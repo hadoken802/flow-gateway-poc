@@ -158,6 +158,31 @@ CREATE INDEX IF NOT EXISTS idx_scene_order ON scene(video_id, display_order);
 CREATE INDEX IF NOT EXISTS idx_request_status ON request(status);
 CREATE INDEX IF NOT EXISTS idx_request_scene ON request(scene_id);
 CREATE INDEX IF NOT EXISTS idx_video_project ON video(project_id);
+
+CREATE TABLE IF NOT EXISTS omni_test_jobs (
+    job_id            TEXT PRIMARY KEY,
+    idempotency_key   TEXT UNIQUE,
+    project_id        TEXT NOT NULL,
+    input_media_id    TEXT,
+    output_media_id   TEXT,
+    workflow_id       TEXT,
+    operation_name    TEXT,
+    upstream_batch_id TEXT,
+    status            TEXT NOT NULL DEFAULT 'queued',
+    remaining_credits INTEGER,
+    prompt            TEXT NOT NULL,
+    image_path        TEXT NOT NULL,
+    video_path        TEXT,
+    error_code        TEXT,
+    error_message     TEXT,
+    raw_response_shape TEXT,
+    submitted_at      TEXT,
+    created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    updated_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    completed_at      TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_omni_test_jobs_status ON omni_test_jobs(status);
 """
 
 
@@ -197,6 +222,15 @@ async def init_db():
         if "source_media_id" not in req_columns:
             await db.execute("ALTER TABLE request ADD COLUMN source_media_id TEXT")
             logger.info("Migrated: added source_media_id column to request table")
+        cursor = await db.execute("PRAGMA table_info(omni_test_jobs)")
+        omni_columns = {row[1] for row in await cursor.fetchall()}
+        if "idempotency_key" not in omni_columns:
+            await db.execute("ALTER TABLE omni_test_jobs ADD COLUMN idempotency_key TEXT")
+            logger.info("Migrated: added idempotency_key column to omni_test_jobs")
+        await db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_omni_test_jobs_idempotency "
+            "ON omni_test_jobs(idempotency_key) WHERE idempotency_key IS NOT NULL"
+        )
         # Migration: add queue columns to request table
         cursor = await db.execute("PRAGMA table_info(request)")
         request_columns = {row[1] for row in await cursor.fetchall()}

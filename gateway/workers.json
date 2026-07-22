@@ -1,0 +1,17 @@
+[
+  {
+    "account_id": "FLOW-001",
+    "api_url": "http://127.0.0.1:8100",
+    "enabled": true
+  },
+  {
+    "account_id": "FLOW-002",
+    "api_url": "http://127.0.0.1:8112",
+    "enabled": true
+  },
+  {
+    "account_id": "FLOW-003",
+    "api_url": "http://127.0.0.1:8113",
+    "enabled": true
+  }
+]

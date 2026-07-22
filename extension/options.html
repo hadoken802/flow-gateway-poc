@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Flow Kit Options</title>
+  <style>
+    body { font: 13px Arial, sans-serif; margin: 24px; max-width: 520px; }
+    label { display: block; margin: 12px 0 4px; font-weight: 600; }
+    input { width: 100%; padding: 8px; box-sizing: border-box; }
+    button { margin-top: 14px; padding: 8px 14px; }
+    #status { margin-top: 12px; color: #2563eb; }
+  </style>
+</head>
+<body>
+  <h1>Flow Kit Worker</h1>
+  <label for="account-id">Account ID</label>
+  <input id="account-id" placeholder="FLOW-001">
+  <label for="ws-url">WebSocket URL</label>
+  <input id="ws-url" placeholder="ws://127.0.0.1:9222">
+  <button id="save">Save</button>
+  <div id="status"></div>
+  <script src="options.js"></script>
+</body>
+</html>

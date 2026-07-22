@@ -1,19 +1,45 @@
 """Configuration constants."""
 import json
 import os
+import logging
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+
+def _env_path(name: str, default: Path) -> Path:
+    return Path(os.environ.get(name, str(default))).expanduser()
+
+
+def _env_port(name: str, default: int) -> int:
+    raw = os.environ.get(name, str(default))
+    try:
+        port = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be a valid TCP port integer, got {raw!r}") from None
+    if port < 1 or port > 65535:
+        raise ValueError(f"{name} must be a valid TCP port between 1 and 65535, got {raw!r}")
+    return port
+
+
+def _mask_account(account_id: str) -> str:
+    if len(account_id) <= 4:
+        return account_id
+    return f"{account_id[:4]}***{account_id[-2:]}"
 
 # ─── Paths ───────────────────────────────────────────────────
 BASE_DIR = Path(os.environ.get("FLOW_AGENT_DIR", Path(__file__).parent.parent))
-DB_PATH = BASE_DIR / "flow_agent.db"
+FLOW_ACCOUNT_ID = os.environ.get("FLOW_ACCOUNT_ID", "FLOW-001")
+DB_PATH = _env_path("FLOW_DB_PATH", BASE_DIR / "flow_agent.db")
 
 # ─── API Server ──────────────────────────────────────────────
-API_HOST = os.environ.get("API_HOST", "127.0.0.1")
-API_PORT = int(os.environ.get("API_PORT", "8100"))
+API_HOST = os.environ.get("AGENT_API_HOST", os.environ.get("API_HOST", "127.0.0.1"))
+API_PORT = _env_port("AGENT_API_PORT", int(os.environ.get("API_PORT", "8100")))
 
 # ─── WebSocket Server (extension connects here) ─────────────
-WS_HOST = os.environ.get("WS_HOST", "127.0.0.1")
-WS_PORT = int(os.environ.get("WS_PORT", "9222"))
+WS_HOST = os.environ.get("EXTENSION_WS_HOST", os.environ.get("WS_HOST", "127.0.0.1"))
+WS_PORT = _env_port("EXTENSION_WS_PORT", int(os.environ.get("WS_PORT", "9222")))
+EXTENSION_WS_MAX_SIZE_BYTES = int(os.environ.get("EXTENSION_WS_MAX_SIZE_BYTES", str(16 * 1024 * 1024)))
 
 # ─── Google Flow API ────────────────────────────────────────
 GOOGLE_FLOW_API = "https://aisandbox-pa.googleapis.com"
@@ -53,10 +79,23 @@ ENDPOINTS = {
 }
 
 # ─── Output Directories ─────────────────────────────────────
-OUTPUT_DIR = BASE_DIR / "output"
+OUTPUT_DIR = _env_path("OUTPUT_DIR", BASE_DIR / "output")
 SHARED_OUTPUT_DIR = OUTPUT_DIR / "_shared"
 TTS_TEMPLATES_DIR = SHARED_OUTPUT_DIR / "tts_templates"
 MUSIC_OUTPUT_DIR = SHARED_OUTPUT_DIR / "music"
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+logger.info(
+    "Flow worker config account=%s api=%s:%d ws=%s:%d db=%s output=%s",
+    _mask_account(FLOW_ACCOUNT_ID),
+    API_HOST,
+    API_PORT,
+    WS_HOST,
+    WS_PORT,
+    DB_PATH,
+    OUTPUT_DIR,
+)
 
 # ─── TTS (OmniVoice) ─────────────────────────────────────────
 TTS_MODEL = os.environ.get("TTS_MODEL", "k2-fsa/OmniVoice")

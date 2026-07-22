@@ -5,11 +5,19 @@
  * Captures bearer token, solves reCAPTCHA, proxies API calls through browser.
  */
 
-const AGENT_WS_URL = 'ws://127.0.0.1:9222';
+const DEFAULT_ACCOUNT_ID = 'FLOW-001';
+const DEFAULT_AGENT_WS_URL = 'ws://127.0.0.1:9222';
+const KEEPALIVE_INTERVAL_MS = 20000;
 // NOTE: This is a browser-restricted public API key — safe to ship in extension bundles.
 const API_KEY = 'AIzaSyBtrm0o5ab1c-Ec8ZuLcGt3oJAA5VWt3pY';
 
 let ws = null;
+let reconnectTimer = null;
+let keepaliveTimer = null;
+let initialized = false;
+let activeSocketId = 0;
+let accountId = DEFAULT_ACCOUNT_ID;
+let wsUrl = DEFAULT_AGENT_WS_URL;
 let flowKey = null;
 let callbackSecret = null;  // Auth secret for HTTP callback, received from server on WS connect
 let state = 'off'; // off | idle | running
@@ -73,13 +81,33 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 });
 
 async function init() {
-  const data = await chrome.storage.local.get(['flowKey', 'metrics', 'callbackSecret']);
+  if (initialized) return;
+  initialized = true;
+  const data = await chrome.storage.local.get(['flowKey', 'metrics', 'callbackSecret', 'account_id', 'ws_url']);
   if (data.flowKey) flowKey = data.flowKey;
   if (data.metrics) Object.assign(metrics, data.metrics);
   if (data.callbackSecret) callbackSecret = data.callbackSecret;
+  accountId = data.account_id || DEFAULT_ACCOUNT_ID;
+  wsUrl = data.ws_url || DEFAULT_AGENT_WS_URL;
   connectToAgent();
   chrome.alarms.create('keepAlive', { periodInMinutes: 0.4 });
 }
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local') return;
+  if (changes.account_id) accountId = changes.account_id.newValue || DEFAULT_ACCOUNT_ID;
+  if (changes.ws_url) wsUrl = changes.ws_url.newValue || DEFAULT_AGENT_WS_URL;
+  if (changes.account_id || changes.ws_url) {
+    manualDisconnect = false;
+    clearReconnectTimer();
+    if (ws) {
+      const old = ws;
+      ws = null;
+      old.close();
+    }
+    connectToAgent();
+  }
+});
 
 // ─── Token Capture ──────────────────────────────────────────
 
@@ -162,9 +190,18 @@ function connectToAgent() {
   if (manualDisconnect) return;
   if (ws?.readyState === WebSocket.CONNECTING) return;
   if (ws?.readyState === WebSocket.OPEN) return;
+  clearReconnectTimer();
 
   try {
-    ws = new WebSocket(AGENT_WS_URL);
+    if (ws) {
+      const old = ws;
+      ws = null;
+      old.close();
+    }
+    const socketId = ++activeSocketId;
+    ws = new WebSocket(wsUrl || DEFAULT_AGENT_WS_URL);
+    console.log(`[FlowAgent] Connecting account=${accountId || DEFAULT_ACCOUNT_ID} ws=${wsUrl || DEFAULT_AGENT_WS_URL}`);
+    ws._flowSocketId = socketId;
   } catch (e) {
     console.error('[FlowAgent] WS connect error:', e);
     scheduleReconnect();
@@ -172,9 +209,16 @@ function connectToAgent() {
   }
 
   ws.onopen = () => {
+    if (ws?._flowSocketId !== activeSocketId) return;
     console.log('[FlowAgent] Connected to agent');
     chrome.alarms.clear('reconnect');
+    startKeepaliveTimer();
     setState('idle');
+    ws.send(JSON.stringify({
+      type: 'register',
+      account_id: accountId || DEFAULT_ACCOUNT_ID,
+      profile_id: accountId || DEFAULT_ACCOUNT_ID,
+    }));
 
     // Token refresh alarm — 45 min gives buffer before ~60 min expiry
     chrome.alarms.create('token-refresh', { periodInMinutes: 45 });
@@ -191,6 +235,7 @@ function connectToAgent() {
   };
 
   ws.onmessage = async ({ data }) => {
+    if (ws?._flowSocketId !== activeSocketId) return;
     try {
       const msg = JSON.parse(data);
 
@@ -215,6 +260,8 @@ function connectToAgent() {
         callbackSecret = msg.secret;
         chrome.storage.local.set({ callbackSecret: msg.secret });
         console.log('[FlowAgent] Received callback secret');
+      } else if (msg.type === 'keepalive_ack') {
+        // application-level keepalive response
       } else if (msg.type === 'pong') {
         // keepalive response
       }
@@ -223,9 +270,16 @@ function connectToAgent() {
     }
   };
 
-  ws.onclose = () => {
+  ws.onclose = (event) => {
+    if (ws?._flowSocketId !== activeSocketId) return;
+    clearKeepaliveTimer();
     setState('off');
     chrome.alarms.clear('token-refresh');
+    const reason = event.reason || '';
+    const tooLarge = event.code === 1009 || reason.toLowerCase().includes('message too big') || reason.toLowerCase().includes('payloadtoobig');
+    metrics.lastError = tooLarge ? 'websocket_message_too_large' : `WS_CLOSED_${event.code}`;
+    chrome.storage.local.set({ metrics });
+    console.warn(`[FlowAgent] WS closed code=${event.code} reason=${reason || ''} error=${metrics.lastError}`);
     if (!manualDisconnect) scheduleReconnect();
   };
 
@@ -237,21 +291,45 @@ function connectToAgent() {
 }
 
 function scheduleReconnect() {
-  chrome.alarms.create('reconnect', { delayInMinutes: 0.083 }); // ~5s
+  if (reconnectTimer) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectToAgent();
+  }, 5000);
+  chrome.alarms.create('reconnect', { delayInMinutes: 0.083 }); // service worker backup
+}
+
+function clearReconnectTimer() {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  chrome.alarms.clear('reconnect');
 }
 
 function keepAlive() {
   if (ws?.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: 'ping' }));
+    ws.send(JSON.stringify({ type: 'keepalive', at: Date.now() }));
   } else {
     connectToAgent();
   }
 }
 
+function startKeepaliveTimer() {
+  if (keepaliveTimer) return;
+  keepaliveTimer = setInterval(() => keepAlive(), KEEPALIVE_INTERVAL_MS);
+}
+
+function clearKeepaliveTimer() {
+  if (!keepaliveTimer) return;
+  clearInterval(keepaliveTimer);
+  keepaliveTimer = null;
+}
+
 function sendToAgent(msg) {
   // API responses (with msg.id) go via HTTP — immune to WS disconnect
   if (msg.id) {
-    fetch('http://127.0.0.1:8100/api/ext/callback', {
+    fetch(getAgentHttpUrl() + '/api/ext/callback', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(msg),
@@ -264,6 +342,20 @@ function sendToAgent(msg) {
   // Non-response messages (ping, status) or no secret yet — use WS
   if (ws?.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(msg));
+  }
+}
+
+function getAgentHttpUrl() {
+  try {
+    const url = new URL(wsUrl || DEFAULT_AGENT_WS_URL);
+    const protocol = url.protocol === 'wss:' ? 'https:' : 'http:';
+    const mappedPorts = { 'FLOW-001': '8100', 'FLOW-002': '8112', 'FLOW-003': '8113' };
+    const port = mappedPorts[accountId] || (url.port === '9212' ? '8112' : url.port === '9213' ? '8113' : '8100');
+    const httpUrl = `${protocol}//${url.hostname}:${port}`;
+    console.log(`[FlowAgent] HTTP callback target ${httpUrl}`);
+    return httpUrl;
+  } catch {
+    return 'http://127.0.0.1:8100';
   }
 }
 
@@ -396,7 +488,7 @@ async function handleTrpcRequest(msg) {
 
 async function handleApiRequest(msg) {
   const { id, params } = msg;
-  const { url, method, headers, body, captchaAction } = params;
+  const { url, captchaAction } = params;
 
   if (!url) {
     sendToAgent({ id, error: 'MISSING_URL' });
@@ -407,6 +499,22 @@ async function handleApiRequest(msg) {
     sendToAgent({ id, error: 'INVALID_URL' });
     return;
   }
+
+  if (captchaAction) {
+    await handleApiRequestInServiceWorker(msg);
+    return;
+  }
+
+  await ensureOffscreenDocument();
+  chrome.runtime.sendMessage({ type: 'OFFSCREEN_API_REQUEST', msg, flowKey }).catch((e) => {
+    sendToAgent({ id, status: 500, error: e.message || 'OFFSCREEN_REQUEST_FAILED' });
+  });
+  return;
+}
+
+async function handleApiRequestInServiceWorker(msg) {
+  const { id, params } = msg;
+  const { url, method, headers, body, captchaAction } = params;
 
   setState('running');
   const hasCaptcha = !!captchaAction;
@@ -512,6 +620,23 @@ async function handleApiRequest(msg) {
   setState('idle');
 }
 
+async function ensureOffscreenDocument() {
+  if (!chrome.offscreen?.createDocument) return;
+  const offscreenUrl = chrome.runtime.getURL('offscreen.html');
+  if (chrome.runtime.getContexts) {
+    const contexts = await chrome.runtime.getContexts({
+      contextTypes: ['OFFSCREEN_DOCUMENT'],
+      documentUrls: [offscreenUrl],
+    });
+    if (contexts.length) return;
+  }
+  await chrome.offscreen.createDocument({
+    url: 'offscreen.html',
+    reasons: ['WORKERS'],
+    justification: 'Run long Google Flow media fetches outside the MV3 service worker.',
+  });
+}
+
 // ─── State & Popup ──────────────────────────────────────────
 
 function setState(newState) {
@@ -528,10 +653,18 @@ function broadcastStatus() {
 }
 
 chrome.runtime.onMessage.addListener((msg, _, reply) => {
+  if (msg.type === 'OFFSCREEN_API_RESPONSE') {
+    sendToAgent(msg.payload);
+    reply({ ok: true });
+    return true;
+  }
+
   if (msg.type === 'STATUS') {
     reply({
       connected: ws?.readyState === WebSocket.OPEN,
       agentConnected: ws?.readyState === WebSocket.OPEN,
+      account_id: accountId,
+      ws_url: wsUrl,
       flowKeyPresent: !!flowKey,
       manualDisconnect,
       tokenAge: metrics.tokenCapturedAt ? Date.now() - metrics.tokenCapturedAt : null,
@@ -554,6 +687,14 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
 
   if (msg.type === 'RECONNECT') {
     manualDisconnect = false;
+    if (msg.account_id) accountId = msg.account_id;
+    if (msg.ws_url) wsUrl = msg.ws_url;
+    clearReconnectTimer();
+    if (ws) {
+      const old = ws;
+      ws = null;
+      old.close();
+    }
     connectToAgent();
     reply({ ok: true });
     return true;

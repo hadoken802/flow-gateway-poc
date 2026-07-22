@@ -8,7 +8,7 @@ from agent.db.schema import get_db, _db_lock
 
 logger = logging.getLogger(__name__)
 
-_VALID_TABLES = frozenset({"character", "project", "video", "scene", "request", "material"})
+_VALID_TABLES = frozenset({"character", "project", "video", "scene", "request", "material", "omni_test_jobs"})
 
 
 def _validate_table(table: str) -> None:
@@ -31,6 +31,10 @@ _COLUMNS = {
               "vertical_end_scene_media_id", "horizontal_end_scene_media_id",
               "trim_start", "trim_end", "duration", "display_order", "source", "transition_prompt", "narrator_text", "updated_at"},
     "request": {"status", "request_id", "media_id", "output_url", "error_message", "retry_count", "next_retry_at", "source_media_id", "updated_at"},
+    "omni_test_jobs": {"project_id", "input_media_id", "output_media_id", "workflow_id", "operation_name",
+                       "upstream_batch_id", "status", "remaining_credits", "prompt", "image_path",
+                       "video_path", "error_code", "error_message", "raw_response_shape", "submitted_at",
+                       "updated_at", "completed_at"},
 }
 
 
@@ -337,4 +341,50 @@ async def delete_material(mid: str): return await _delete("material", "id", mid)
 async def list_materials() -> list[dict]:
     db = await get_db()
     cur = await db.execute("SELECT * FROM material ORDER BY created_at")
+    return [dict(r) for r in await cur.fetchall()]
+
+
+# Omni test jobs
+
+async def get_omni_test_job_by_idempotency_key(idempotency_key: str):
+    db = await get_db()
+    cur = await db.execute("SELECT * FROM omni_test_jobs WHERE idempotency_key=?", (idempotency_key,))
+    row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def create_omni_test_job(job_id: str, project_id: str, prompt: str, image_path: str, idempotency_key: str = None) -> dict:
+    db = await get_db()
+    now = _now()
+    async with _db_lock:
+        await db.execute(
+            """INSERT OR IGNORE INTO omni_test_jobs
+               (job_id,idempotency_key,project_id,prompt,image_path,status,created_at,updated_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (job_id, idempotency_key, project_id, prompt, image_path, "queued", now, now))
+        await db.commit()
+    if idempotency_key:
+        existing = await get_omni_test_job_by_idempotency_key(idempotency_key)
+        if existing:
+            return existing
+    return await _get_with_db(db, "omni_test_jobs", "job_id", job_id)
+
+
+async def get_omni_test_job(job_id: str):
+    return await _get("omni_test_jobs", "job_id", job_id)
+
+
+async def update_omni_test_job(job_id: str, **kw):
+    return await _update("omni_test_jobs", "job_id", job_id, **kw)
+
+
+async def list_omni_test_jobs(statuses: list[str] = None) -> list[dict]:
+    db = await get_db()
+    if statuses:
+        placeholders = ",".join("?" for _ in statuses)
+        cur = await db.execute(
+            f"SELECT * FROM omni_test_jobs WHERE status IN ({placeholders}) ORDER BY created_at ASC",
+            tuple(statuses))
+    else:
+        cur = await db.execute("SELECT * FROM omni_test_jobs ORDER BY created_at DESC")
     return [dict(r) for r in await cur.fetchall()]

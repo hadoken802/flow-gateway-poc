@@ -15,3 +15,11 @@ agent/active_project.json
 AGENTS.md
 GEMINI.md
 .fk-setup.json
+
+# Test and temporary runtime files
+.pytest_cache/
+.pytest_tmp/
+.tmp/
+
+# Browser-generated extension metadata
+extension/_metadata/

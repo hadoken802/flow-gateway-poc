@@ -78,6 +78,8 @@ function updateStatus(data) {
   const st = data.state || 'off';
   stateBadge.textContent = st;
   stateBadge.className = st; // idle | running | off
+  document.getElementById('worker-account').textContent = data.account_id || 'FLOW-001';
+  document.getElementById('worker-ws').textContent = data.ws_url || 'ws://127.0.0.1:9222';
 
   // Token status
   const tokenEl = document.getElementById('token-status');

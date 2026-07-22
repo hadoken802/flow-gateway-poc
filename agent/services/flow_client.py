@@ -25,6 +25,7 @@ class FlowClient:
 
     def __init__(self):
         self._extension_ws = None  # Set by WS server when extension connects
+        self._extension_registered = False
         self._pending: dict[str, asyncio.Future] = {}
         self._flow_key: Optional[str] = None
         # WS stats
@@ -32,34 +33,76 @@ class FlowClient:
         self._ws_disconnect_count = 0
         self._ws_connected_at: Optional[float] = None
         self._ws_last_disconnect_at: Optional[float] = None
+        self._ws_last_close_code: Optional[int] = None
+        self._ws_last_close_reason: Optional[str] = None
+        self._ws_last_error: Optional[str] = None
+        self._background_tasks: set[asyncio.Task] = set()
+        self._shutting_down = False
 
-    def set_extension(self, ws):
+    def _track_task(self, coro):
+        if self._shutting_down:
+            return None
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
+    async def shutdown(self):
+        self._shutting_down = True
+        if self._extension_ws is not None:
+            try:
+                await self._extension_ws.close()
+            except Exception:
+                pass
+        self.clear_extension()
+        for task in list(self._background_tasks):
+            task.cancel()
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+
+    def set_extension(self, ws, registered: bool = True):
         """Called when extension connects via WS."""
         self._extension_ws = ws
+        self._extension_registered = bool(registered)
         self._ws_connect_count += 1
         self._ws_connected_at = time.time()
         logger.info("Extension connected #%d (waiting for extension_ready/token_captured to sync)", self._ws_connect_count)
 
-    def clear_extension(self):
+    def mark_extension_ready(self):
+        if self._extension_ws is not None:
+            self._extension_registered = True
+
+    def clear_extension(self, close_code: int | None = None, close_reason: str | None = None):
         """Called when extension disconnects."""
         self._extension_ws = None
+        self._extension_registered = False
         self._ws_disconnect_count += 1
         self._ws_last_disconnect_at = time.time()
+        self._ws_last_close_code = close_code
+        self._ws_last_close_reason = (close_reason or "")[:200]
+        if close_code == 1009:
+            self._ws_last_error = "websocket_message_too_large"
         # Cancel all pending futures (copy to avoid RuntimeError on concurrent modification)
         pending_copy = list(self._pending.items())
         count = len(pending_copy)
         for req_id, future in pending_copy:
             if not future.done():
-                future.set_exception(ConnectionError("Extension disconnected"))
+                if self._ws_last_error:
+                    future.set_exception(ConnectionError(self._ws_last_error))
+                else:
+                    future.set_exception(ConnectionError(f"Extension disconnected code={close_code} reason={self._ws_last_close_reason}"))
         self._pending.clear()
-        logger.warning("Extension disconnected, cleared %d pending requests", count)
+        logger.warning("Extension disconnected code=%s reason=%s error=%s cleared=%d", close_code, self._ws_last_close_reason, self._ws_last_error, count)
+
+    def note_ws_error(self, error_code: str):
+        self._ws_last_error = error_code
 
     def set_flow_key(self, key: str):
         self._flow_key = key
 
     @property
     def connected(self) -> bool:
-        return self._extension_ws is not None
+        return self._extension_ws is not None and self._extension_registered
 
     @property
     def ws_stats(self) -> dict:
@@ -71,6 +114,9 @@ class FlowClient:
             "connects": self._ws_connect_count,
             "disconnects": self._ws_disconnect_count,
             "uptime_s": uptime,
+            "last_close_code": self._ws_last_close_code,
+            "last_close_reason": self._ws_last_close_reason,
+            "last_error": self._ws_last_error,
         }
 
     async def handle_message(self, data: dict):
@@ -78,16 +124,17 @@ class FlowClient:
         if data.get("type") == "token_captured":
             self._flow_key = data.get("flowKey")
             logger.info("Flow key captured from extension")
-            asyncio.create_task(self._sync_tier())
+            self._track_task(self._sync_tier())
             return
 
         if data.get("type") == "extension_ready":
+            self.mark_extension_ready()
             logger.info("Extension ready, flowKey=%s", "yes" if data.get("flowKeyPresent") else "no")
-            asyncio.create_task(self._sync_tier())
+            self._track_task(self._sync_tier())
             return
 
         if data.get("type") == "media_urls_refresh":
-            asyncio.create_task(self._refresh_media_urls(data.get("urls", [])))
+            self._track_task(self._refresh_media_urls(data.get("urls", [])))
             return
 
         if data.get("type") == "pong":
@@ -214,6 +261,8 @@ class FlowClient:
         """
         if not self._extension_ws:
             return {"error": "Extension not connected"}
+        if not self._extension_registered:
+            return {"error": "Extension not registered"}
 
         req_id = str(uuid.uuid4())
         future = asyncio.get_running_loop().create_future()
@@ -511,7 +560,7 @@ class FlowClient:
             "url": url,
             "method": "GET",
             "headers": random_headers(),
-        }, timeout=15)
+        }, timeout=120)
 
     async def validate_media_id(self, media_id: str) -> bool:
         """Check if a mediaId is still valid.

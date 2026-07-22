@@ -132,6 +132,18 @@ document.getElementById('btn-panel').addEventListener('click', () => {
   });
 });
 
+function renderStatus(data) {
+  if (!data) return;
+  document.getElementById('worker-account').textContent = data.account_id || 'FLOW-001';
+  document.getElementById('worker-ws').textContent = data.ws_url || 'ws://127.0.0.1:9222';
+  document.getElementById('worker-connection').textContent = data.connected ? 'connected' : 'disconnected';
+}
+
+chrome.runtime.sendMessage({ type: 'STATUS' }, (data) => {
+  if (chrome.runtime.lastError) return;
+  renderStatus(data);
+});
+
 chrome.runtime.sendMessage({ type: 'REQUEST_LOG' }, (data) => {
   if (chrome.runtime.lastError) return;
   if (data && data.log) renderLog(data.log);

@@ -79,6 +79,17 @@
       border-bottom: 1px solid var(--border);
     }
 
+    .worker-status {
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--muted);
+      font-size: 9px;
+      line-height: 1.6;
+    }
+
+    .worker-status strong { color: var(--text); }
+
     #log-count {
       background: var(--border);
       border-radius: 10px;
@@ -236,6 +247,12 @@
   <div class="log-header">
     Recent Requests
     <span id="log-count">0</span>
+  </div>
+
+  <div class="worker-status">
+    <div>Account: <strong id="worker-account">FLOW-001</strong></div>
+    <div>WS: <strong id="worker-ws">ws://127.0.0.1:9222</strong></div>
+    <div>Status: <strong id="worker-connection">disconnected</strong></div>
   </div>
 
   <div id="log-list">
