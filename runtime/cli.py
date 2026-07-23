@@ -15,6 +15,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("list")
 
+    show = sub.add_parser("show")
+    show.add_argument("account_id")
+
     import_existing = sub.add_parser("import-existing")
     import_existing.add_argument("--dry-run", action="store_true")
 
@@ -22,7 +25,6 @@ def build_parser() -> argparse.ArgumentParser:
     add_batch.add_argument("--start", type=int, required=True)
     add_batch.add_argument("--count", type=int, required=True)
     add_batch.add_argument("--dry-run", action="store_true")
-    add_batch.add_argument("--create-dirs", action="store_true")
 
     return parser
 
@@ -35,6 +37,14 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps([asdict(account) for account in registry.list_accounts()], ensure_ascii=False, indent=2))
         return 0
 
+    if args.command == "show":
+        account = registry.get(args.account_id)
+        if not account:
+            print(json.dumps({"account_id": args.account_id, "result": "failed"}, ensure_ascii=False, indent=2))
+            return 1
+        print(json.dumps(asdict(account), ensure_ascii=False, indent=2))
+        return 0
+
     if args.command == "import-existing":
         plan = registry.import_existing_workers(dry_run=args.dry_run)
         print(json.dumps(plan_to_dict(plan), ensure_ascii=False, indent=2))
@@ -45,7 +55,6 @@ def main(argv: list[str] | None = None) -> int:
             args.start,
             args.count,
             dry_run=args.dry_run,
-            create_dirs=args.create_dirs,
         )
         print(json.dumps(plan_to_dict(plan), ensure_ascii=False, indent=2))
         return 1 if plan.issues else 0
@@ -55,4 +64,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
-

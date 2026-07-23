@@ -12,6 +12,9 @@ from .paths import DATA_ROOT, OUTPUTS_ROOT, PROFILES_ROOT, REGISTRY_DB_PATH, WOR
 from .port_allocator import PortRanges, allocate_port_triplet
 
 
+SCHEMA_VERSION = 1
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS flow_account_registry (
     account_id TEXT PRIMARY KEY,
@@ -33,6 +36,26 @@ CREATE TABLE IF NOT EXISTS flow_account_registry (
     last_error TEXT,
     updated_at TEXT NOT NULL
 );
+"""
+
+META_SCHEMA = """
+CREATE TABLE IF NOT EXISTS schema_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+"""
+
+UNIQUE_INDEXES = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_flow_account_registry_account_id
+ON flow_account_registry(account_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_flow_account_registry_profile_path
+ON flow_account_registry(profile_path);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_flow_account_registry_worker_api_port
+ON flow_account_registry(worker_api_port);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_flow_account_registry_extension_ws_port
+ON flow_account_registry(extension_ws_port);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_flow_account_registry_chrome_cdp_port
+ON flow_account_registry(chrome_cdp_port);
 """
 
 
@@ -64,6 +87,7 @@ class RegistrationIssue:
 class RegistrationPlan:
     accounts: list[AccountRecord]
     issues: list[RegistrationIssue]
+    rollback_completed: bool = False
 
 
 def utc_now() -> str:
@@ -100,8 +124,7 @@ class AccountRegistry:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
-        conn.executescript(SCHEMA)
-        conn.commit()
+        self._migrate(conn)
         return conn
 
     def list_accounts(self) -> list[AccountRecord]:
@@ -142,6 +165,7 @@ class AccountRegistry:
                 database_path=str(self.data_root / f"{account_id}.db"),
                 output_dir=str(self.outputs_root / account_id),
                 enabled=bool(item.get("enabled", True)),
+                status="planned",
                 created_at=utc_now(),
             )
             accounts.append(record)
@@ -180,6 +204,7 @@ class AccountRegistry:
                 chrome_cdp_port=chrome_cdp_port,
                 database_path=str(self.data_root / f"{account_id}.db"),
                 output_dir=str(self.outputs_root / account_id),
+                status="planned",
                 created_at=utc_now(),
             )
             accounts.append(record)
@@ -187,24 +212,36 @@ class AccountRegistry:
         return RegistrationPlan(accounts, issues)
 
     def register_many(self, accounts: list[AccountRecord], create_dirs: bool = False) -> None:
+        created_dirs: list[Path] = []
         with self.connect() as conn:
             try:
                 conn.execute("BEGIN")
                 for account in accounts:
-                    self._insert(conn, account)
+                    status = "login_required" if create_dirs else account.status
+                    self._insert(conn, account, status=status)
                     if create_dirs:
-                        Path(account.profile_path).mkdir(parents=True, exist_ok=False)
+                        profile_path = Path(account.profile_path)
+                        profile_path.mkdir(parents=True, exist_ok=False)
+                        created_dirs.append(profile_path)
                         Path(account.output_dir).mkdir(parents=True, exist_ok=True)
                         Path(account.database_path).parent.mkdir(parents=True, exist_ok=True)
                 conn.commit()
             except Exception:
                 conn.rollback()
+                self._cleanup_created_dirs(created_dirs)
                 raise
 
-    def register_batch(self, start_number: int, count: int, dry_run: bool = False, create_dirs: bool = False) -> RegistrationPlan:
+    def register_batch(self, start_number: int, count: int, dry_run: bool = False, create_dirs: bool = True) -> RegistrationPlan:
         plan = self.plan_batch(start_number, count)
         if not dry_run and not plan.issues:
-            self.register_many(plan.accounts, create_dirs=create_dirs)
+            try:
+                self.register_many(plan.accounts, create_dirs=create_dirs)
+            except Exception as error:
+                return RegistrationPlan([], [RegistrationIssue("", "failed", path=str(error))], rollback_completed=True)
+            return RegistrationPlan(
+                [self.get(account.account_id) or account for account in plan.accounts],
+                [],
+            )
         return plan
 
     def get(self, account_id: str) -> AccountRecord | None:
@@ -212,7 +249,7 @@ class AccountRegistry:
             row = conn.execute("SELECT * FROM flow_account_registry WHERE account_id=?", (account_id,)).fetchone()
         return self._row_to_record(row) if row else None
 
-    def _insert(self, conn: sqlite3.Connection, account: AccountRecord) -> None:
+    def _insert(self, conn: sqlite3.Connection, account: AccountRecord, status: str | None = None) -> None:
         now = utc_now()
         conn.execute(
             """
@@ -233,12 +270,37 @@ class AccountRegistry:
                 account.database_path,
                 account.output_dir,
                 int(account.enabled),
-                account.status,
+                status or account.status,
                 account.created_at or now,
                 account.last_started_at,
                 now,
             ),
         )
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        try:
+            conn.execute("BEGIN")
+            conn.executescript(META_SCHEMA)
+            conn.executescript(SCHEMA)
+            conn.executescript(UNIQUE_INDEXES)
+            current = conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()
+            if current is None:
+                conn.execute(
+                    "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?)",
+                    (str(SCHEMA_VERSION),),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    def _cleanup_created_dirs(self, created_dirs: list[Path]) -> None:
+        for path in reversed(created_dirs):
+            try:
+                if path.exists() and path.is_dir() and not any(path.iterdir()):
+                    path.rmdir()
+            except Exception:
+                pass
 
     def _load_workers_json(self) -> list[dict]:
         if not self.workers_json_path.exists():
@@ -291,7 +353,19 @@ class AccountRegistry:
 
 def plan_to_dict(plan: RegistrationPlan) -> dict:
     return {
-        "accounts": [asdict(account) for account in plan.accounts],
-        "issues": [asdict(issue) for issue in plan.issues],
+        "accounts": [_account_to_result(account) for account in plan.accounts],
+        "issues": [_issue_to_result(issue) for issue in plan.issues],
+        "rollback_completed": plan.rollback_completed,
     }
 
+
+def _account_to_result(account: AccountRecord) -> dict:
+    data = asdict(account)
+    data["result"] = "planned" if account.status == "planned" else "created"
+    return data
+
+
+def _issue_to_result(issue: RegistrationIssue) -> dict:
+    data = asdict(issue)
+    data["result"] = issue.reason
+    return data
