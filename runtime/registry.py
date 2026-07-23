@@ -73,6 +73,11 @@ class AccountRecord:
     status: str = "registered"
     created_at: str = ""
     last_started_at: str | None = None
+    last_stopped_at: str | None = None
+    chrome_pid: int | None = None
+    worker_pid: int | None = None
+    last_health_at: str | None = None
+    last_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -150,6 +155,8 @@ class AccountRegistry:
                 continue
             existing = self.get(account_id)
             if existing:
+                if not dry_run and existing.status == "planned":
+                    self.update_status(account_id, "registered")
                 issues.append(RegistrationIssue(account_id, "already_registered"))
                 continue
             worker_port = _port_from_url(item["api_url"])
@@ -248,6 +255,63 @@ class AccountRegistry:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM flow_account_registry WHERE account_id=?", (account_id,)).fetchone()
         return self._row_to_record(row) if row else None
+
+    def update_status(self, account_id: str, status: str, last_error: str | None = None) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE flow_account_registry
+                SET status=?, last_error=?, updated_at=?
+                WHERE account_id=?
+                """,
+                (status, last_error, utc_now(), account_id),
+            )
+            conn.commit()
+
+    def mark_started(self, account_id: str, chrome_pid: int | None = None, worker_pid: int | None = None) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE flow_account_registry
+                SET chrome_pid=COALESCE(?, chrome_pid),
+                    worker_pid=COALESCE(?, worker_pid),
+                    last_started_at=?,
+                    last_error=NULL,
+                    updated_at=?
+                WHERE account_id=?
+                """,
+                (chrome_pid, worker_pid, utc_now(), utc_now(), account_id),
+            )
+            conn.commit()
+
+    def mark_health(self, account_id: str, last_error: str | None = None) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE flow_account_registry
+                SET last_health_at=?, last_error=?, updated_at=?
+                WHERE account_id=?
+                """,
+                (utc_now(), last_error, utc_now(), account_id),
+            )
+            conn.commit()
+
+    def mark_stopped(self, account_id: str, clear_chrome: bool = True, clear_worker: bool = True) -> None:
+        chrome_expr = "NULL" if clear_chrome else "chrome_pid"
+        worker_expr = "NULL" if clear_worker else "worker_pid"
+        with self.connect() as conn:
+            conn.execute(
+                f"""
+                UPDATE flow_account_registry
+                SET chrome_pid={chrome_expr},
+                    worker_pid={worker_expr},
+                    last_stopped_at=?,
+                    updated_at=?
+                WHERE account_id=?
+                """,
+                (utc_now(), utc_now(), account_id),
+            )
+            conn.commit()
 
     def _insert(self, conn: sqlite3.Connection, account: AccountRecord, status: str | None = None) -> None:
         now = utc_now()
@@ -348,6 +412,11 @@ class AccountRegistry:
             status=row["status"],
             created_at=row["created_at"],
             last_started_at=row["last_started_at"],
+            last_stopped_at=row["last_stopped_at"],
+            chrome_pid=row["chrome_pid"],
+            worker_pid=row["worker_pid"],
+            last_health_at=row["last_health_at"],
+            last_error=row["last_error"],
         )
 
 

@@ -6,6 +6,7 @@ import json
 import sys
 from dataclasses import asdict
 
+from .process_manager import RuntimeManager
 from .registry import AccountRegistry, plan_to_dict
 
 
@@ -17,6 +18,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     show = sub.add_parser("show")
     show.add_argument("account_id")
+
+    for name in ("open-login", "start-one", "status", "stop-one"):
+        parser_one = sub.add_parser(name)
+        parser_one.add_argument("account_id")
 
     import_existing = sub.add_parser("import-existing")
     import_existing.add_argument("--dry-run", action="store_true")
@@ -44,6 +49,12 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(json.dumps(asdict(account), ensure_ascii=False, indent=2))
         return 0
+
+    if args.command in {"open-login", "start-one", "status", "stop-one"}:
+        manager = RuntimeManager(registry)
+        result = getattr(manager, args.command.replace("-", "_"))(args.account_id)
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        return 0 if result.ok or result.result in {"stopped", "already_stopped", "already_running", "opened"} else 1
 
     if args.command == "import-existing":
         plan = registry.import_existing_workers(dry_run=args.dry_run)
