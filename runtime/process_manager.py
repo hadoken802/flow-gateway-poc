@@ -71,6 +71,23 @@ class RuntimeResult:
 
 
 @dataclass
+class ProcessProbeResult:
+    pid: int | None
+    alive: bool | None
+    status: str
+    method: str | None = None
+    error: str | None = None
+
+
+@dataclass
+class CommandLineProbeResult:
+    pid: int | None
+    command_line: str = ""
+    status: str = "unavailable"
+    error: str | None = None
+
+
+@dataclass
 class TerminationResult:
     success: bool
     pid: int
@@ -94,28 +111,85 @@ class TerminationResult:
 
 
 class ProcessInspector:
-    def process_alive(self, pid: int | None) -> bool:
+    def probe_process(self, pid: int | None) -> ProcessProbeResult:
         if not pid:
-            return False
+            return ProcessProbeResult(pid, False, "not_found", "none")
+        pid = int(pid)
+        get_process = self._probe_with_get_process(pid)
+        if get_process.status in {"alive", "not_found"}:
+            return get_process
+        tasklist = self._probe_with_tasklist(pid)
+        if tasklist.status in {"alive", "not_found"}:
+            return tasklist
+        if get_process.status == "access_denied" or tasklist.status == "access_denied":
+            return ProcessProbeResult(pid, None, "access_denied", "get-process/tasklist")
+        return ProcessProbeResult(pid, None, "unknown", "get-process/tasklist")
+
+    def process_alive(self, pid: int | None) -> bool:
+        return self.probe_process(pid).alive is True
+
+    def _probe_with_get_process(self, pid: int) -> ProcessProbeResult:
         try:
             result = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {int(pid)}"],
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    f"$p=Get-Process -Id {pid} -ErrorAction SilentlyContinue; if ($null -ne $p) {{ 'FOUND' }}",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=3,
+                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+            )
+        except subprocess.TimeoutExpired:
+            return ProcessProbeResult(pid, None, "probe_error", "get-process", "timeout")
+        except Exception as error:
+            return ProcessProbeResult(pid, None, "probe_error", "get-process", type(error).__name__)
+        stdout = result.stdout or ""
+        stderr = result.stderr or ""
+        combined = f"{stdout}\n{stderr}".lower()
+        if result.returncode == 0:
+            return ProcessProbeResult(pid, "FOUND" in stdout, "alive" if "FOUND" in stdout else "not_found", "get-process")
+        if "access is denied" in combined or "access denied" in combined or "拒绝访问" in combined:
+            return ProcessProbeResult(pid, None, "access_denied", "get-process")
+        return ProcessProbeResult(pid, None, "probe_error", "get-process", f"returncode_{result.returncode}")
+
+    def _probe_with_tasklist(self, pid: int) -> ProcessProbeResult:
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}"],
                 capture_output=True,
                 text=True,
                 check=False,
                 creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
             )
-            return str(int(pid)) in (result.stdout or "")
-        except Exception:
-            return False
+        except Exception as error:
+            return ProcessProbeResult(pid, None, "probe_error", "tasklist", type(error).__name__)
+        stdout = result.stdout or ""
+        stderr = result.stderr or ""
+        combined = f"{stdout}\n{stderr}".lower()
+        if "access is denied" in combined or "access denied" in combined or "拒绝访问" in combined:
+            return ProcessProbeResult(pid, None, "access_denied", "tasklist")
+        if str(pid) in stdout:
+            return ProcessProbeResult(pid, True, "alive", "tasklist")
+        if "no tasks are running" in combined or "没有运行" in combined:
+            return ProcessProbeResult(pid, False, "not_found", "tasklist")
+        return ProcessProbeResult(pid, None, "unknown", "tasklist")
 
     def command_line(self, pid: int | None) -> str:
+        return self.command_line_probe(pid).command_line
+
+    def command_line_probe(self, pid: int | None) -> CommandLineProbeResult:
         if not pid:
-            return ""
+            return CommandLineProbeResult(pid, "", "process_not_found")
         pid = int(pid)
         script = (
             f'$p=Get-CimInstance Win32_Process -Filter "ProcessId={pid}";'
-            'if ($null -ne $p -and $null -ne $p.CommandLine) { [Console]::Out.Write($p.CommandLine) }'
+            'if ($null -eq $p) { [Console]::Out.Write("__PROCESS_NOT_FOUND__") }'
+            'elseif ($null -ne $p.CommandLine) { [Console]::Out.Write($p.CommandLine) }'
         )
         try:
             result = subprocess.run(
@@ -133,10 +207,20 @@ class ProcessInspector:
                 creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
             )
             if result.returncode != 0:
-                return ""
-            return (result.stdout or "").strip()
-        except Exception:
-            return ""
+                combined = f"{result.stdout or ''}\n{result.stderr or ''}".lower()
+                if "access is denied" in combined or "access denied" in combined or "拒绝访问" in combined:
+                    return CommandLineProbeResult(pid, "", "access_denied")
+                return CommandLineProbeResult(pid, "", "query_failed", f"returncode_{result.returncode}")
+            stdout = (result.stdout or "").strip()
+            if stdout == "__PROCESS_NOT_FOUND__":
+                return CommandLineProbeResult(pid, "", "process_not_found")
+            if not stdout:
+                return CommandLineProbeResult(pid, "", "cim_empty")
+            return CommandLineProbeResult(pid, stdout, "available")
+        except subprocess.TimeoutExpired:
+            return CommandLineProbeResult(pid, "", "query_failed", "timeout")
+        except Exception as error:
+            return CommandLineProbeResult(pid, "", "query_failed", type(error).__name__)
 
     def listening_pid(self, port: int) -> int | None:
         try:
@@ -375,9 +459,16 @@ class RuntimeManager:
         account = self.registry.get(account_id)
         if not account:
             return RuntimeResult("account_not_found", account_id, False)
-        chrome_alive = self._owned_chrome_running(account)
+        self._verified_chrome_pid(account)
+        self._verified_worker_pid(account)
         account = self.registry.get(account_id) or account
-        worker_alive = self._owned_worker_running(account)
+        chrome_probe = self.inspector.probe_process(account.chrome_pid)
+        worker_probe = self.inspector.probe_process(account.worker_pid)
+        chrome_ownership = self._chrome_ownership(account, account.chrome_pid)
+        worker_ownership = self._worker_ownership(account, account.worker_pid)
+        chrome_alive = chrome_probe.alive is True
+        account = self.registry.get(account_id) or account
+        worker_alive = worker_probe.alive is True
         account = self.registry.get(account_id) or account
         worker_health = self._worker_health(account)
         cdp_reachable = self._tcp_reachable(account.chrome_cdp_port)
@@ -394,26 +485,49 @@ class RuntimeManager:
         else:
             extension_bootstrap_status = "extension_missing"
         profile_exists = Path(account.profile_path).exists()
-        if worker_alive and chrome_alive and worker_health and cdp_reachable:
-            runtime_status = "running" if account_match else "unhealthy"
-        elif worker_alive or chrome_alive or worker_health or cdp_reachable:
+        worker_health_matches = bool(worker_health) and worker_health.get("account_id") == account.account_id
+        worker_api_listener_pid = self.inspector.listening_pid(account.worker_api_port)
+        worker_ws_listener_pid = self.inspector.listening_pid(account.extension_ws_port)
+        chrome_cdp_listener_pid = self.inspector.listening_pid(account.chrome_cdp_port)
+        worker_ports_listening = bool(worker_api_listener_pid and worker_ws_listener_pid and int(worker_api_listener_pid) == int(worker_ws_listener_pid))
+        chrome_port_listening = bool(chrome_cdp_listener_pid)
+        worker_service_reachable = bool(worker_health_matches and (worker_ports_listening or worker_ownership["verified"]))
+        chrome_service_reachable = bool(cdp_reachable and (chrome_port_listening or chrome_ownership["verified"]))
+        runtime_healthy = bool(worker_service_reachable and chrome_service_reachable and account_match)
+        if runtime_healthy:
+            runtime_status = "running"
+        elif worker_service_reachable and chrome_service_reachable:
+            runtime_status = "unhealthy"
+        elif worker_service_reachable or chrome_service_reachable or worker_health or cdp_reachable or (worker_alive and worker_ownership["verified"]) or (chrome_alive and chrome_ownership["verified"]):
             runtime_status = "partial"
         else:
             runtime_status = "stopped"
+        ownership_status = self._combined_ownership_status(chrome_ownership, worker_ownership)
+        stop_safe = bool(chrome_ownership["verified"] and worker_ownership["verified"])
         details = {
             "account_id": account.account_id,
             "enabled": account.enabled,
             "registration_status": account.status,
             "runtime_status": runtime_status,
+            "runtime_healthy": runtime_healthy,
             "chrome_pid": account.chrome_pid,
+            "chrome_pid_recorded": account.chrome_pid,
             "chrome_process_alive": chrome_alive,
+            "chrome_process_probe_status": chrome_probe.status,
             "chrome_cdp_port": account.chrome_cdp_port,
             "chrome_cdp_reachable": cdp_reachable,
+            "chrome_cdp_listener_pid": chrome_cdp_listener_pid,
+            "chrome_ownership_verified": chrome_ownership["verified"],
+            "chrome_ownership_reason": chrome_ownership["reason"],
             "worker_pid": account.worker_pid,
+            "worker_pid_recorded": account.worker_pid,
             "worker_process_alive": worker_alive,
+            "worker_process_probe_status": worker_probe.status,
             "worker_api_port": account.worker_api_port,
+            "worker_api_listener_pid": worker_api_listener_pid,
             "worker_health_reachable": bool(worker_health),
             "extension_ws_port": account.extension_ws_port,
+            "worker_ws_listener_pid": worker_ws_listener_pid,
             "extension_connected": extension_connected,
             "extension_account_id": extension_account_id,
             "account_match": account_match,
@@ -428,6 +542,10 @@ class RuntimeManager:
             "last_stopped_at": account.last_stopped_at,
             "last_health_at": account.last_health_at,
             "last_error": account.last_error,
+            "worker_ownership_verified": worker_ownership["verified"],
+            "worker_ownership_reason": worker_ownership["reason"],
+            "ownership_status": ownership_status,
+            "stop_safe": stop_safe,
         }
         if worker_health.get("bootstrap_diagnostics"):
             details["bootstrap_diagnostics"] = worker_health.get("bootstrap_diagnostics")
@@ -640,14 +758,24 @@ class RuntimeManager:
         return None
 
     def _chrome_pid_matches(self, account: AccountRecord, pid: int | None) -> bool:
-        cmd = self.inspector.command_line(pid)
-        normalized = self._normalize_command_line(cmd)
+        return self._chrome_ownership(account, pid)["verified"]
+
+    def _chrome_ownership(self, account: AccountRecord, pid: int | None) -> dict:
+        probe = self.inspector.probe_process(pid)
+        if probe.alive is False:
+            return {"verified": False, "reason": "process_not_found"}
+        if probe.alive is None:
+            return {"verified": False, "reason": f"process_probe_{probe.status}"}
+        cmd_probe = self.inspector.command_line_probe(pid)
+        if cmd_probe.status != "available":
+            return {"verified": False, "reason": f"command_line_{cmd_probe.status}"}
+        normalized = self._normalize_command_line(cmd_probe.command_line)
         profile = self._normalize_command_line(str(Path(account.profile_path)))
-        return bool(
-            self.inspector.process_alive(pid)
-            and profile in normalized
-            and f"remote-debugging-port={account.chrome_cdp_port}" in normalized
-        )
+        if profile not in normalized:
+            return {"verified": False, "reason": "profile_mismatch"}
+        if f"remote-debugging-port={account.chrome_cdp_port}" not in normalized:
+            return {"verified": False, "reason": "cdp_port_mismatch"}
+        return {"verified": True, "reason": "verified"}
 
     def _owned_worker_running(self, account: AccountRecord) -> bool:
         pid = self._verified_worker_pid(account)
@@ -737,18 +865,38 @@ class RuntimeManager:
         return None
 
     def _worker_pid_matches(self, account: AccountRecord, pid: int | None) -> bool:
-        cmd = self.inspector.command_line(pid)
-        normalized = self._normalize_command_line(cmd)
-        return bool(
-            self.inspector.process_alive(pid)
-            and "runtime.worker_entry" in normalized
-            and "--runtime-account-id" in normalized
-            and account.account_id.lower() in normalized
-            and "--runtime-api-port" in normalized
-            and str(account.worker_api_port) in normalized
-            and "--runtime-ws-port" in normalized
-            and str(account.extension_ws_port) in normalized
-        )
+        return self._worker_ownership(account, pid)["verified"]
+
+    def _worker_ownership(self, account: AccountRecord, pid: int | None) -> dict:
+        probe = self.inspector.probe_process(pid)
+        if probe.alive is False:
+            return {"verified": False, "reason": "process_not_found"}
+        if probe.alive is None:
+            return {"verified": False, "reason": f"process_probe_{probe.status}"}
+        cmd_probe = self.inspector.command_line_probe(pid)
+        if cmd_probe.status != "available":
+            return {"verified": False, "reason": f"command_line_{cmd_probe.status}"}
+        normalized = self._normalize_command_line(cmd_probe.command_line)
+        if "runtime.worker_entry" not in normalized:
+            return {"verified": False, "reason": "worker_entry_missing"}
+        if "--runtime-account-id" not in normalized or account.account_id.lower() not in normalized:
+            return {"verified": False, "reason": "account_mismatch"}
+        if "--runtime-api-port" not in normalized or str(account.worker_api_port) not in normalized:
+            return {"verified": False, "reason": "api_port_mismatch"}
+        if "--runtime-ws-port" not in normalized or str(account.extension_ws_port) not in normalized:
+            return {"verified": False, "reason": "ws_port_mismatch"}
+        return {"verified": True, "reason": "verified"}
+
+    def _combined_ownership_status(self, chrome_ownership: dict, worker_ownership: dict) -> str:
+        verified = [chrome_ownership["verified"], worker_ownership["verified"]]
+        reasons = {chrome_ownership["reason"], worker_ownership["reason"]}
+        if all(verified):
+            return "verified"
+        if "profile_mismatch" in reasons or "cdp_port_mismatch" in reasons or "account_mismatch" in reasons or "api_port_mismatch" in reasons or "ws_port_mismatch" in reasons:
+            return "mismatch"
+        if any(verified):
+            return "partial"
+        return "unknown"
 
     def _worker_health(self, account: AccountRecord) -> dict:
         try:

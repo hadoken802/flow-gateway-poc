@@ -7,7 +7,7 @@ import pytest
 
 from runtime import cli
 from runtime import worker_entry
-from runtime.process_manager import BOOL, DWORD, HANDLE, INVALID_HANDLE_VALUE, KERNEL32, PROCESSENTRY32W, ProcessInspector, RuntimeManager, TerminationResult
+from runtime.process_manager import BOOL, DWORD, HANDLE, INVALID_HANDLE_VALUE, KERNEL32, PROCESSENTRY32W, ProcessInspector, ProcessProbeResult, RuntimeManager, TerminationResult
 from runtime.registry import AccountRecord, AccountRegistry
 
 
@@ -32,17 +32,33 @@ class FakeInspector:
     def __init__(self):
         self.commands = {}
         self.alive = set()
+        self.probe_status = {}
+        self.command_status = {}
         self.terminated = []
         self.listeners = {}
         self.parents = {}
         self.fail_terminate = set()
         self.keep_listeners = set()
 
+    def probe_process(self, pid):
+        if pid in self.probe_status:
+            return ProcessProbeResult(pid=pid, alive=self.probe_status[pid] == "alive", status=self.probe_status[pid], method="fake")
+        return ProcessProbeResult(pid=pid, alive=pid in self.alive, status="alive" if pid in self.alive else "not_found", method="fake")
+
     def process_alive(self, pid):
-        return pid in self.alive
+        return self.probe_process(pid).alive
 
     def command_line(self, pid):
         return self.commands.get(pid, "")
+
+    def command_line_probe(self, pid):
+        from runtime.process_manager import CommandLineProbeResult
+
+        status = self.command_status.get(pid)
+        if status:
+            return CommandLineProbeResult(pid=pid, command_line="", status=status)
+        command = self.commands.get(pid, "")
+        return CommandLineProbeResult(pid=pid, command_line=command, status="available" if command else "cim_empty")
 
     def terminate(self, pid, timeout_seconds=8.0, should_force=None):
         self.terminated.append(pid)
@@ -138,6 +154,7 @@ def add_account(registry, account_id="FLOW-005", enabled=True, status="login_req
         "FLOW-006": (8102, 9201, 9304),
         "FLOW-007": (8103, 9202, 9305),
         "FLOW-008": (8104, 9203, 9306),
+        "FLOW-012": (8108, 9206, 9310),
     }
     worker_api_port, extension_ws_port, chrome_cdp_port = ports[account_id]
     profile = registry.profiles_root / account_id
@@ -281,6 +298,61 @@ def test_command_line_returns_empty_on_failure_timeout_or_missing(monkeypatch):
 
     monkeypatch.setattr("runtime.process_manager.subprocess.run", raise_timeout)
     assert ProcessInspector().command_line(36836) == ""
+
+
+def test_process_alive_uses_get_process_when_tasklist_is_denied(monkeypatch):
+    def fake_run(command, **kwargs):
+        if command[0] == "powershell.exe":
+            return subprocess.CompletedProcess(command, 0, stdout="FOUND\r\n", stderr="")
+        return subprocess.CompletedProcess(command, 1, stdout="", stderr="ERROR: Access denied")
+
+    monkeypatch.setattr("runtime.process_manager.subprocess.run", fake_run)
+
+    probe = ProcessInspector().probe_process(35088)
+
+    assert probe.alive is True
+    assert probe.status == "alive"
+    assert probe.method == "get-process"
+    assert ProcessInspector().process_alive(35088) is True
+
+
+def test_process_probe_unknown_when_all_methods_are_denied(monkeypatch):
+    def fake_run(command, **kwargs):
+        return subprocess.CompletedProcess(command, 1, stdout="", stderr="ERROR: Access denied")
+
+    monkeypatch.setattr("runtime.process_manager.subprocess.run", fake_run)
+
+    probe = ProcessInspector().probe_process(35088)
+
+    assert probe.alive is None
+    assert probe.status == "access_denied"
+    assert ProcessInspector().process_alive(35088) is False
+
+
+def test_process_probe_not_found_when_get_process_is_empty(monkeypatch):
+    def fake_run(command, **kwargs):
+        if command[0] == "powershell.exe":
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(command, 0, stdout="INFO: No tasks are running which match the specified criteria.", stderr="")
+
+    monkeypatch.setattr("runtime.process_manager.subprocess.run", fake_run)
+
+    probe = ProcessInspector().probe_process(99999)
+
+    assert probe.alive is False
+    assert probe.status == "not_found"
+
+
+def test_command_line_probe_reports_cim_empty_without_faking_mismatch(monkeypatch):
+    monkeypatch.setattr(
+        "runtime.process_manager.subprocess.run",
+        lambda command, **kwargs: subprocess.CompletedProcess(command, 0, stdout="", stderr=""),
+    )
+
+    probe = ProcessInspector().command_line_probe(33036)
+
+    assert probe.command_line == ""
+    assert probe.status == "cim_empty"
 
 
 def test_terminate_uses_graceful_taskkill_without_force_first(monkeypatch):
@@ -569,6 +641,44 @@ def test_status_running_after_repair_when_worker_is_healthy(tmp_path, monkeypatc
 
     assert status.details["runtime_status"] == "running"
     assert status.details["chrome_pid"] == 36836
+
+
+def test_status_running_when_services_healthy_but_ownership_unknown(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    add_account(registry, account_id="FLOW-012")
+    registry.mark_started("FLOW-012", chrome_pid=33036, worker_pid=35088)
+    inspector = FakeInspector()
+    inspector.listeners[9310] = 33036
+    inspector.listeners[8108] = 35088
+    inspector.listeners[9206] = 35088
+    inspector.probe_status[33036] = "alive"
+    inspector.probe_status[35088] = "alive"
+    inspector.command_status[33036] = "cim_empty"
+    inspector.command_status[35088] = "cim_empty"
+    manager = make_manager(
+        tmp_path,
+        registry,
+        inspector=inspector,
+        health={"account_id": "FLOW-012", "extension_connected": True},
+        cdp=True,
+    )
+    monkeypatch.setattr("runtime.process_manager.port_is_listening", lambda port: port in {8108, 9206, 9310})
+
+    status = manager.status("FLOW-012")
+
+    assert status.result == "running"
+    assert status.details["runtime_status"] == "running"
+    assert status.details["runtime_healthy"] is True
+    assert status.details["chrome_process_alive"] is True
+    assert status.details["worker_process_alive"] is True
+    assert status.details["chrome_process_probe_status"] == "alive"
+    assert status.details["worker_process_probe_status"] == "alive"
+    assert status.details["chrome_ownership_verified"] is False
+    assert status.details["worker_ownership_verified"] is False
+    assert status.details["ownership_status"] == "unknown"
+    assert status.details["stop_safe"] is False
+    assert manager.stop_one("FLOW-012").result == "ownership_not_verified"
+    assert inspector.terminated == []
 
 
 def test_worker_service_pid_repairs_from_api_and_ws_listeners(tmp_path, monkeypatch):
@@ -1294,7 +1404,13 @@ def test_worker_ownership_requires_worker_entry_account_api_and_ws(tmp_path):
     assert manager.status("FLOW-005").details["worker_process_alive"] is True
 
     inspector.commands[12] = "python -m runtime.worker_entry --runtime-account-id FLOW-006 --runtime-api-port 8101 --runtime-ws-port 9200"
-    assert manager.status("FLOW-005").details["worker_process_alive"] is False
+    mismatch = manager.status("FLOW-005").details
+    assert mismatch["worker_process_alive"] is True
+    assert mismatch["worker_ownership_verified"] is False
+    assert mismatch["worker_ownership_reason"] == "account_mismatch"
 
     inspector.commands[12] = "python -m agent.main --runtime-account-id FLOW-005 --runtime-api-port 8101 --runtime-ws-port 9200"
-    assert manager.status("FLOW-005").details["worker_process_alive"] is False
+    missing_entry = manager.status("FLOW-005").details
+    assert missing_entry["worker_process_alive"] is True
+    assert missing_entry["worker_ownership_verified"] is False
+    assert missing_entry["worker_ownership_reason"] == "worker_entry_missing"
