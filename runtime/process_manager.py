@@ -10,7 +10,7 @@ from pathlib import Path
 from urllib.request import urlopen
 
 from .paths import EXTENSION_DIR, FLOWKIT_DIR, POC_ROOT
-from .port_allocator import port_is_listening
+from .port_allocator import port_can_bind, port_is_listening
 from .registry import AccountRecord, AccountRegistry
 
 
@@ -108,9 +108,10 @@ class RuntimeManager:
         if self._owned_chrome_running(account):
             self._log(account.account_id, "open-login", {"result": "already_running", "chrome_pid": account.chrome_pid})
             return RuntimeResult("already_running", account.account_id, True)
-        if port_is_listening(account.chrome_cdp_port):
+        conflict = self._listening_port_conflict(account, "chrome_cdp_port", account.chrome_cdp_port)
+        if conflict:
             self._log(account.account_id, "open-login", {"result": "port_conflict", "chrome_cdp_port": account.chrome_cdp_port})
-            return RuntimeResult("port_conflict", account.account_id, False, details={"port": account.chrome_cdp_port})
+            return conflict
         command = self.chrome_command(account)
         proc = self.popen(command, cwd=str(FLOWKIT_DIR))
         self.registry.mark_started(account.account_id, chrome_pid=proc.pid)
@@ -229,8 +230,6 @@ class RuntimeManager:
             str(chrome),
             f"--user-data-dir={Path(account.profile_path)}",
             f"--remote-debugging-port={account.chrome_cdp_port}",
-            f"--disable-extensions-except={self.extension_dir}",
-            f"--load-extension={self.extension_dir}",
             "--no-first-run",
             "--no-default-browser-check",
             self.flow_url,
@@ -286,9 +285,26 @@ class RuntimeManager:
             "chrome_cdp_port": account.chrome_cdp_port,
         }
         for name, port in ports.items():
-            if port_is_listening(port):
-                return RuntimeResult("port_conflict", account.account_id, False, details={"field": name, "port": port})
+            conflict = self._listening_port_conflict(account, name, port)
+            if conflict:
+                return conflict
         return None
+
+    def _listening_port_conflict(self, account: AccountRecord, field: str, port: int) -> RuntimeResult | None:
+        for other in self.registry.list_accounts():
+            if other.account_id == account.account_id:
+                continue
+            if int(getattr(other, field)) == int(port):
+                return RuntimeResult("port_conflict", account.account_id, False, details={"field": field, "port": port, "owner": other.account_id})
+        if not port_is_listening(port):
+            if port_can_bind(port):
+                return None
+            return RuntimeResult("port_conflict", account.account_id, False, details={"field": field, "port": port})
+        if field == "chrome_cdp_port" and self._owned_chrome_running(account):
+            return None
+        if field in {"worker_api_port", "extension_ws_port"} and self._owned_worker_running(account):
+            return None
+        return RuntimeResult("port_conflict", account.account_id, False, details={"field": field, "port": port})
 
     def _find_chrome(self) -> Path | None:
         if self.chrome_path:

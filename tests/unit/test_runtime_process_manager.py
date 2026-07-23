@@ -9,6 +9,11 @@ from runtime.process_manager import RuntimeManager
 from runtime.registry import AccountRecord, AccountRegistry
 
 
+@pytest.fixture(autouse=True)
+def default_free_bind_probe(monkeypatch):
+    monkeypatch.setattr("runtime.process_manager.port_can_bind", lambda port: True)
+
+
 class FakeProcess:
     next_pid = 1000
 
@@ -82,6 +87,7 @@ def add_account(registry, account_id="FLOW-005", enabled=True, status="login_req
 
 
 def make_manager(tmp_path, registry, inspector=None, health=None, cdp=False):
+    tmp_path.mkdir(parents=True, exist_ok=True)
     chrome = tmp_path / "chrome.exe"
     chrome.write_text("", encoding="utf-8")
     extension = tmp_path / "extension"
@@ -111,7 +117,7 @@ def make_manager(tmp_path, registry, inspector=None, health=None, cdp=False):
     return manager
 
 
-def test_open_login_uses_registered_profile_cdp_and_extension(tmp_path, monkeypatch):
+def test_open_login_uses_registered_profile_and_cdp_without_extension_flags(tmp_path, monkeypatch):
     registry = make_registry(tmp_path)
     account = add_account(registry)
     manager = make_manager(tmp_path, registry)
@@ -123,7 +129,8 @@ def test_open_login_uses_registered_profile_cdp_and_extension(tmp_path, monkeypa
     assert result.result == "opened"
     assert f"--user-data-dir={Path(account.profile_path)}" in command
     assert "--remote-debugging-port=9300" in command
-    assert any(str(manager.extension_dir) in part for part in command if "--load-extension" in part)
+    assert not any("--load-extension" in part for part in command)
+    assert not any("--disable-extensions-except" in part for part in command)
     assert registry.get("FLOW-005").chrome_pid == manager.launched[0].pid
 
 
@@ -155,6 +162,63 @@ def test_open_login_chrome_missing_and_port_conflict(tmp_path, monkeypatch):
     assert manager.open_login("FLOW-005").result == "port_conflict"
 
 
+def test_os_port_bind_failure_returns_conflict(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    add_account(registry)
+    manager = make_manager(tmp_path, registry)
+    monkeypatch.setattr("runtime.process_manager.port_is_listening", lambda port: False)
+    monkeypatch.setattr("runtime.process_manager.port_can_bind", lambda port: False)
+
+    assert manager.open_login("FLOW-005").result == "port_conflict"
+
+
+def test_registered_self_ports_do_not_create_conflict_when_os_ports_are_free(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    add_account(registry)
+    add_account(registry, "FLOW-006")
+    manager = make_manager(tmp_path, registry)
+    monkeypatch.setattr("runtime.process_manager.port_is_listening", lambda port: False)
+
+    assert manager.open_login("FLOW-005").result == "opened"
+
+    manager = make_manager(tmp_path / "start", registry, health={"account_id": "FLOW-005", "extension_connected": False}, cdp=False)
+    monkeypatch.setattr("runtime.process_manager.port_is_listening", lambda port: False)
+    assert manager.start_one("FLOW-005").result == "extension_not_connected"
+
+
+def test_other_account_registered_port_conflicts_only_when_os_listens(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    add_account(registry)
+    add_account(registry, "FLOW-006")
+    manager = make_manager(tmp_path, registry)
+    monkeypatch.setattr("runtime.process_manager.port_is_listening", lambda port: port == 9304)
+
+    assert manager.open_login("FLOW-005").result == "opened"
+
+
+def test_other_account_registered_same_target_port_returns_conflict(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    account = add_account(registry)
+    other = AccountRecord(
+        account_id="FLOW-006",
+        display_name="FLOW-006",
+        profile_path=str(tmp_path / "profiles" / "FLOW-006"),
+        worker_api_port=8102,
+        extension_ws_port=9201,
+        chrome_cdp_port=9300,
+        database_path=str(tmp_path / "data" / "FLOW-006.db"),
+        output_dir=str(tmp_path / "outputs" / "FLOW-006"),
+    )
+    monkeypatch.setattr(registry, "list_accounts", lambda: [account, other])
+    manager = make_manager(tmp_path, registry)
+    monkeypatch.setattr("runtime.process_manager.port_is_listening", lambda port: False)
+
+    result = manager.open_login("FLOW-005")
+
+    assert result.result == "port_conflict"
+    assert result.details["owner"] == "FLOW-006"
+
+
 def test_open_login_already_running_is_idempotent(tmp_path, monkeypatch):
     registry = make_registry(tmp_path)
     account = add_account(registry)
@@ -167,6 +231,17 @@ def test_open_login_already_running_is_idempotent(tmp_path, monkeypatch):
 
     assert manager.open_login("FLOW-005").result == "already_running"
     assert manager.launched == []
+
+
+def test_stale_pid_with_free_cdp_port_allows_open_login(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    add_account(registry)
+    registry.mark_started("FLOW-005", chrome_pid=222)
+    inspector = FakeInspector()
+    manager = make_manager(tmp_path, registry, inspector=inspector)
+    monkeypatch.setattr("runtime.process_manager.port_is_listening", lambda port: False)
+
+    assert manager.open_login("FLOW-005").result == "opened"
 
 
 def test_start_one_starts_worker_then_chrome_and_checks_health(tmp_path, monkeypatch):
