@@ -1,6 +1,7 @@
 """Single-account local runtime launcher and health checks."""
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import socket
@@ -16,6 +17,42 @@ from .registry import AccountRecord, AccountRegistry
 
 FLOW_URL = "https://labs.google/fx/tools/flow"
 PYTHON_EXE = POC_ROOT / ".venv" / "Scripts" / "python.exe"
+TH32CS_SNAPPROCESS = 0x00000002
+DWORD = ctypes.c_ulong
+BOOL = ctypes.c_int
+HANDLE = ctypes.c_void_p
+INVALID_HANDLE_VALUE = HANDLE(-1).value
+
+
+class PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", ctypes.c_ulong),
+        ("cntUsage", ctypes.c_ulong),
+        ("th32ProcessID", ctypes.c_ulong),
+        ("th32DefaultHeapID", ctypes.c_void_p),
+        ("th32ModuleID", ctypes.c_ulong),
+        ("cntThreads", ctypes.c_ulong),
+        ("th32ParentProcessID", ctypes.c_ulong),
+        ("pcPriClassBase", ctypes.c_long),
+        ("dwFlags", ctypes.c_ulong),
+        ("szExeFile", ctypes.c_wchar * 260),
+    ]
+
+
+def _load_kernel32():
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.argtypes = [DWORD, DWORD]
+    kernel32.CreateToolhelp32Snapshot.restype = HANDLE
+    kernel32.Process32FirstW.argtypes = [HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32FirstW.restype = BOOL
+    kernel32.Process32NextW.argtypes = [HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32NextW.restype = BOOL
+    kernel32.CloseHandle.argtypes = [HANDLE]
+    kernel32.CloseHandle.restype = BOOL
+    return kernel32
+
+
+KERNEL32 = _load_kernel32()
 
 
 @dataclass
@@ -53,15 +90,80 @@ class ProcessInspector:
             return ""
         try:
             result = subprocess.run(
-                ["wmic", "process", "where", f"ProcessId={int(pid)}", "get", "CommandLine", "/value"],
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    "$p=Get-CimInstance Win32_Process -Filter \"ProcessId=$args[0]\";"
+                    "if ($p) { $p.CommandLine }",
+                    str(int(pid)),
+                ],
                 capture_output=True,
                 text=True,
                 check=False,
+                timeout=3,
                 creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
             )
             return result.stdout or ""
         except Exception:
             return ""
+
+    def listening_pid(self, port: int) -> int | None:
+        try:
+            result = subprocess.run(
+                ["netstat", "-ano", "-p", "tcp"],
+                capture_output=True,
+                text=True,
+                check=False,
+                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+            )
+        except Exception:
+            return None
+        marker = f":{int(port)}"
+        for line in (result.stdout or "").splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and parts[0].upper().startswith("TCP") and parts[1].endswith(marker) and parts[3].upper() == "LISTENING":
+                try:
+                    return int(parts[-1])
+                except ValueError:
+                    return None
+        return None
+
+    def parent_pid(self, pid: int | None) -> int | None:
+        if not pid:
+            return None
+        snapshot = self._create_process_snapshot()
+        if self._snapshot_failed(snapshot):
+            return None
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            if not self._process_first(snapshot, entry):
+                return None
+            while True:
+                if int(entry.th32ProcessID) == int(pid):
+                    return int(entry.th32ParentProcessID)
+                if not self._process_next(snapshot, entry):
+                    return None
+        except Exception:
+            return None
+        finally:
+            self._close_handle(snapshot)
+
+    def _create_process_snapshot(self):
+        return KERNEL32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+
+    def _snapshot_failed(self, snapshot) -> bool:
+        return not snapshot or int(snapshot) == int(INVALID_HANDLE_VALUE)
+
+    def _process_first(self, snapshot, entry) -> bool:
+        return bool(KERNEL32.Process32FirstW(snapshot, ctypes.byref(entry)))
+
+    def _process_next(self, snapshot, entry) -> bool:
+        return bool(KERNEL32.Process32NextW(snapshot, ctypes.byref(entry)))
+
+    def _close_handle(self, snapshot) -> None:
+        KERNEL32.CloseHandle(snapshot)
 
     def terminate(self, pid: int, timeout_seconds: float = 8.0) -> bool:
         try:
@@ -132,15 +234,32 @@ class RuntimeManager:
         if conflict:
             self._log(account.account_id, "start-one", {"result": "port_conflict", **(conflict.details or {})})
             return conflict
+        existing_chrome_pid = self._verified_chrome_pid(account)
         worker_proc = None
         chrome_proc = None
         try:
-            worker_proc = self.popen(self.worker_command(account), cwd=str(FLOWKIT_DIR), env=self.worker_env(account))
+            log_handle = self._worker_log_file(account).open("ab")
+            try:
+                worker_proc = self.popen(
+                    self.worker_command(account),
+                    cwd=str(FLOWKIT_DIR),
+                    env=self.worker_env(account),
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+                )
+            finally:
+                log_handle.close()
             self.registry.mark_started(account.account_id, worker_pid=worker_proc.pid)
             self._log(account.account_id, "start-one", {"step": "worker_started", "pid": worker_proc.pid, "command": self._safe_command(self.worker_command(account))})
-            chrome_proc = self.popen(self.chrome_command(account), cwd=str(FLOWKIT_DIR))
-            self.registry.mark_started(account.account_id, chrome_pid=chrome_proc.pid)
-            self._log(account.account_id, "start-one", {"step": "chrome_started", "pid": chrome_proc.pid, "command": self._safe_command(self.chrome_command(account))})
+            if existing_chrome_pid:
+                self.registry.mark_started(account.account_id, chrome_pid=existing_chrome_pid)
+                self._log(account.account_id, "start-one", {"step": "chrome_reused", "pid": existing_chrome_pid})
+            else:
+                chrome_proc = self.popen(self.chrome_command(account), cwd=str(FLOWKIT_DIR))
+                self.registry.mark_started(account.account_id, chrome_pid=chrome_proc.pid)
+                self._log(account.account_id, "start-one", {"step": "chrome_started", "pid": chrome_proc.pid, "command": self._safe_command(self.chrome_command(account))})
             health = self.status(account.account_id)
             if health.details.get("account_match"):
                 self._log(account.account_id, "start-one", {"result": "started", "health": self._health_log_fields(health.details)})
@@ -161,6 +280,7 @@ class RuntimeManager:
         if not account:
             return RuntimeResult("account_not_found", account_id, False)
         chrome_alive = self._owned_chrome_running(account)
+        account = self.registry.get(account_id) or account
         worker_alive = self._owned_worker_running(account)
         worker_health = self._worker_health(account)
         cdp_reachable = self._tcp_reachable(account.chrome_cdp_port)
@@ -206,7 +326,10 @@ class RuntimeManager:
         account = self.registry.get(account_id)
         if not account:
             return RuntimeResult("account_not_found", account_id, False)
-        chrome_alive = self._owned_chrome_running(account)
+        verified_chrome_pid = self._verified_chrome_pid(account)
+        chrome_alive = verified_chrome_pid is not None
+        if verified_chrome_pid is not None and verified_chrome_pid != account.chrome_pid:
+            account = self.registry.get(account_id) or account
         worker_alive = self._owned_worker_running(account)
         if not chrome_alive and not worker_alive:
             self.registry.mark_stopped(account.account_id)
@@ -216,7 +339,7 @@ class RuntimeManager:
         if worker_alive:
             stopped = self.inspector.terminate(account.worker_pid) and stopped
         if chrome_alive:
-            stopped = self.inspector.terminate(account.chrome_pid) and stopped
+            stopped = self.inspector.terminate(verified_chrome_pid) and stopped
         if stopped:
             self.registry.mark_stopped(account.account_id)
             self._log(account.account_id, "stop-one", {"result": "stopped", "chrome_pid": account.chrome_pid, "worker_pid": account.worker_pid})
@@ -317,11 +440,41 @@ class RuntimeManager:
         return next((path for path in candidates if path.exists()), None)
 
     def _owned_chrome_running(self, account: AccountRecord) -> bool:
-        cmd = self.inspector.command_line(account.chrome_pid)
+        pid = self._verified_chrome_pid(account)
+        return pid is not None
+
+    def _verified_chrome_pid(self, account: AccountRecord) -> int | None:
+        pid = account.chrome_pid
+        if self._chrome_pid_matches(account, pid):
+            return int(pid)
+        listening_pid = self.inspector.listening_pid(account.chrome_cdp_port)
+        verified_pid = self._verified_chrome_pid_from_tree(account, listening_pid)
+        if verified_pid is not None:
+            if verified_pid != account.chrome_pid:
+                self.registry.mark_started(account.account_id, chrome_pid=verified_pid)
+            return verified_pid
+        return None
+
+    def _verified_chrome_pid_from_tree(self, account: AccountRecord, pid: int | None, max_depth: int = 8) -> int | None:
+        seen: set[int] = set()
+        current = pid
+        for _ in range(max_depth):
+            if not current or current in seen:
+                return None
+            seen.add(current)
+            if self._chrome_pid_matches(account, current):
+                return int(current)
+            if not self.inspector.process_alive(current):
+                return None
+            current = self.inspector.parent_pid(current)
+        return None
+
+    def _chrome_pid_matches(self, account: AccountRecord, pid: int | None) -> bool:
+        cmd = self.inspector.command_line(pid)
         normalized = self._normalize_command_line(cmd)
         profile = self._normalize_command_line(str(Path(account.profile_path)))
         return bool(
-            self.inspector.process_alive(account.chrome_pid)
+            self.inspector.process_alive(pid)
             and profile in normalized
             and f"remote-debugging-port={account.chrome_cdp_port}" in normalized
         )
@@ -361,6 +514,11 @@ class RuntimeManager:
 
     def _safe_command(self, command: list[str]) -> list[str]:
         return [part for part in command if "token" not in part.lower() and "cookie" not in part.lower()]
+
+    def _worker_log_file(self, account: AccountRecord) -> Path:
+        path = self.log_dir / f"{account.account_id}-worker.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
 
     def _health_log_fields(self, details: dict) -> dict:
         keys = [
