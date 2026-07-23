@@ -2,11 +2,20 @@ import json
 import hashlib
 from urllib.error import HTTPError
 from pathlib import Path
+from dataclasses import replace
 
 from runtime import cli
-from runtime.extension_bootstrap import CdpClient, EXPECTED_FLOWKIT_EXTENSION_ID, ExtensionBootstrapper, TEMPLATE_PROFILE_NAME, TEMPLATE_READY_FILE
+from runtime.extension_bootstrap import (
+    CREDENTIAL_STORAGE_POLICY_VERSION,
+    CdpClient,
+    EXPECTED_FLOWKIT_EXTENSION_ID,
+    ExtensionBootstrapper,
+    TEMPLATE_PROFILE_NAME,
+    TEMPLATE_READY_FILE,
+)
 from runtime.process_manager import RuntimeManager, RuntimeResult
 from runtime.registry import AccountRecord, AccountRegistry
+from agent.services.flow_client import FlowClient
 
 
 def make_registry(tmp_path):
@@ -56,6 +65,8 @@ class FakeRuntime:
         }
         self.inspector = type("Inspector", (), {"terminate": lambda self, pid: True})()
         self.launched = []
+        self.worker_only_started = []
+        self.start_one_calls = []
 
     def _find_chrome(self):
         return Path("C:/Chrome/chrome.exe")
@@ -69,13 +80,31 @@ class FakeRuntime:
         self.opened.append(account_id)
         return RuntimeResult("already_running", account_id, True)
 
+    def _owned_chrome_running(self, account):
+        return False
+
+    def _listening_port_conflict(self, account, field, port):
+        return None
+
+    def _safe_command(self, command):
+        return command
+
     def start_one(self, account_id):
+        self.start_one_calls.append(account_id)
         self.started.append(account_id)
         return RuntimeResult("started", account_id, True)
+
+    def start_worker_only(self, account_id):
+        self.worker_only_started.append(account_id)
+        return RuntimeResult("started", account_id, True, details={"worker_pid": 2000 + len(self.worker_only_started)})
 
     def stop_one(self, account_id):
         self.stopped.append(account_id)
         return RuntimeResult("stopped", account_id, True)
+
+    def _stop_started(self, account, worker_pid, chrome_pid):
+        self.stopped.append(account.account_id)
+        self.stopped_pids = {"worker_pid": worker_pid, "chrome_pid": chrome_pid}
 
     def status(self, account_id):
         payload = {**self.status_payload}
@@ -104,10 +133,22 @@ class FakeCdp:
             "discovered_extension_id": self.extension_id_value,
             "options_target_url": f"chrome-extension://{self.extension_id_value}/{options_page}",
             "service_worker_target_url": f"chrome-extension://{self.extension_id_value}/{service_worker}",
+            "target_summary": self.target_summary(self.list_targets(cdp_port), self.extension_id_value, options_page, service_worker),
         }
 
     def extension_present(self, cdp_port):
         return self.extension_id_value is not None
+
+    def list_targets(self, cdp_port):
+        if not self.extension_id_value:
+            return []
+        return [
+            {"type": "page", "url": f"chrome-extension://{self.extension_id_value}/options.html?bootstrap=1&nonce=SECRET"},
+            {"type": "service_worker", "url": f"chrome-extension://{self.extension_id_value}/background.js"},
+        ]
+
+    def target_summary(self, targets, expected_extension_id, options_page, service_worker):
+        return CdpClient().target_summary(targets, expected_extension_id, options_page, service_worker)
 
     def open_url(self, cdp_port, url):
         self.opened_urls.append((cdp_port, url))
@@ -135,7 +176,10 @@ def ready_template(root):
     template = root / TEMPLATE_PROFILE_NAME
     (template / "Default").mkdir(parents=True)
     (template / "Default" / "Preferences").write_text("{}", encoding="utf-8")
+    (template / "Default" / "Secure Preferences").write_text("{}", encoding="utf-8")
     (template / "Default" / "Extensions").mkdir()
+    (template / "Default" / "Extension State").mkdir()
+    (template / "Default" / "Extension State" / "MANIFEST-000001").write_text("extension-state", encoding="utf-8")
     (template / "Default" / "Local Extension Settings").mkdir()
     (template / "Default" / "SingletonLock").write_text("lock", encoding="utf-8")
     (template / "Default" / "Cookies").write_text("cookie", encoding="utf-8")
@@ -160,6 +204,33 @@ def ready_template(root):
     }
     (template / TEMPLATE_READY_FILE).write_text(json.dumps(marker), encoding="utf-8")
     return template
+
+
+def write_sensitive_profile_state(profile):
+    ext_storage = profile / "Default" / "Local Extension Settings" / EXPECTED_FLOWKIT_EXTENSION_ID
+    ext_storage.mkdir(parents=True, exist_ok=True)
+    (ext_storage / "000003.log").write_text("SIMULATED_TOKEN_SHOULD_NOT_COPY", encoding="utf-8")
+    for relative in (
+        Path("Default") / "Local Storage" / "leveldb",
+        Path("Default") / "IndexedDB" / "https_labs.google_0.indexeddb.leveldb",
+        Path("Default") / "Session Storage",
+        Path("Default") / "Service Worker" / "Database",
+        Path("Default") / "Sessions",
+        Path("Default") / "Storage",
+        Path("Default") / "WebStorage",
+    ):
+        directory = profile / relative
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "000003.log").write_text("SIMULATED_CALLBACK_SECRET_SHOULD_NOT_COPY", encoding="utf-8")
+    for relative in (
+        Path("Default") / "SharedStorage",
+        Path("Default") / "SharedStorage-wal",
+        Path("Default") / "SharedStorage-shm",
+        Path("Default") / "SharedStorage-journal",
+    ):
+        file_path = profile / relative
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text("SIMULATED_TOKEN_SHOULD_NOT_COPY", encoding="utf-8")
 
 
 def write_manifest(extension_dir, version="0.2.0"):
@@ -473,6 +544,89 @@ def test_profile_created_from_template_without_locks_or_cache(tmp_path):
     assert not (target / "Default" / "Login Data").exists()
 
 
+def test_profile_created_from_template_sanitizes_credential_storage(tmp_path):
+    registry = make_registry(tmp_path)
+    account = add_account(registry)
+    template = ready_template(registry.profiles_root)
+    write_sensitive_profile_state(template)
+    bootstrapper = ExtensionBootstrapper(registry, runtime=FakeRuntime(), cdp=FakeCdp(), profiles_root=registry.profiles_root)
+
+    result = bootstrapper.copy_template_to_profile(account)
+
+    target = Path(account.profile_path)
+    assert result.result == "profile_created_from_template"
+    assert result.details["credential_storage_sanitized"] is True
+    assert result.details["credential_storage_policy_version"] == CREDENTIAL_STORAGE_POLICY_VERSION
+    assert not (target / "Default" / "Local Extension Settings" / EXPECTED_FLOWKIT_EXTENSION_ID).exists()
+    assert not (target / "Default" / "Local Storage").exists()
+    assert not (target / "Default" / "IndexedDB").exists()
+    assert not (target / "Default" / "Session Storage").exists()
+    assert not (target / "Default" / "Service Worker").exists()
+    assert not (target / "Default" / "Sessions").exists()
+    assert not (target / "Default" / "Storage").exists()
+    assert not (target / "Default" / "WebStorage").exists()
+    assert not (target / "Default" / "SharedStorage").exists()
+    assert not (target / "Default" / "SharedStorage-wal").exists()
+    assert not (target / "Default" / "SharedStorage-shm").exists()
+    assert not (target / "Default" / "SharedStorage-journal").exists()
+    assert (target / "Default" / "Preferences").exists()
+    assert (target / "Default" / "Secure Preferences").exists()
+    assert (target / "Default" / "Extension State" / "MANIFEST-000001").exists()
+    assert (template / "Default" / "Local Extension Settings" / EXPECTED_FLOWKIT_EXTENSION_ID / "000003.log").exists()
+    assert (template / "Default" / "Local Storage" / "leveldb" / "000003.log").exists()
+    assert (template / "Default" / "SharedStorage").exists()
+
+
+def test_profile_cleanup_failure_fails_bootstrap_without_leaking_values(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    account = add_account(registry)
+    ready_template(registry.profiles_root)
+    bootstrapper = ExtensionBootstrapper(registry, runtime=FakeRuntime(), cdp=FakeCdp(), profiles_root=registry.profiles_root)
+    target = Path(account.profile_path)
+    (target / "Default" / "Local Storage").mkdir(parents=True)
+    (target / "Default" / "Local Storage" / "secret.txt").write_text("SIMULATED_TOKEN_SHOULD_NOT_LEAK", encoding="utf-8")
+
+    original_rmtree = __import__("shutil").rmtree
+
+    def fail_local_storage(path, *args, **kwargs):
+        if Path(path).name == "Local Storage":
+            raise OSError("permission denied")
+        return original_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr("runtime.extension_bootstrap.shutil.rmtree", fail_local_storage)
+
+    result = bootstrapper.sanitize_copied_profile(target)
+
+    rendered = json.dumps(result.to_dict())
+    assert result.result == "credential_storage_cleanup_failed"
+    assert result.ok is False
+    assert result.details["credential_storage_sanitized"] is False
+    assert "SIMULATED_TOKEN_SHOULD_NOT_LEAK" not in rendered
+
+
+def test_profile_cleanup_file_failure_fails_without_leaking_values(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    account = add_account(registry)
+    ready_template(registry.profiles_root)
+    bootstrapper = ExtensionBootstrapper(registry, runtime=FakeRuntime(), cdp=FakeCdp(), profiles_root=registry.profiles_root)
+    target = Path(account.profile_path)
+    (target / "Default").mkdir(parents=True)
+    shared = target / "Default" / "SharedStorage"
+    shared.write_text("SIMULATED_CALLBACK_SECRET_SHOULD_NOT_LEAK", encoding="utf-8")
+
+    def fail_unlink(self):
+        raise PermissionError("locked")
+
+    monkeypatch.setattr(Path, "unlink", fail_unlink)
+
+    result = bootstrapper.sanitize_copied_profile(target)
+
+    rendered = json.dumps(result.to_dict())
+    assert result.result == "credential_storage_cleanup_failed"
+    assert result.ok is False
+    assert "SIMULATED_CALLBACK_SECRET_SHOULD_NOT_LEAK" not in rendered
+
+
 def test_existing_profile_is_not_overwritten(tmp_path):
     registry = make_registry(tmp_path)
     account = add_account(registry)
@@ -499,11 +653,221 @@ def test_bootstrap_generates_account_specific_url_and_verifies_connection(tmp_pa
     result = bootstrapper.bootstrap_account("FLOW-006", repair=True)
 
     assert result.result == "extension_bootstrapped"
-    assert cdp.opened_urls[0][0] == 9304
-    assert f"chrome-extension://{EXPECTED_FLOWKIT_EXTENSION_ID}/options.html?" in cdp.opened_urls[0][1]
-    assert "account_id=FLOW-006" in cdp.opened_urls[0][1]
-    assert "ws_url=ws%3A%2F%2F127.0.0.1%3A9201" in cdp.opened_urls[0][1]
+    assert runtime.start_one_calls == []
+    assert runtime.worker_only_started == ["FLOW-006"]
+    command = runtime.launched[0][1]
+    assert any(f"chrome-extension://{EXPECTED_FLOWKIT_EXTENSION_ID}/options.html?" in part for part in command)
+    assert any("account_id=FLOW-006" in part for part in command)
+    assert any("ws_url=ws%3A%2F%2F127.0.0.1%3A9201" in part for part in command)
+    assert not any("labs.google" in part or "aisandbox" in part for part in command)
     assert result.details["extension_expected_ws_url"] == "ws://127.0.0.1:9201"
+
+
+def test_new_profile_bootstrap_reports_credential_storage_sanitized(tmp_path):
+    registry = make_registry(tmp_path)
+    account = add_account(registry, "FLOW-006")
+    template = ready_template(registry.profiles_root)
+    write_sensitive_profile_state(template)
+    runtime = FakeRuntime(status={"extension_connected": True, "extension_account_id": "FLOW-006", "account_match": True})
+    cdp = FakeCdp(EXPECTED_FLOWKIT_EXTENSION_ID)
+    bootstrapper = ExtensionBootstrapper(registry, runtime=runtime, cdp=cdp, profiles_root=registry.profiles_root, sleep=lambda _: None)
+
+    result = bootstrapper.bootstrap_account("FLOW-006")
+
+    assert result.result == "extension_bootstrapped"
+    assert result.details["credential_storage_sanitized"] is True
+    assert result.details["credential_storage_policy_version"] == CREDENTIAL_STORAGE_POLICY_VERSION
+    assert not (Path(account.profile_path) / "Default" / "Local Extension Settings" / EXPECTED_FLOWKIT_EXTENSION_ID).exists()
+
+
+def test_registered_empty_profile_is_rebuilt_from_template_without_repair(tmp_path):
+    registry = make_registry(tmp_path)
+    account = add_account(registry, "FLOW-006")
+    Path(account.profile_path).mkdir(parents=True)
+    template = ready_template(registry.profiles_root)
+    write_sensitive_profile_state(template)
+    runtime = FakeRuntime(status={"extension_connected": True, "extension_account_id": "FLOW-006", "account_match": True})
+    bootstrapper = ExtensionBootstrapper(registry, runtime=runtime, cdp=FakeCdp(), profiles_root=registry.profiles_root, sleep=lambda _: None)
+
+    result = bootstrapper.bootstrap_account("FLOW-006")
+
+    target = Path(account.profile_path)
+    assert result.result == "extension_bootstrapped"
+    assert result.details["profile_initialization_mode"] == "rebuilt_registered_empty_profile"
+    assert result.details["credential_storage_sanitized"] is True
+    assert result.details["credential_storage_policy_version"] == CREDENTIAL_STORAGE_POLICY_VERSION
+    assert (target / "Default" / "Preferences").exists()
+    assert not (target / "Default" / "Local Extension Settings" / EXPECTED_FLOWKIT_EXTENSION_ID).exists()
+    assert runtime.launched
+    assert runtime.start_one_calls == []
+    assert runtime.worker_only_started == ["FLOW-006"]
+    assert not any("labs.google" in part or "aisandbox" in part for part in runtime.launched[0][1])
+
+
+def test_registered_profile_with_empty_default_placeholder_is_rebuilt(tmp_path):
+    registry = make_registry(tmp_path)
+    account = add_account(registry, "FLOW-006")
+    (Path(account.profile_path) / "Default").mkdir(parents=True)
+    ready_template(registry.profiles_root)
+    runtime = FakeRuntime(status={"extension_connected": True, "extension_account_id": "FLOW-006", "account_match": True})
+    bootstrapper = ExtensionBootstrapper(registry, runtime=runtime, cdp=FakeCdp(), profiles_root=registry.profiles_root, sleep=lambda _: None)
+
+    result = bootstrapper.bootstrap_account("FLOW-006")
+
+    assert result.result == "extension_bootstrapped"
+    assert result.details["profile_initialization_mode"] == "rebuilt_registered_empty_profile"
+
+
+def test_registered_profile_with_file_is_partial_and_not_deleted(tmp_path):
+    registry = make_registry(tmp_path)
+    account = add_account(registry, "FLOW-006")
+    target = Path(account.profile_path)
+    target.mkdir(parents=True)
+    (target / "note.txt").write_text("SIMULATED_TOKEN_SHOULD_NOT_LEAK", encoding="utf-8")
+    ready_template(registry.profiles_root)
+    runtime = FakeRuntime()
+    bootstrapper = ExtensionBootstrapper(registry, runtime=runtime, cdp=FakeCdp(), profiles_root=registry.profiles_root)
+
+    result = bootstrapper.bootstrap_account("FLOW-006")
+
+    rendered = json.dumps(result.to_dict())
+    assert result.result == "profile_partial_requires_manual_review"
+    assert result.details["profile_state"] == "partial_or_unsafe"
+    assert result.details["safe_to_rebuild"] is False
+    assert result.details["blocking_paths"] == ["note.txt"]
+    assert "SIMULATED_TOKEN_SHOULD_NOT_LEAK" not in rendered
+    assert (target / "note.txt").exists()
+    assert runtime.launched == []
+
+
+def test_partial_chrome_artifacts_are_not_rebuilt_automatically(tmp_path):
+    registry = make_registry(tmp_path)
+    account = add_account(registry, "FLOW-006")
+    target = Path(account.profile_path)
+    for relative in (
+        Path("Local State"),
+        Path("Crashpad") / "reports" / "crash.dmp",
+        Path("Default") / "Service Worker" / "Database" / "LOG",
+        Path("Default") / "Sessions" / "Session_1",
+        Path("Default") / "WebStorage" / "QuotaManager",
+    ):
+        path = target / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("partial", encoding="utf-8")
+    ready_template(registry.profiles_root)
+    bootstrapper = ExtensionBootstrapper(registry, runtime=FakeRuntime(), cdp=FakeCdp(), profiles_root=registry.profiles_root)
+
+    result = bootstrapper.bootstrap_account("FLOW-006")
+
+    assert result.result == "profile_partial_requires_manual_review"
+    assert "Local State" in result.details["blocking_paths"]
+    assert "Crashpad/reports/crash.dmp" in result.details["blocking_paths"]
+    assert "Default/Service Worker/Database/LOG" in result.details["blocking_paths"]
+    assert "Default/Sessions/Session_1" in result.details["blocking_paths"]
+    assert "Default/WebStorage/QuotaManager" in result.details["blocking_paths"]
+
+
+def test_failed_chrome_profile_with_extension_state_is_partial_not_bootstrapped(tmp_path):
+    registry = make_registry(tmp_path)
+    account = add_account(registry, "FLOW-006")
+    target = Path(account.profile_path)
+    for relative in (
+        Path("Default") / "Extension State" / "MANIFEST-000001",
+        Path("Default") / "Service Worker" / "Database" / "LOG",
+        Path("Default") / "Sessions",
+        Path("Default") / "WebStorage" / "QuotaManager",
+        Path("Crashpad") / "reports" / "crash.dmp",
+    ):
+        path = target / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.suffix or path.name.startswith("MANIFEST") or path.name == "LOG":
+            path.write_text("partial", encoding="utf-8")
+        else:
+            path.mkdir(parents=True, exist_ok=True)
+    ready_template(registry.profiles_root)
+    bootstrapper = ExtensionBootstrapper(registry, runtime=FakeRuntime(), cdp=FakeCdp(), profiles_root=registry.profiles_root)
+
+    result = bootstrapper.bootstrap_account("FLOW-006")
+
+    assert result.result == "profile_partial_requires_manual_review"
+    assert result.details["profile_state"] == "partial_or_unsafe"
+    assert (target / "Default" / "Extension State" / "MANIFEST-000001").exists()
+
+
+def test_real_profile_features_are_never_deleted(tmp_path):
+    registry = make_registry(tmp_path)
+    account = add_account(registry, "FLOW-006")
+    target = Path(account.profile_path)
+    for relative in (
+        Path("Default") / "Preferences",
+        Path("Default") / "Secure Preferences",
+        Path("Default") / "Cookies",
+        Path("Default") / "Login Data",
+        Path("Default") / "Local Extension Settings" / EXPECTED_FLOWKIT_EXTENSION_ID / "LOG",
+        Path("Default") / "Local Storage" / "leveldb" / "LOG",
+        Path("Default") / "IndexedDB" / "db" / "LOG",
+    ):
+        path = target / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("profile-data", encoding="utf-8")
+    ready_template(registry.profiles_root)
+    bootstrapper = ExtensionBootstrapper(registry, runtime=FakeRuntime(), cdp=FakeCdp(), profiles_root=registry.profiles_root)
+
+    result = bootstrapper.bootstrap_account("FLOW-006")
+
+    assert result.result == "profile_exists"
+    assert result.details["profile_state"] == "bootstrapped_profile"
+    assert (target / "Default" / "Preferences").exists()
+    assert (target / "Default" / "Cookies").exists()
+
+
+def test_repair_existing_profile_does_not_recopy_template(tmp_path):
+    registry = make_registry(tmp_path)
+    account = add_account(registry, "FLOW-006")
+    target = Path(account.profile_path)
+    target.mkdir(parents=True)
+    (target / "keep.txt").write_text("keep", encoding="utf-8")
+    ready_template(registry.profiles_root)
+    runtime = FakeRuntime(status={"extension_connected": True, "extension_account_id": "FLOW-006", "account_match": True})
+    bootstrapper = ExtensionBootstrapper(registry, runtime=runtime, cdp=FakeCdp(), profiles_root=registry.profiles_root, sleep=lambda _: None)
+
+    result = bootstrapper.bootstrap_account("FLOW-006", repair=True)
+
+    assert result.result == "extension_bootstrapped"
+    assert result.details["profile_initialization_mode"] == "repaired_existing_profile"
+    assert result.details["credential_storage_sanitized"] is False
+    assert (target / "keep.txt").read_text(encoding="utf-8") == "keep"
+
+
+def test_rebuild_rejects_template_path_and_account_path_mismatch(tmp_path):
+    registry = make_registry(tmp_path)
+    account = add_account(registry, "FLOW-006")
+    template = ready_template(registry.profiles_root)
+    account = replace(account, profile_path=str(template))
+    bootstrapper = ExtensionBootstrapper(registry, runtime=FakeRuntime(), cdp=FakeCdp(), profiles_root=registry.profiles_root)
+
+    result = bootstrapper._profile_rebuild_safety(account)
+
+    assert result["safe_to_rebuild"] is False
+    assert result["profile_state"] == "partial_or_unsafe"
+
+
+def test_rebuild_delete_failure_blocks_bootstrap(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    account = add_account(registry, "FLOW-006")
+    Path(account.profile_path).mkdir(parents=True)
+    ready_template(registry.profiles_root)
+    bootstrapper = ExtensionBootstrapper(registry, runtime=FakeRuntime(), cdp=FakeCdp(), profiles_root=registry.profiles_root)
+
+    def fail_rmtree(path, *args, **kwargs):
+        raise OSError("locked")
+
+    monkeypatch.setattr("runtime.extension_bootstrap.shutil.rmtree", fail_rmtree)
+
+    result = bootstrapper.bootstrap_account("FLOW-006")
+
+    assert result.result == "profile_registered_empty_cleanup_failed"
+    assert result.details["profile_state"] == "registered_empty"
 
 
 def test_bootstrap_uses_different_config_per_account(tmp_path):
@@ -517,10 +881,12 @@ def test_bootstrap_uses_different_config_per_account(tmp_path):
     bootstrapper.bootstrap_account("FLOW-006", repair=True)
     bootstrapper.bootstrap_account("FLOW-007", repair=True)
 
-    assert "account_id=FLOW-006" in cdp.opened_urls[0][1]
-    assert "ws_url=ws%3A%2F%2F127.0.0.1%3A9201" in cdp.opened_urls[0][1]
-    assert "account_id=FLOW-007" in cdp.opened_urls[1][1]
-    assert "ws_url=ws%3A%2F%2F127.0.0.1%3A9202" in cdp.opened_urls[1][1]
+    first_command = bootstrapper.runtime.launched[0][1]
+    second_command = bootstrapper.runtime.launched[1][1]
+    assert any("account_id=FLOW-006" in part for part in first_command)
+    assert any("ws_url=ws%3A%2F%2F127.0.0.1%3A9201" in part for part in first_command)
+    assert any("account_id=FLOW-007" in part for part in second_command)
+    assert any("ws_url=ws%3A%2F%2F127.0.0.1%3A9202" in part for part in second_command)
 
 
 def test_bootstrap_rejects_invalid_account_id_or_port(tmp_path):
@@ -598,29 +964,52 @@ def test_failure_compensates_started_worker(tmp_path):
     assert runtime.stopped == ["FLOW-006"]
 
 
-def test_cdp_open_failure_is_structured_and_compensates_bootstrap_started_chrome(tmp_path):
+def test_bootstrap_extension_not_connected_keeps_initialization_context_and_avoids_second_chrome(tmp_path):
+    registry = make_registry(tmp_path)
+    account = add_account(registry)
+    ready_template(registry.profiles_root)
+    Path(account.profile_path).mkdir(parents=True)
+    runtime = FakeRuntime(status={"extension_connected": False, "extension_account_id": None, "account_match": False})
+    bootstrapper = ExtensionBootstrapper(registry, runtime=runtime, cdp=FakeCdp(), profiles_root=registry.profiles_root, sleep=lambda _: None)
+
+    result = bootstrapper.bootstrap_account("FLOW-006")
+
+    assert result.result == "extension_not_connected"
+    assert runtime.start_one_calls == []
+    assert runtime.worker_only_started == ["FLOW-006"]
+    assert len(runtime.launched) == 1
+    assert not any("labs.google" in part or "aisandbox" in part for part in runtime.launched[0][1])
+    assert result.details["chrome_started_by_bootstrap"] is True
+    assert result.details["worker_started_by_bootstrap"] is True
+    assert result.details["compensation_result"] == "stopped"
+    assert result.details["profile_initialization_mode"] == "rebuilt_registered_empty_profile"
+    assert result.details["credential_storage_sanitized"] is True
+    assert result.details["credential_storage_policy_version"] == CREDENTIAL_STORAGE_POLICY_VERSION
+
+
+def test_reused_chrome_cdp_open_failure_is_structured_without_stopping_existing_chrome(tmp_path):
     registry = make_registry(tmp_path)
     account = add_account(registry)
     Path(account.profile_path).mkdir(parents=True)
 
-    class OpeningRuntime(FakeRuntime):
-        def open_login(self, account_id):
-            self.opened.append(account_id)
-            return RuntimeResult("opened", account_id, True)
+    class ReusedRuntime(FakeRuntime):
+        def _owned_chrome_running(self, account):
+            return True
 
     class FailingCdp(FakeCdp):
         def open_url(self, cdp_port, url):
             raise Exception("boom")
 
-    runtime = OpeningRuntime()
+    runtime = ReusedRuntime()
     bootstrapper = ExtensionBootstrapper(registry, runtime=runtime, cdp=FailingCdp(), profiles_root=registry.profiles_root)
 
     result = bootstrapper.bootstrap_account("FLOW-006", repair=True)
 
     assert result.result == "failed"
-    assert result.details["chrome_started_by_bootstrap"] is True
-    assert result.details["worker_started_by_bootstrap"] is False
+    assert result.details["chrome_started_by_bootstrap"] is False
+    assert result.details["worker_started_by_bootstrap"] is True
     assert runtime.stopped == ["FLOW-006"]
+    assert runtime.stopped_pids["chrome_pid"] is None
 
 
 def test_reused_chrome_open_failure_does_not_close_existing_chrome(tmp_path):
@@ -632,14 +1021,19 @@ def test_reused_chrome_open_failure_does_not_close_existing_chrome(tmp_path):
         def open_url(self, cdp_port, url):
             raise Exception("boom")
 
-    runtime = FakeRuntime()
+    class ReusedRuntime(FakeRuntime):
+        def _owned_chrome_running(self, account):
+            return True
+
+    runtime = ReusedRuntime()
     bootstrapper = ExtensionBootstrapper(registry, runtime=runtime, cdp=FailingCdp(), profiles_root=registry.profiles_root)
 
     result = bootstrapper.bootstrap_account("FLOW-006", repair=True)
 
     assert result.result == "failed"
     assert result.details["chrome_started_by_bootstrap"] is False
-    assert runtime.stopped == []
+    assert runtime.stopped == ["FLOW-006"]
+    assert runtime.stopped_pids["chrome_pid"] is None
 
 
 def test_batch_results_are_isolated(tmp_path):
@@ -742,6 +1136,142 @@ def test_regular_chrome_command_does_not_readd_extension_flags(tmp_path):
     assert not any("--disable-extensions-except" in part for part in command)
 
 
+def test_bootstrap_chrome_command_opens_options_not_flow_url(tmp_path):
+    registry = make_registry(tmp_path)
+    account = add_account(registry)
+    bootstrapper = ExtensionBootstrapper(registry, runtime=FakeRuntime(), cdp=FakeCdp(), profiles_root=registry.profiles_root)
+
+    command = bootstrapper.bootstrap_chrome_command(account, f"chrome-extension://{EXPECTED_FLOWKIT_EXTENSION_ID}/options.html?bootstrap=1")
+
+    assert any("chrome-extension://" in part and "options.html?bootstrap=1" in part for part in command)
+    assert not any("labs.google" in part or "aisandbox" in part for part in command)
+
+
+def test_bootstrap_chrome_logs_are_account_specific_and_handles_close(tmp_path):
+    registry = make_registry(tmp_path)
+    account = add_account(registry)
+    Path(account.profile_path).mkdir(parents=True)
+    runtime = FakeRuntime()
+    runtime.log_dir = tmp_path / "logs" / "runtime"
+    bootstrapper = ExtensionBootstrapper(registry, runtime=runtime, cdp=FakeCdp(), profiles_root=registry.profiles_root)
+
+    result = bootstrapper._open_bootstrap_chrome(account, bootstrapper.bootstrap_url(account, "SECRET_NONCE", EXPECTED_FLOWKIT_EXTENSION_ID))
+
+    assert result.result == "opened"
+    assert result.details["stdout_log"].endswith("FLOW-006-bootstrap-chrome-stdout.log")
+    assert result.details["stderr_log"].endswith("FLOW-006-bootstrap-chrome-stderr.log")
+    kwargs = runtime.launched[0][2]
+    assert kwargs["stdout"].closed is True
+    assert kwargs["stderr"].closed is True
+
+
+def test_bootstrap_chrome_command_redacts_nonce_and_sensitive_query(tmp_path):
+    registry = make_registry(tmp_path)
+    account = add_account(registry)
+    runtime = FakeRuntime()
+    runtime.log_dir = tmp_path / "logs" / "runtime"
+    bootstrapper = ExtensionBootstrapper(registry, runtime=runtime, cdp=FakeCdp(), profiles_root=registry.profiles_root)
+    command = bootstrapper.bootstrap_chrome_command(
+        account,
+        f"chrome-extension://{EXPECTED_FLOWKIT_EXTENSION_ID}/options.html?bootstrap=1&account_id=FLOW-006&ws_url=ws://127.0.0.1:9201&api_url=http://127.0.0.1:8102&nonce=SECRET_NONCE",
+    )
+
+    redacted = bootstrapper._redacted_bootstrap_command(command)
+
+    joined = " ".join(redacted)
+    assert "SECRET_NONCE" not in joined
+    assert "nonce=%3Credacted%3E" in joined or "nonce=<redacted>" in joined
+    assert "FLOW-006" in joined
+    assert "127.0.0.1" in joined
+    assert "flowKey" not in joined
+
+
+def test_cdp_target_summary_records_only_safe_categories():
+    targets = [
+        {"type": "page", "url": f"chrome-extension://{EXPECTED_FLOWKIT_EXTENSION_ID}/options.html?bootstrap=1&nonce=SECRET"},
+        {"type": "service_worker", "url": f"chrome-extension://{EXPECTED_FLOWKIT_EXTENSION_ID}/background.js"},
+        {"type": "page", "url": "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/options.html?token=SECRET"},
+        {"type": "page", "url": "https://labs.google/fx/tools/flow?token=SECRET"},
+        {"type": "page", "url": "about:blank"},
+    ]
+
+    summary = CdpClient().target_summary(targets, EXPECTED_FLOWKIT_EXTENSION_ID, "options.html", "background.js")
+
+    assert summary["options_target_seen"] is True
+    assert summary["service_worker_target_seen"] is True
+    assert summary["target_counts"]["target_extension_options"] == 1
+    assert summary["target_counts"]["target_extension_service_worker"] == 1
+    assert summary["target_counts"]["target_other_extension"] == 1
+    assert summary["target_counts"]["target_non_extension"] == 1
+    assert "SECRET" not in json.dumps(summary)
+
+
+def test_bootstrap_returns_chrome_exited_when_chrome_dies_during_extension_wait(tmp_path):
+    registry = make_registry(tmp_path)
+    account = add_account(registry)
+    ready_template(registry.profiles_root)
+    Path(account.profile_path).mkdir(parents=True)
+    runtime = FakeRuntime(status={
+        "extension_connected": False,
+        "extension_account_id": "FLOW-006",
+        "account_match": False,
+        "chrome_process_alive": False,
+        "chrome_cdp_reachable": False,
+        "worker_process_alive": True,
+        "worker_health_reachable": True,
+    })
+    runtime.log_dir = tmp_path / "logs" / "runtime"
+    bootstrapper = ExtensionBootstrapper(registry, runtime=runtime, cdp=FakeCdp(), profiles_root=registry.profiles_root, sleep=lambda _: None)
+
+    result = bootstrapper.bootstrap_account("FLOW-006")
+
+    assert result.result == "bootstrap_chrome_exited"
+    assert result.details["stage"] == "wait_extension_ready"
+    assert result.details["chrome_exit_detected_at"]
+    assert result.details["options_target_seen"] is True
+    assert result.details["service_worker_target_seen"] is True
+    assert result.details["credential_storage_policy_version"] == CREDENTIAL_STORAGE_POLICY_VERSION
+
+
+def test_flow_client_bootstrap_diagnostics_are_restricted_and_bounded():
+    client = FlowClient()
+
+    assert client.record_bootstrap_diagnostic({"source": "options", "event": "bootstrap_detected", "account_id": "FLOW-999"}, "FLOW-006") is False
+    assert client.record_bootstrap_diagnostic({"source": "options", "event": "unknown_event", "account_id": "FLOW-006"}, "FLOW-006") is False
+    assert client.record_bootstrap_diagnostic({
+        "source": "background",
+        "event": "websocket_connect_attempt",
+        "account_id": "FLOW-006",
+        "ws": {"host": "127.0.0.1", "port": 9201},
+        "flowKey": "SIMULATED_TOKEN_SHOULD_NOT_RECORD",
+    }, "FLOW-006") is True
+    for index in range(60):
+        client.record_bootstrap_diagnostic({"source": "options", "event": "bootstrap_detected", "account_id": "FLOW-006", "at": index}, "FLOW-006")
+
+    snapshot = client.bootstrap_diagnostics
+    assert snapshot["event_count"] == 50
+    assert snapshot["ws_connect_attempted"] is False
+    assert "SIMULATED_TOKEN" not in json.dumps(snapshot)
+
+
+def test_template_persistence_launch_does_not_open_flow_url(tmp_path):
+    registry = make_registry(tmp_path)
+    bootstrapper = ExtensionBootstrapper(registry, runtime=FakeRuntime(), cdp=FakeCdp(), profiles_root=registry.profiles_root)
+
+    first = bootstrapper.template_chrome_command(load_extension=True)
+    second = bootstrapper.template_chrome_command(load_extension=False)
+
+    assert first[-1] == "about:blank"
+    assert second[-1] == "about:blank"
+    assert not any("labs.google" in part or "aisandbox" in part for part in first + second)
+
+
+def test_regular_start_one_does_not_reference_credential_sanitizer():
+    text = Path("runtime/process_manager.py").read_text(encoding="utf-8")
+
+    assert "sanitize_copied_profile" not in text
+
+
 def test_options_js_contains_bootstrap_validation():
     text = Path("extension/options.js").read_text(encoding="utf-8")
 
@@ -749,6 +1279,52 @@ def test_options_js_contains_bootstrap_validation():
     assert "127.0.0.1" in text
     assert "bootstrap_nonces" in text
     assert "history.replaceState" in text
+    assert "BOOTSTRAP_RESET" in text
+    assert "chrome.storage.local.remove(['flowKey', 'callbackSecret', 'metrics'])" in text
+    assert "metrics: emptyMetrics()" in text
+    for stage in (
+        "bootstrap_detected",
+        "parameters_validated",
+        "bootstrap_reset_requested",
+        "bootstrap_reset_succeeded",
+        "storage_cleanup_started",
+        "storage_cleanup_succeeded",
+        "account_config_write_started",
+        "account_config_write_succeeded",
+        "nonce_recorded",
+        "reconnect_requested",
+        "reconnect_acknowledged",
+        "bootstrap_completed",
+        "bootstrap_failed",
+    ):
+        assert stage in text
+    assert "/api/ext/bootstrap-diagnostic" in text
+
+
+def test_background_bootstrap_reset_clears_sensitive_memory_without_logging_values():
+    text = Path("extension/background.js").read_text(encoding="utf-8")
+
+    assert "BOOTSTRAP_RESET" in text
+    assert "flowKey = null" in text
+    assert "callbackSecret = null" in text
+    assert "tokenCapturedAt: null" in text
+    assert "requestCount: 0" in text
+    assert "SIMULATED_TOKEN" not in text
+    for event in (
+        "service_worker_started",
+        "bootstrap_reset_received",
+        "bootstrap_reset_completed",
+        "old_websocket_closed",
+        "storage_change_observed",
+        "reconnect_received",
+        "websocket_connect_attempt",
+        "websocket_open",
+        "register_sent",
+        "extension_ready_sent",
+        "websocket_error",
+        "websocket_close",
+    ):
+        assert event in text
 
 
 def test_template_default_config_does_not_connect_flow001():

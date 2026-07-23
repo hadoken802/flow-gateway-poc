@@ -48,6 +48,10 @@ async def ws_handler(websocket):
                 if data.get("type") == "keepalive":
                     await websocket.send(json.dumps({"type": "keepalive_ack", "at": data.get("at")}))
                     continue
+                if data.get("type") == "bootstrap_diagnostic":
+                    ok = client.record_bootstrap_diagnostic(data, FLOW_ACCOUNT_ID)
+                    await websocket.send(json.dumps({"type": "bootstrap_diagnostic_ack", "ok": ok}))
+                    continue
                 if not registered:
                     registered = await register_extension(client, data, websocket)
                     if not registered:
@@ -213,6 +217,19 @@ async def ext_callback(request: Request):
     return {"ok": False, "reason": "no matching pending request"}
 
 
+@app.post("/api/ext/bootstrap-diagnostic")
+async def ext_bootstrap_diagnostic(request: Request):
+    raw = await request.body()
+    if len(raw) > 2048:
+        return {"ok": False, "reason": "payload_too_large"}
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return {"ok": False, "reason": "invalid_json"}
+    client = get_flow_client()
+    return {"ok": client.record_bootstrap_diagnostic(data, FLOW_ACCOUNT_ID)}
+
+
 @app.get("/health")
 async def health():
     client = get_flow_client()
@@ -225,6 +242,7 @@ async def health():
         "ws_max_size_bytes": EXTENSION_WS_MAX_SIZE_BYTES,
         "extension_connected": client.connected,
         "ws": client.ws_stats,
+        "bootstrap_diagnostics": client.bootstrap_diagnostics,
     }
 
 

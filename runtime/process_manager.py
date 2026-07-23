@@ -320,19 +320,7 @@ class RuntimeManager:
             if existing_worker_pid:
                 self._log(account.account_id, "start-one", {"step": "worker_reused", "pid": existing_worker_pid})
             else:
-                log_handle = self._worker_log_file(account).open("ab")
-                try:
-                    worker_proc = self.popen(
-                        self.worker_command(account),
-                        cwd=str(FLOWKIT_DIR),
-                        env=self.worker_env(account),
-                        stdout=log_handle,
-                        stderr=subprocess.STDOUT,
-                        stdin=subprocess.DEVNULL,
-                        creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
-                    )
-                finally:
-                    log_handle.close()
+                worker_proc = self._start_worker_process(account)
                 self.registry.mark_started(account.account_id, worker_pid=worker_proc.pid)
                 self._log(account.account_id, "start-one", {"step": "worker_started", "pid": worker_proc.pid, "command": self._safe_command(self.worker_command(account))})
             if existing_chrome_pid:
@@ -356,6 +344,32 @@ class RuntimeManager:
             self._stop_started(account, getattr(worker_proc, "pid", None), getattr(chrome_proc, "pid", None))
             self._log(account.account_id, "start-one", {"result": "failed", "error": str(error)})
             return RuntimeResult("failed", account.account_id, False, str(error), {"rollback_completed": True})
+
+    def start_worker_only(self, account_id: str) -> RuntimeResult:
+        account = self._account_or_error(account_id)
+        if isinstance(account, RuntimeResult):
+            return account
+        base = self._preflight(account, require_profile=True, require_chrome=False)
+        if base:
+            return base
+        for field, port in (("worker_api_port", account.worker_api_port), ("extension_ws_port", account.extension_ws_port)):
+            conflict = self._listening_port_conflict(account, field, port)
+            if conflict:
+                self._log(account.account_id, "start-worker-only", {"result": "port_conflict", **(conflict.details or {})})
+                return conflict
+        existing_worker_pid = self._verified_worker_pid(account)
+        if existing_worker_pid:
+            self.registry.mark_started(account.account_id, worker_pid=existing_worker_pid)
+            self._log(account.account_id, "start-worker-only", {"result": "already_running", "pid": existing_worker_pid})
+            return RuntimeResult("already_running", account.account_id, True, details={"worker_pid": existing_worker_pid})
+        try:
+            worker_proc = self._start_worker_process(account)
+        except Exception as error:
+            self._log(account.account_id, "start-worker-only", {"result": "worker_start_failed", "error": str(error)})
+            return RuntimeResult("worker_start_failed", account.account_id, False, str(error))
+        self.registry.mark_started(account.account_id, worker_pid=worker_proc.pid)
+        self._log(account.account_id, "start-worker-only", {"result": "started", "pid": worker_proc.pid, "command": self._safe_command(self.worker_command(account))})
+        return RuntimeResult("started", account.account_id, True, details={"worker_pid": worker_proc.pid})
 
     def status(self, account_id: str) -> RuntimeResult:
         account = self.registry.get(account_id)
@@ -415,6 +429,8 @@ class RuntimeManager:
             "last_health_at": account.last_health_at,
             "last_error": account.last_error,
         }
+        if worker_health.get("bootstrap_diagnostics"):
+            details["bootstrap_diagnostics"] = worker_health.get("bootstrap_diagnostics")
         self.registry.mark_health(account.account_id, None if runtime_status != "unhealthy" else "runtime_unhealthy")
         self._log(account.account_id, "status", {"result": runtime_status, "health": self._health_log_fields(details)})
         return RuntimeResult(runtime_status, account.account_id, runtime_status == "running", details=details)
@@ -519,6 +535,21 @@ class RuntimeManager:
             "OUTPUT_DIR": account.output_dir,
         })
         return env
+
+    def _start_worker_process(self, account: AccountRecord):
+        log_handle = self._worker_log_file(account).open("ab")
+        try:
+            return self.popen(
+                self.worker_command(account),
+                cwd=str(FLOWKIT_DIR),
+                env=self.worker_env(account),
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+            )
+        finally:
+            log_handle.close()
 
     def _account_or_error(self, account_id: str) -> AccountRecord | RuntimeResult:
         account = self.registry.get(account_id)

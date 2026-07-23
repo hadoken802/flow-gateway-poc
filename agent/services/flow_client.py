@@ -9,6 +9,7 @@ import json
 import logging
 import time
 import uuid
+from collections import deque
 from typing import Optional
 
 from agent.config import (
@@ -18,6 +19,35 @@ from agent.config import (
 from agent.services.headers import random_headers
 
 logger = logging.getLogger(__name__)
+
+
+BOOTSTRAP_DIAGNOSTIC_EVENTS = {
+    "bootstrap_detected",
+    "parameters_validated",
+    "bootstrap_reset_requested",
+    "bootstrap_reset_succeeded",
+    "storage_cleanup_started",
+    "storage_cleanup_succeeded",
+    "account_config_write_started",
+    "account_config_write_succeeded",
+    "nonce_recorded",
+    "reconnect_requested",
+    "reconnect_acknowledged",
+    "bootstrap_completed",
+    "bootstrap_failed",
+    "service_worker_started",
+    "bootstrap_reset_received",
+    "bootstrap_reset_completed",
+    "old_websocket_closed",
+    "storage_change_observed",
+    "reconnect_received",
+    "websocket_connect_attempt",
+    "websocket_open",
+    "register_sent",
+    "extension_ready_sent",
+    "websocket_error",
+    "websocket_close",
+}
 
 
 class FlowClient:
@@ -36,6 +66,7 @@ class FlowClient:
         self._ws_last_close_code: Optional[int] = None
         self._ws_last_close_reason: Optional[str] = None
         self._ws_last_error: Optional[str] = None
+        self._bootstrap_diagnostics = deque(maxlen=50)
         self._background_tasks: set[asyncio.Task] = set()
         self._shutting_down = False
 
@@ -118,6 +149,49 @@ class FlowClient:
             "last_close_reason": self._ws_last_close_reason,
             "last_error": self._ws_last_error,
         }
+
+    @property
+    def bootstrap_diagnostics(self) -> dict:
+        events = list(self._bootstrap_diagnostics)
+        last_options = next((item for item in reversed(events) if item.get("source") == "options"), None)
+        last_background = next((item for item in reversed(events) if item.get("source") == "background"), None)
+        return {
+            "events": events,
+            "event_count": len(events),
+            "last_options_stage": last_options.get("event") if last_options else None,
+            "last_background_stage": last_background.get("event") if last_background else None,
+            "ws_connect_attempted": any(item.get("event") == "websocket_connect_attempt" for item in events),
+            "ws_opened": any(item.get("event") == "websocket_open" for item in events),
+        }
+
+    def record_bootstrap_diagnostic(self, data: dict, expected_account_id: str) -> bool:
+        if not isinstance(data, dict):
+            return False
+        if str(data.get("account_id") or "") != expected_account_id:
+            return False
+        event = str(data.get("event") or "")
+        if event not in BOOTSTRAP_DIAGNOSTIC_EVENTS:
+            return False
+        source = str(data.get("source") or "")
+        if source not in {"options", "background"}:
+            return False
+        safe = {
+            "source": source,
+            "event": event,
+            "account_id": expected_account_id,
+            "at": data.get("at"),
+        }
+        if isinstance(data.get("ws"), dict):
+            ws = data["ws"]
+            safe["ws"] = {
+                "host": ws.get("host") if ws.get("host") in {"127.0.0.1", "localhost"} else None,
+                "port": int(ws.get("port")) if str(ws.get("port") or "").isdigit() else None,
+            }
+        if isinstance(data.get("error_code"), str):
+            safe["error_code"] = data["error_code"][:80]
+        self._bootstrap_diagnostics.append(safe)
+        logger.info("Bootstrap diagnostic source=%s event=%s account=%s", source, event, expected_account_id)
+        return True
 
     async def handle_message(self, data: dict):
         """Handle incoming message from extension."""

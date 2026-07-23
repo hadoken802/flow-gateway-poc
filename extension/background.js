@@ -18,6 +18,7 @@ let initialized = false;
 let activeSocketId = 0;
 let accountId = DEFAULT_ACCOUNT_ID;
 let wsUrl = DEFAULT_AGENT_WS_URL;
+let apiUrl = '';
 let flowKey = null;
 let callbackSecret = null;  // Auth secret for HTTP callback, received from server on WS connect
 let state = 'off'; // off | idle | running
@@ -29,6 +30,71 @@ let metrics = {
   failedCount: 0,
   lastError: null,
 };
+
+function resetBootstrapSensitiveState() {
+  flowKey = null;
+  callbackSecret = null;
+  metrics = {
+    tokenCapturedAt: null,
+    requestCount: 0,
+    successCount: 0,
+    failedCount: 0,
+    lastError: null,
+  };
+  manualDisconnect = false;
+  clearReconnectTimer();
+  if (ws) {
+    const old = ws;
+    ws = null;
+    old.close();
+    recordBootstrapDiagnostic('old_websocket_closed');
+  }
+}
+
+function safeWs() {
+  try {
+    const url = new URL(wsUrl);
+    return { host: url.hostname, port: Number(url.port) };
+  } catch (_) {
+    return {};
+  }
+}
+
+function safeWsErrorCode(eventOrError) {
+  const message = eventOrError?.message || eventOrError?.reason || '';
+  if (message.toLowerCase().includes('refused')) return 'connection_refused';
+  if (eventOrError?.code) return 'connection_closed';
+  if (eventOrError?.name === 'SyntaxError') return 'invalid_url';
+  if (eventOrError?.name) return 'runtime_error';
+  return 'unknown';
+}
+
+function validBootstrapDiagnosticTarget() {
+  try {
+    const url = new URL(apiUrl);
+    return url.protocol === 'http:' && url.hostname === '127.0.0.1' && Number(url.port) >= 1 && Number(url.port) <= 65535;
+  } catch (_) {
+    return false;
+  }
+}
+
+function recordBootstrapDiagnostic(event, error_code = null) {
+  if (!accountId || !validBootstrapDiagnosticTarget()) return;
+  const payload = {
+    type: 'bootstrap_diagnostic',
+    source: 'background',
+    event,
+    account_id: accountId,
+    ws: safeWs(),
+    at: new Date().toISOString(),
+  };
+  if (error_code) payload.error_code = error_code;
+  fetch(`${apiUrl}/api/ext/bootstrap-diagnostic`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  }).catch(() => {});
+}
 
 // ─── URL → Log Type Classifier ─────────────────────────────
 
@@ -83,12 +149,14 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 async function init() {
   if (initialized) return;
   initialized = true;
-  const data = await chrome.storage.local.get(['flowKey', 'metrics', 'callbackSecret', 'account_id', 'ws_url']);
+  const data = await chrome.storage.local.get(['flowKey', 'metrics', 'callbackSecret', 'account_id', 'ws_url', 'api_url']);
   if (data.flowKey) flowKey = data.flowKey;
   if (data.metrics) Object.assign(metrics, data.metrics);
   if (data.callbackSecret) callbackSecret = data.callbackSecret;
   accountId = data.account_id || '';
   wsUrl = data.ws_url || '';
+  apiUrl = data.api_url || '';
+  recordBootstrapDiagnostic('service_worker_started');
   if (accountId && wsUrl) connectToAgent();
   chrome.alarms.create('keepAlive', { periodInMinutes: 0.4 });
 }
@@ -97,13 +165,16 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== 'local') return;
   if (changes.account_id) accountId = changes.account_id.newValue || '';
   if (changes.ws_url) wsUrl = changes.ws_url.newValue || '';
-  if (changes.account_id || changes.ws_url) {
+  if (changes.api_url) apiUrl = changes.api_url.newValue || '';
+  if (changes.account_id || changes.ws_url || changes.api_url) {
+    recordBootstrapDiagnostic('storage_change_observed');
     manualDisconnect = false;
     clearReconnectTimer();
     if (ws) {
       const old = ws;
       ws = null;
       old.close();
+      recordBootstrapDiagnostic('old_websocket_closed');
     }
     connectToAgent();
   }
@@ -198,8 +269,10 @@ function connectToAgent() {
       const old = ws;
       ws = null;
       old.close();
+      recordBootstrapDiagnostic('old_websocket_closed');
     }
     const socketId = ++activeSocketId;
+    recordBootstrapDiagnostic('websocket_connect_attempt');
     ws = new WebSocket(wsUrl);
     console.log(`[FlowAgent] Connecting account=${accountId} ws=${wsUrl}`);
     ws._flowSocketId = socketId;
@@ -212,6 +285,7 @@ function connectToAgent() {
   ws.onopen = () => {
     if (ws?._flowSocketId !== activeSocketId) return;
     console.log('[FlowAgent] Connected to agent');
+    recordBootstrapDiagnostic('websocket_open');
     chrome.alarms.clear('reconnect');
     startKeepaliveTimer();
     setState('idle');
@@ -220,6 +294,7 @@ function connectToAgent() {
       account_id: accountId,
       profile_id: accountId,
     }));
+    recordBootstrapDiagnostic('register_sent');
 
     // Token refresh alarm — 45 min gives buffer before ~60 min expiry
     chrome.alarms.create('token-refresh', { periodInMinutes: 45 });
@@ -230,6 +305,7 @@ function connectToAgent() {
       flowKeyPresent: !!flowKey,
       tokenAge: flowKey && metrics.tokenCapturedAt ? Date.now() - metrics.tokenCapturedAt : null,
     }));
+    recordBootstrapDiagnostic('extension_ready_sent');
     if (flowKey) {
       ws.send(JSON.stringify({ type: 'token_captured', flowKey }));
     }
@@ -281,11 +357,13 @@ function connectToAgent() {
     metrics.lastError = tooLarge ? 'websocket_message_too_large' : `WS_CLOSED_${event.code}`;
     chrome.storage.local.set({ metrics });
     console.warn(`[FlowAgent] WS closed code=${event.code} reason=${reason || ''} error=${metrics.lastError}`);
+    recordBootstrapDiagnostic('websocket_close', safeWsErrorCode(event));
     if (!manualDisconnect) scheduleReconnect();
   };
 
   ws.onerror = (e) => {
     console.error('[FlowAgent] WS error:', e);
+    recordBootstrapDiagnostic('websocket_error', safeWsErrorCode(e));
     metrics.lastError = 'WS_ERROR';
     chrome.storage.local.set({ metrics });
   };
@@ -335,7 +413,7 @@ function sendToAgent(msg) {
       if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
       return;
     }
-    fetch(agentHttpUrl + '/api/ext/callback', {
+    fetch(getAgentHttpUrl() + '/api/ext/callback', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(msg),
@@ -696,13 +774,24 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
     manualDisconnect = false;
     if (msg.account_id) accountId = msg.account_id;
     if (msg.ws_url) wsUrl = msg.ws_url;
+    if (msg.api_url) apiUrl = msg.api_url;
+    recordBootstrapDiagnostic('reconnect_received');
     clearReconnectTimer();
     if (ws) {
       const old = ws;
       ws = null;
       old.close();
+      recordBootstrapDiagnostic('old_websocket_closed');
     }
     connectToAgent();
+    reply({ ok: true });
+    return true;
+  }
+
+  if (msg.type === 'BOOTSTRAP_RESET') {
+    recordBootstrapDiagnostic('bootstrap_reset_received');
+    resetBootstrapSensitiveState();
+    recordBootstrapDiagnostic('bootstrap_reset_completed');
     reply({ ok: true });
     return true;
   }

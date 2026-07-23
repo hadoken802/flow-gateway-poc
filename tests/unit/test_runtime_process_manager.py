@@ -159,6 +159,40 @@ def add_account(registry, account_id="FLOW-005", enabled=True, status="login_req
     return registry.get(account_id)
 
 
+def test_start_worker_only_uses_account_env_and_does_not_launch_chrome(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    account = add_account(registry, "FLOW-005")
+    Path(account.profile_path).mkdir(parents=True, exist_ok=True)
+    extension_dir = tmp_path / "extension"
+    extension_dir.mkdir()
+    inspector = FakeInspector()
+    launched = []
+
+    def fake_popen(command, **kwargs):
+        proc = FakeProcess(command, **kwargs)
+        launched.append(proc)
+        return proc
+
+    manager = RuntimeManager(registry, inspector=inspector, popen=fake_popen, chrome_path=tmp_path / "chrome.exe", extension_dir=extension_dir)
+    monkeypatch.setattr("runtime.process_manager.port_is_listening", lambda port: False)
+
+    result = manager.start_worker_only("FLOW-005")
+
+    assert result.result == "started"
+    assert len(launched) == 1
+    assert "-m" in launched[0].command
+    assert "runtime.worker_entry" in launched[0].command
+    assert not any("chrome" in str(part).lower() for part in launched[0].command)
+    assert not any("labs.google" in str(part) for part in launched[0].command)
+    assert launched[0].env["FLOW_ACCOUNT_ID"] == "FLOW-005"
+    assert launched[0].env["AGENT_API_PORT"] == "8101"
+    assert launched[0].env["EXTENSION_WS_PORT"] == "9200"
+    assert launched[0].env["FLOW_DB_PATH"] == account.database_path
+    assert launched[0].env["OUTPUT_DIR"] == account.output_dir
+    assert launched[0].kwargs["stdin"] == subprocess.DEVNULL
+    assert launched[0].kwargs["stderr"] == subprocess.STDOUT
+
+
 def make_manager(tmp_path, registry, inspector=None, health=None, cdp=False):
     tmp_path.mkdir(parents=True, exist_ok=True)
     chrome = tmp_path / "chrome.exe"
