@@ -45,6 +45,9 @@ class FakeInspector:
     def terminate(self, pid, timeout_seconds=8.0):
         self.terminated.append(pid)
         self.alive.discard(pid)
+        for port, owner_pid in list(self.listeners.items()):
+            if owner_pid == pid:
+                del self.listeners[port]
         return True
 
     def listening_pid(self, port):
@@ -188,6 +191,38 @@ def test_toolhelp_api_signatures_use_pointer_sized_handle():
     assert KERNEL32.CloseHandle.argtypes == [HANDLE]
     assert KERNEL32.CloseHandle.restype is BOOL
     assert HANDLE is ctypes.c_void_p
+
+
+def test_command_line_embeds_int_pid_without_args(monkeypatch):
+    seen = {}
+
+    def fake_run(command, **kwargs):
+        seen["command"] = command
+        return subprocess.CompletedProcess(command, 0, stdout='"C:\\Chrome\\chrome.exe" --remote-debugging-port=9300\r\n', stderr="")
+
+    monkeypatch.setattr("runtime.process_manager.subprocess.run", fake_run)
+
+    assert ProcessInspector().command_line("36836") == '"C:\\Chrome\\chrome.exe" --remote-debugging-port=9300'
+    script = seen["command"][4]
+    assert "$args[0]" not in script
+    assert "ProcessId=36836" in script
+    assert seen["command"][0] == "powershell.exe"
+    assert "-NoProfile" in seen["command"]
+    assert "-NonInteractive" in seen["command"]
+
+
+def test_command_line_returns_empty_on_failure_timeout_or_missing(monkeypatch):
+    monkeypatch.setattr(
+        "runtime.process_manager.subprocess.run",
+        lambda command, **kwargs: subprocess.CompletedProcess(command, 1, stdout="36836", stderr="error"),
+    )
+    assert ProcessInspector().command_line(36836) == ""
+
+    def raise_timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired("powershell.exe", 3)
+
+    monkeypatch.setattr("runtime.process_manager.subprocess.run", raise_timeout)
+    assert ProcessInspector().command_line(36836) == ""
 
 
 def test_parent_pid_returns_none_when_target_missing_and_closes_handle():
@@ -365,6 +400,125 @@ def test_status_running_after_repair_when_worker_is_healthy(tmp_path, monkeypatc
     assert status.details["chrome_pid"] == 36836
 
 
+def test_worker_service_pid_repairs_from_api_and_ws_listeners(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    account = add_account(registry)
+    registry.mark_started("FLOW-005", chrome_pid=36836, worker_pid=352)
+    inspector = FakeInspector()
+    inspector.listeners[8101] = 38820
+    inspector.listeners[9200] = 38820
+    inspector.alive.update({36836, 352, 38820})
+    inspector.commands[36836] = f"chrome --user-data-dir={account.profile_path} --remote-debugging-port=9300"
+    add_running_worker(inspector, 352)
+    add_running_worker(inspector, 38820)
+    manager = make_manager(tmp_path, registry, inspector=inspector, health={"account_id": "FLOW-005", "extension_connected": True}, cdp=True)
+    monkeypatch.setattr("runtime.process_manager.port_is_listening", lambda port: port in {8101, 9200, 9300})
+
+    status = manager.status("FLOW-005")
+
+    assert status.details["runtime_status"] == "running"
+    assert status.details["worker_pid"] == 38820
+    assert registry.get("FLOW-005").worker_pid == 38820
+
+
+def test_worker_service_pid_takes_priority_over_live_launcher_pid(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    account = add_account(registry)
+    registry.mark_started("FLOW-005", chrome_pid=36836, worker_pid=352)
+    inspector = FakeInspector()
+    inspector.listeners[9300] = 36836
+    inspector.listeners[8101] = 38820
+    inspector.listeners[9200] = 38820
+    inspector.parents[38820] = 352
+    inspector.alive.update({36836, 352, 38820})
+    inspector.commands[36836] = f"chrome --user-data-dir={account.profile_path} --remote-debugging-port=9300"
+    add_running_worker(inspector, 352)
+    add_running_worker(inspector, 38820)
+    manager = make_manager(tmp_path, registry, inspector=inspector, health={"account_id": "FLOW-005", "extension_connected": True}, cdp=True)
+    monkeypatch.setattr("runtime.process_manager.port_is_listening", lambda port: port in {8101, 9200, 9300})
+
+    status = manager.status("FLOW-005")
+
+    assert status.details["runtime_status"] == "running"
+    assert status.details["worker_pid"] == 38820
+    assert registry.get("FLOW-005").worker_pid == 38820
+
+
+def test_worker_launcher_pid_is_temporary_when_ports_are_not_listening(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    add_account(registry)
+    registry.mark_started("FLOW-005", worker_pid=352)
+    inspector = FakeInspector()
+    add_running_worker(inspector, 352)
+    manager = make_manager(tmp_path, registry, inspector=inspector)
+    monkeypatch.setattr("runtime.process_manager.port_is_listening", lambda port: False)
+
+    status = manager.status("FLOW-005")
+
+    assert status.details["worker_process_alive"] is True
+    assert status.details["worker_pid"] == 352
+    assert registry.get("FLOW-005").worker_pid == 352
+
+
+def test_worker_service_pid_rejects_different_api_and_ws_pids(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    add_account(registry)
+    registry.mark_started("FLOW-005", worker_pid=352)
+    inspector = FakeInspector()
+    inspector.listeners[8101] = 38820
+    inspector.listeners[9200] = 38821
+    inspector.alive.update({38820, 38821})
+    add_running_worker(inspector, 38820)
+    add_running_worker(inspector, 38821)
+    manager = make_manager(tmp_path, registry, inspector=inspector, health={"account_id": "FLOW-005", "extension_connected": True}, cdp=False)
+    monkeypatch.setattr("runtime.process_manager.port_is_listening", lambda port: port in {8101, 9200})
+
+    assert manager.status("FLOW-005").details["worker_process_alive"] is False
+    assert registry.get("FLOW-005").worker_pid == 352
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python -m runtime.worker_entry --runtime-account-id FLOW-006 --runtime-api-port 8101 --runtime-ws-port 9200",
+        "python -m runtime.worker_entry --runtime-account-id FLOW-005 --runtime-api-port 9999 --runtime-ws-port 9200",
+        "python -m runtime.worker_entry --runtime-account-id FLOW-005 --runtime-api-port 8101 --runtime-ws-port 9999",
+    ],
+)
+def test_worker_service_pid_rejects_wrong_account_or_ports(tmp_path, monkeypatch, command):
+    registry = make_registry(tmp_path)
+    add_account(registry)
+    registry.mark_started("FLOW-005", worker_pid=352)
+    inspector = FakeInspector()
+    inspector.listeners[8101] = 38820
+    inspector.listeners[9200] = 38820
+    inspector.alive.add(38820)
+    inspector.commands[38820] = command
+    manager = make_manager(tmp_path, registry, inspector=inspector, health={"account_id": "FLOW-005", "extension_connected": True}, cdp=False)
+    monkeypatch.setattr("runtime.process_manager.port_is_listening", lambda port: port in {8101, 9200})
+
+    assert manager.status("FLOW-005").details["worker_process_alive"] is False
+
+
+def test_worker_listener_child_pid_repairs_to_matching_parent(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    add_account(registry)
+    registry.mark_started("FLOW-005", worker_pid=352)
+    inspector = FakeInspector()
+    inspector.listeners[8101] = 40001
+    inspector.listeners[9200] = 40001
+    inspector.parents[40001] = 38820
+    inspector.alive.update({40001, 38820})
+    inspector.commands[40001] = "python child-helper"
+    add_running_worker(inspector, 38820)
+    manager = make_manager(tmp_path, registry, inspector=inspector, health={"account_id": "FLOW-005", "extension_connected": True}, cdp=False)
+    monkeypatch.setattr("runtime.process_manager.port_is_listening", lambda port: port in {8101, 9200})
+
+    manager.status("FLOW-005")
+
+    assert registry.get("FLOW-005").worker_pid == 38820
+
+
 def test_chrome_listener_child_pid_repairs_to_matching_parent(tmp_path, monkeypatch):
     registry = make_registry(tmp_path)
     account = add_account(registry)
@@ -476,6 +630,57 @@ def test_start_one_reuses_verified_chrome_listener_and_redirects_worker_logs(tmp
     assert registry.get("FLOW-005").chrome_pid == 36836
 
 
+def test_start_one_reuses_existing_worker_service_pid(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    account = add_account(registry)
+    registry.mark_started("FLOW-005", chrome_pid=36836, worker_pid=352)
+    inspector = FakeInspector()
+    inspector.alive.update({36836, 38820})
+    inspector.commands[36836] = f"chrome --user-data-dir={account.profile_path} --remote-debugging-port=9300"
+    add_running_worker(inspector, 38820)
+    inspector.listeners[8101] = 38820
+    inspector.listeners[9200] = 38820
+    manager = make_manager(tmp_path, registry, inspector=inspector, health={"account_id": "FLOW-005", "extension_connected": True}, cdp=True)
+    monkeypatch.setattr("runtime.process_manager.port_is_listening", lambda port: port in {8101, 9200, 9300})
+
+    result = manager.start_one("FLOW-005")
+
+    assert result.result == "already_running"
+    assert manager.launched == []
+    assert registry.get("FLOW-005").worker_pid == 38820
+
+
+def test_start_one_records_service_pid_after_worker_health(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    account = add_account(registry)
+    registry.mark_started("FLOW-005", chrome_pid=36836)
+    inspector = FakeInspector()
+    inspector.listeners[9300] = 36836
+    inspector.alive.add(36836)
+    inspector.commands[36836] = f"chrome --user-data-dir={account.profile_path} --remote-debugging-port=9300"
+    manager = make_manager(tmp_path, registry, inspector=inspector, health={"account_id": "FLOW-005", "extension_connected": True}, cdp=True)
+    original_popen = manager.popen
+
+    def fake_popen(command, **kwargs):
+        proc = original_popen(command, **kwargs)
+        if command[1:3] == ["-m", "runtime.worker_entry"]:
+            inspector.listeners[8101] = 38820
+            inspector.listeners[9200] = 38820
+            inspector.parents[38820] = proc.pid
+            add_running_worker(inspector, 38820)
+        return proc
+
+    manager.popen = fake_popen
+    monkeypatch.setattr("runtime.process_manager.port_is_listening", lambda port: port in inspector.listeners)
+
+    result = manager.start_one("FLOW-005")
+
+    assert result.result == "started"
+    assert len(manager.launched) == 1
+    assert manager.launched[0].pid != 38820
+    assert registry.get("FLOW-005").worker_pid == 38820
+
+
 def test_worker_logs_are_account_specific(tmp_path, monkeypatch):
     registry = make_registry(tmp_path)
     add_account(registry)
@@ -579,7 +784,7 @@ def test_pid_reuse_rejects_wrong_owner_and_stop_only_target(tmp_path):
     assert inspector.terminated == []
 
 
-def test_stop_one_stops_owned_processes_and_is_idempotent(tmp_path):
+def test_stop_one_stops_owned_processes_and_is_idempotent(tmp_path, monkeypatch):
     registry = make_registry(tmp_path)
     account = add_account(registry)
     registry.mark_started("FLOW-005", chrome_pid=11, worker_pid=12)
@@ -588,6 +793,7 @@ def test_stop_one_stops_owned_processes_and_is_idempotent(tmp_path):
     inspector.commands[11] = f"chrome --user-data-dir={account.profile_path} --remote-debugging-port=9300"
     inspector.commands[12] = "python -m runtime.worker_entry --runtime-account-id FLOW-005 --runtime-api-port 8101 --runtime-ws-port 9200"
     manager = make_manager(tmp_path, registry, inspector=inspector)
+    monkeypatch.setattr("runtime.process_manager.port_is_listening", lambda port: port in inspector.listeners)
 
     assert manager.stop_one("FLOW-005").result == "stopped"
     assert inspector.terminated == [12, 11]
@@ -607,6 +813,40 @@ def test_stop_one_uses_repaired_chrome_pid(tmp_path, monkeypatch):
 
     assert manager.stop_one("FLOW-005").result == "stopped"
     assert inspector.terminated == [36836]
+
+
+def test_stop_one_uses_repaired_worker_service_pid(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    add_account(registry)
+    registry.mark_started("FLOW-005", worker_pid=352)
+    inspector = FakeInspector()
+    inspector.listeners[8101] = 38820
+    inspector.listeners[9200] = 38820
+    inspector.alive.add(38820)
+    add_running_worker(inspector, 38820)
+    manager = make_manager(tmp_path, registry, inspector=inspector)
+    monkeypatch.setattr("runtime.process_manager.port_is_listening", lambda port: port in inspector.listeners)
+
+    assert manager.stop_one("FLOW-005").result == "stopped"
+    assert inspector.terminated == [38820]
+
+
+def test_stop_one_stops_service_pid_before_verified_launcher_pid(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    add_account(registry)
+    registry.mark_started("FLOW-005", worker_pid=352)
+    inspector = FakeInspector()
+    inspector.listeners[8101] = 38820
+    inspector.listeners[9200] = 38820
+    inspector.parents[38820] = 352
+    inspector.alive.update({352, 38820})
+    add_running_worker(inspector, 352)
+    add_running_worker(inspector, 38820)
+    manager = make_manager(tmp_path, registry, inspector=inspector)
+    monkeypatch.setattr("runtime.process_manager.port_is_listening", lambda port: port in inspector.listeners)
+
+    assert manager.stop_one("FLOW-005").result == "stopped"
+    assert inspector.terminated == [38820, 352]
 
 
 def test_import_existing_safely_corrects_planned_only(tmp_path):

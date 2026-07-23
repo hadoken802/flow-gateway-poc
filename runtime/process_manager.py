@@ -6,6 +6,7 @@ import json
 import os
 import socket
 import subprocess
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from urllib.request import urlopen
@@ -88,15 +89,19 @@ class ProcessInspector:
     def command_line(self, pid: int | None) -> str:
         if not pid:
             return ""
+        pid = int(pid)
+        script = (
+            f'$p=Get-CimInstance Win32_Process -Filter "ProcessId={pid}";'
+            'if ($null -ne $p -and $null -ne $p.CommandLine) { [Console]::Out.Write($p.CommandLine) }'
+        )
         try:
             result = subprocess.run(
                 [
-                    "powershell",
+                    "powershell.exe",
                     "-NoProfile",
+                    "-NonInteractive",
                     "-Command",
-                    "$p=Get-CimInstance Win32_Process -Filter \"ProcessId=$args[0]\";"
-                    "if ($p) { $p.CommandLine }",
-                    str(int(pid)),
+                    script,
                 ],
                 capture_output=True,
                 text=True,
@@ -104,7 +109,9 @@ class ProcessInspector:
                 timeout=3,
                 creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
             )
-            return result.stdout or ""
+            if result.returncode != 0:
+                return ""
+            return (result.stdout or "").strip()
         except Exception:
             return ""
 
@@ -235,24 +242,30 @@ class RuntimeManager:
             self._log(account.account_id, "start-one", {"result": "port_conflict", **(conflict.details or {})})
             return conflict
         existing_chrome_pid = self._verified_chrome_pid(account)
+        existing_worker_pid = self._verified_worker_pid(account)
+        if existing_worker_pid:
+            self.registry.mark_started(account.account_id, worker_pid=existing_worker_pid)
         worker_proc = None
         chrome_proc = None
         try:
-            log_handle = self._worker_log_file(account).open("ab")
-            try:
-                worker_proc = self.popen(
-                    self.worker_command(account),
-                    cwd=str(FLOWKIT_DIR),
-                    env=self.worker_env(account),
-                    stdout=log_handle,
-                    stderr=subprocess.STDOUT,
-                    stdin=subprocess.DEVNULL,
-                    creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
-                )
-            finally:
-                log_handle.close()
-            self.registry.mark_started(account.account_id, worker_pid=worker_proc.pid)
-            self._log(account.account_id, "start-one", {"step": "worker_started", "pid": worker_proc.pid, "command": self._safe_command(self.worker_command(account))})
+            if existing_worker_pid:
+                self._log(account.account_id, "start-one", {"step": "worker_reused", "pid": existing_worker_pid})
+            else:
+                log_handle = self._worker_log_file(account).open("ab")
+                try:
+                    worker_proc = self.popen(
+                        self.worker_command(account),
+                        cwd=str(FLOWKIT_DIR),
+                        env=self.worker_env(account),
+                        stdout=log_handle,
+                        stderr=subprocess.STDOUT,
+                        stdin=subprocess.DEVNULL,
+                        creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+                    )
+                finally:
+                    log_handle.close()
+                self.registry.mark_started(account.account_id, worker_pid=worker_proc.pid)
+                self._log(account.account_id, "start-one", {"step": "worker_started", "pid": worker_proc.pid, "command": self._safe_command(self.worker_command(account))})
             if existing_chrome_pid:
                 self.registry.mark_started(account.account_id, chrome_pid=existing_chrome_pid)
                 self._log(account.account_id, "start-one", {"step": "chrome_reused", "pid": existing_chrome_pid})
@@ -264,7 +277,7 @@ class RuntimeManager:
             if health.details.get("account_match"):
                 self._log(account.account_id, "start-one", {"result": "started", "health": self._health_log_fields(health.details)})
                 return RuntimeResult("started", account.account_id, True, details=health.details)
-            self._stop_started(account, worker_proc.pid, chrome_proc.pid)
+            self._stop_started(account, getattr(worker_proc, "pid", None), getattr(chrome_proc, "pid", None))
             reason = "extension_not_connected"
             if health.details.get("extension_connected") and not health.details.get("account_match"):
                 reason = "account_mismatch"
@@ -282,6 +295,7 @@ class RuntimeManager:
         chrome_alive = self._owned_chrome_running(account)
         account = self.registry.get(account_id) or account
         worker_alive = self._owned_worker_running(account)
+        account = self.registry.get(account_id) or account
         worker_health = self._worker_health(account)
         cdp_reachable = self._tcp_reachable(account.chrome_cdp_port)
         extension_connected = bool(worker_health.get("extension_connected"))
@@ -330,14 +344,25 @@ class RuntimeManager:
         chrome_alive = verified_chrome_pid is not None
         if verified_chrome_pid is not None and verified_chrome_pid != account.chrome_pid:
             account = self.registry.get(account_id) or account
-        worker_alive = self._owned_worker_running(account)
+        verified_worker_pid = self._verified_worker_pid(account)
+        worker_alive = verified_worker_pid is not None
+        if verified_worker_pid is not None and verified_worker_pid != account.worker_pid:
+            account = self.registry.get(account_id) or account
+        verified_worker_launcher_pid = self._verified_worker_launcher_pid(account, verified_worker_pid)
         if not chrome_alive and not worker_alive:
             self.registry.mark_stopped(account.account_id)
             self._log(account.account_id, "stop-one", {"result": "already_stopped"})
             return RuntimeResult("already_stopped", account.account_id, True)
         stopped = True
         if worker_alive:
-            stopped = self.inspector.terminate(account.worker_pid) and stopped
+            stopped = self.inspector.terminate(verified_worker_pid) and stopped
+            stopped = self._wait_worker_ports_released(account) and stopped
+            if (
+                verified_worker_launcher_pid
+                and verified_worker_launcher_pid != verified_worker_pid
+                and self.inspector.process_alive(verified_worker_launcher_pid)
+            ):
+                stopped = self.inspector.terminate(verified_worker_launcher_pid) and stopped
         if chrome_alive:
             stopped = self.inspector.terminate(verified_chrome_pid) and stopped
         if stopped:
@@ -480,10 +505,60 @@ class RuntimeManager:
         )
 
     def _owned_worker_running(self, account: AccountRecord) -> bool:
-        cmd = self.inspector.command_line(account.worker_pid)
+        pid = self._verified_worker_pid(account)
+        return pid is not None
+
+    def _verified_worker_pid(self, account: AccountRecord) -> int | None:
+        api_pid = self.inspector.listening_pid(account.worker_api_port)
+        ws_pid = self.inspector.listening_pid(account.extension_ws_port)
+        if api_pid or ws_pid:
+            if not api_pid or not ws_pid or int(api_pid) != int(ws_pid):
+                return None
+            verified_pid = self._verified_worker_pid_from_tree(account, api_pid)
+            if verified_pid is not None:
+                if verified_pid != account.worker_pid:
+                    self.registry.mark_started(account.account_id, worker_pid=verified_pid)
+                return verified_pid
+            return None
+        if self._worker_pid_matches(account, account.worker_pid):
+            return int(account.worker_pid)
+        return None
+
+    def _verified_worker_launcher_pid(self, account: AccountRecord, service_pid: int | None, max_depth: int = 8) -> int | None:
+        if not service_pid:
+            return None
+        seen = {int(service_pid)}
+        current = self.inspector.parent_pid(service_pid)
+        for _ in range(max_depth):
+            if not current or current in seen:
+                return None
+            seen.add(current)
+            if self._worker_pid_matches(account, current):
+                return int(current)
+            if not self.inspector.process_alive(current):
+                return None
+            current = self.inspector.parent_pid(current)
+        return None
+
+    def _verified_worker_pid_from_tree(self, account: AccountRecord, pid: int | None, max_depth: int = 8) -> int | None:
+        seen: set[int] = set()
+        current = pid
+        for _ in range(max_depth):
+            if not current or current in seen:
+                return None
+            seen.add(current)
+            if self._worker_pid_matches(account, current):
+                return int(current)
+            if not self.inspector.process_alive(current):
+                return None
+            current = self.inspector.parent_pid(current)
+        return None
+
+    def _worker_pid_matches(self, account: AccountRecord, pid: int | None) -> bool:
+        cmd = self.inspector.command_line(pid)
         normalized = self._normalize_command_line(cmd)
         return bool(
-            self.inspector.process_alive(account.worker_pid)
+            self.inspector.process_alive(pid)
             and "runtime.worker_entry" in normalized
             and "--runtime-account-id" in normalized
             and account.account_id.lower() in normalized
@@ -499,6 +574,14 @@ class RuntimeManager:
                 return json.loads(response.read().decode("utf-8"))
         except Exception:
             return {}
+
+    def _wait_worker_ports_released(self, account: AccountRecord, timeout_seconds: float = 5.0) -> bool:
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            if not port_is_listening(account.worker_api_port) and not port_is_listening(account.extension_ws_port):
+                return True
+            time.sleep(0.1)
+        return not port_is_listening(account.worker_api_port) and not port_is_listening(account.extension_ws_port)
 
     def _tcp_reachable(self, port: int) -> bool:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
