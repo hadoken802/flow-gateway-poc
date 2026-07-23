@@ -70,6 +70,29 @@ class RuntimeResult:
         return data
 
 
+@dataclass
+class TerminationResult:
+    success: bool
+    pid: int
+    graceful_attempted: bool = False
+    graceful_returncode: int | None = None
+    graceful_stdout: str = ""
+    graceful_stderr: str = ""
+    forced_attempted: bool = False
+    forced_returncode: int | None = None
+    forced_stdout: str = ""
+    forced_stderr: str = ""
+    process_alive_after: bool = False
+    timeout: bool = False
+    exception_type: str | None = None
+
+    def __bool__(self) -> bool:
+        return self.success
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
 class ProcessInspector:
     def process_alive(self, pid: int | None) -> bool:
         if not pid:
@@ -172,18 +195,64 @@ class ProcessInspector:
     def _close_handle(self, snapshot) -> None:
         KERNEL32.CloseHandle(snapshot)
 
-    def terminate(self, pid: int, timeout_seconds: float = 8.0) -> bool:
+    def terminate(self, pid: int, timeout_seconds: float = 8.0, should_force=None) -> TerminationResult:
+        pid = int(pid)
+        result = TerminationResult(success=False, pid=pid)
+        if not self.process_alive(pid):
+            result.success = True
+            result.process_alive_after = False
+            return result
+        result.graceful_attempted = True
         try:
-            proc = subprocess.Popen(
-                ["taskkill", "/PID", str(int(pid))],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+            graceful = subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout_seconds,
                 creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
             )
-            proc.wait(timeout=timeout_seconds)
-            return proc.returncode == 0
-        except Exception:
-            return False
+            result.graceful_returncode = graceful.returncode
+            result.graceful_stdout = self._truncate_output(graceful.stdout)
+            result.graceful_stderr = self._truncate_output(graceful.stderr)
+        except subprocess.TimeoutExpired as error:
+            result.timeout = True
+            result.exception_type = type(error).__name__
+        except Exception as error:
+            result.exception_type = type(error).__name__
+
+        force_needed = result.graceful_returncode != 0 or self.process_alive(pid)
+        if should_force is not None:
+            try:
+                force_needed = force_needed or bool(should_force())
+            except Exception:
+                force_needed = True
+        if force_needed:
+            result.forced_attempted = True
+            try:
+                forced = subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=timeout_seconds,
+                    creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+                )
+                result.forced_returncode = forced.returncode
+                result.forced_stdout = self._truncate_output(forced.stdout)
+                result.forced_stderr = self._truncate_output(forced.stderr)
+            except subprocess.TimeoutExpired as error:
+                result.timeout = True
+                result.exception_type = type(error).__name__
+            except Exception as error:
+                result.exception_type = type(error).__name__
+        result.process_alive_after = self.process_alive(pid)
+        result.success = not result.process_alive_after
+        return result
+
+    def _truncate_output(self, output: str | None, limit: int = 500) -> str:
+        text = (output or "").strip()
+        return text if len(text) <= limit else text[:limit] + "...<truncated>"
 
 
 class RuntimeManager:
@@ -340,37 +409,65 @@ class RuntimeManager:
         account = self.registry.get(account_id)
         if not account:
             return RuntimeResult("account_not_found", account_id, False)
-        verified_chrome_pid = self._verified_chrome_pid(account)
-        chrome_alive = verified_chrome_pid is not None
-        if verified_chrome_pid is not None and verified_chrome_pid != account.chrome_pid:
-            account = self.registry.get(account_id) or account
-        verified_worker_pid = self._verified_worker_pid(account)
-        worker_alive = verified_worker_pid is not None
-        if verified_worker_pid is not None and verified_worker_pid != account.worker_pid:
-            account = self.registry.get(account_id) or account
-        verified_worker_launcher_pid = self._verified_worker_launcher_pid(account, verified_worker_pid)
-        if not chrome_alive and not worker_alive:
+        plan = self._build_stop_plan(account)
+        if plan.get("error"):
+            details = {key: value for key, value in plan.items() if key != "error"}
+            self._log(account.account_id, "stop-one", {"result": "ownership_not_verified", **details})
+            return RuntimeResult("ownership_not_verified", account.account_id, False, details=details)
+        verified_chrome_pid = plan.get("verified_chrome_pid")
+        verified_worker_pid = plan.get("verified_worker_service_pid")
+        verified_worker_launcher_pid = plan.get("optional_worker_launcher_pid")
+        if not verified_chrome_pid and not verified_worker_pid:
             self.registry.mark_stopped(account.account_id)
-            self._log(account.account_id, "stop-one", {"result": "already_stopped"})
+            self._log(account.account_id, "stop-one", {"result": "already_stopped", **plan})
             return RuntimeResult("already_stopped", account.account_id, True)
-        stopped = True
-        if worker_alive:
-            stopped = self.inspector.terminate(verified_worker_pid) and stopped
-            stopped = self._wait_worker_ports_released(account) and stopped
-            if (
-                verified_worker_launcher_pid
-                and verified_worker_launcher_pid != verified_worker_pid
-                and self.inspector.process_alive(verified_worker_launcher_pid)
-            ):
-                stopped = self.inspector.terminate(verified_worker_launcher_pid) and stopped
-        if chrome_alive:
-            stopped = self.inspector.terminate(verified_chrome_pid) and stopped
-        if stopped:
-            self.registry.mark_stopped(account.account_id)
-            self._log(account.account_id, "stop-one", {"result": "stopped", "chrome_pid": account.chrome_pid, "worker_pid": account.worker_pid})
-            return RuntimeResult("stopped", account.account_id, True)
-        self._log(account.account_id, "stop-one", {"result": "ownership_not_verified", "chrome_pid": account.chrome_pid, "worker_pid": account.worker_pid})
-        return RuntimeResult("ownership_not_verified", account.account_id, False)
+        if verified_worker_pid:
+            worker_terminate_pid = verified_worker_launcher_pid or verified_worker_pid
+            termination = self.inspector.terminate(
+                worker_terminate_pid,
+                should_force=lambda: port_is_listening(account.worker_api_port) or port_is_listening(account.extension_ws_port),
+            )
+            if not termination:
+                details = {
+                    "stage": "terminate",
+                    "target": "worker_service",
+                    "pid": worker_terminate_pid,
+                    "worker_service_pid": verified_worker_pid,
+                    "terminate_result": False,
+                    "reason": "force_termination_failed",
+                    **self._termination_details(termination),
+                    "remaining_ports": self._worker_port_details(account),
+                }
+                self._log(account.account_id, "stop-one", {"result": "stop_failed", **details})
+                return RuntimeResult("stop_failed", account.account_id, False, details=details)
+            if not self._wait_worker_ports_released(account):
+                details = {"stage": "wait_ports", "target": "worker_service", "pid": worker_terminate_pid, "worker_service_pid": verified_worker_pid, "remaining_ports": self._worker_port_details(account)}
+                self._log(account.account_id, "stop-one", {"result": "stop_failed", **details})
+                return RuntimeResult("stop_failed", account.account_id, False, details=details)
+        if verified_chrome_pid:
+            termination = self.inspector.terminate(
+                verified_chrome_pid,
+                should_force=lambda: port_is_listening(account.chrome_cdp_port),
+            )
+            if not termination:
+                details = {
+                    "stage": "terminate",
+                    "target": "chrome",
+                    "pid": verified_chrome_pid,
+                    "terminate_result": False,
+                    "reason": "force_termination_failed",
+                    **self._termination_details(termination),
+                    "remaining_ports": {"chrome_cdp_listener_pid": self.inspector.listening_pid(account.chrome_cdp_port)},
+                }
+                self._log(account.account_id, "stop-one", {"result": "stop_failed", **details})
+                return RuntimeResult("stop_failed", account.account_id, False, details=details)
+            if not self._wait_port_released(account.chrome_cdp_port):
+                details = {"stage": "wait_ports", "target": "chrome", "pid": verified_chrome_pid, "remaining_ports": {"chrome_cdp_listener_pid": self.inspector.listening_pid(account.chrome_cdp_port)}}
+                self._log(account.account_id, "stop-one", {"result": "stop_failed", **details})
+                return RuntimeResult("stop_failed", account.account_id, False, details=details)
+        self.registry.mark_stopped(account.account_id)
+        self._log(account.account_id, "stop-one", {"result": "stopped", **plan})
+        return RuntimeResult("stopped", account.account_id, True, details=plan)
 
     def chrome_command(self, account: AccountRecord) -> list[str]:
         chrome = self._find_chrome()
@@ -469,13 +566,16 @@ class RuntimeManager:
         return pid is not None
 
     def _verified_chrome_pid(self, account: AccountRecord) -> int | None:
+        return self._discover_chrome_pid(account, repair_registry=True)
+
+    def _discover_chrome_pid(self, account: AccountRecord, repair_registry: bool) -> int | None:
         pid = account.chrome_pid
         if self._chrome_pid_matches(account, pid):
             return int(pid)
         listening_pid = self.inspector.listening_pid(account.chrome_cdp_port)
         verified_pid = self._verified_chrome_pid_from_tree(account, listening_pid)
         if verified_pid is not None:
-            if verified_pid != account.chrome_pid:
+            if repair_registry and verified_pid != account.chrome_pid:
                 self.registry.mark_started(account.account_id, chrome_pid=verified_pid)
             return verified_pid
         return None
@@ -509,6 +609,9 @@ class RuntimeManager:
         return pid is not None
 
     def _verified_worker_pid(self, account: AccountRecord) -> int | None:
+        return self._discover_worker_pid(account, repair_registry=True)
+
+    def _discover_worker_pid(self, account: AccountRecord, repair_registry: bool) -> int | None:
         api_pid = self.inspector.listening_pid(account.worker_api_port)
         ws_pid = self.inspector.listening_pid(account.extension_ws_port)
         if api_pid or ws_pid:
@@ -516,13 +619,47 @@ class RuntimeManager:
                 return None
             verified_pid = self._verified_worker_pid_from_tree(account, api_pid)
             if verified_pid is not None:
-                if verified_pid != account.worker_pid:
+                if repair_registry and verified_pid != account.worker_pid:
                     self.registry.mark_started(account.account_id, worker_pid=verified_pid)
                 return verified_pid
             return None
         if self._worker_pid_matches(account, account.worker_pid):
             return int(account.worker_pid)
         return None
+
+    def _build_stop_plan(self, account: AccountRecord) -> dict:
+        plan = {
+            "stage": "preflight",
+            "verified_chrome_pid": None,
+            "verified_worker_service_pid": None,
+            "optional_worker_launcher_pid": None,
+            "chrome_cdp_listener_pid": self.inspector.listening_pid(account.chrome_cdp_port),
+            **self._worker_port_details(account),
+        }
+        worker_api_pid = plan["worker_api_listener_pid"]
+        worker_ws_pid = plan["worker_ws_listener_pid"]
+        if worker_api_pid or worker_ws_pid:
+            if not worker_api_pid or not worker_ws_pid or int(worker_api_pid) != int(worker_ws_pid):
+                plan.update({"error": True, "target": "worker_service", "reason": "ownership_not_verified"})
+                return plan
+            worker_pid = self._discover_worker_pid(account, repair_registry=False)
+            if not worker_pid:
+                plan.update({"error": True, "target": "worker_service", "reason": "ownership_not_verified"})
+                return plan
+            plan["verified_worker_service_pid"] = worker_pid
+            plan["optional_worker_launcher_pid"] = self._verified_worker_launcher_pid(account, worker_pid)
+        elif self._worker_pid_matches(account, account.worker_pid):
+            plan["verified_worker_service_pid"] = int(account.worker_pid)
+
+        if plan["chrome_cdp_listener_pid"]:
+            chrome_pid = self._discover_chrome_pid(account, repair_registry=False)
+            if not chrome_pid:
+                plan.update({"error": True, "target": "chrome", "reason": "ownership_not_verified"})
+                return plan
+            plan["verified_chrome_pid"] = chrome_pid
+        elif self._chrome_pid_matches(account, account.chrome_pid):
+            plan["verified_chrome_pid"] = int(account.chrome_pid)
+        return plan
 
     def _verified_worker_launcher_pid(self, account: AccountRecord, service_pid: int | None, max_depth: int = 8) -> int | None:
         if not service_pid:
@@ -582,6 +719,25 @@ class RuntimeManager:
                 return True
             time.sleep(0.1)
         return not port_is_listening(account.worker_api_port) and not port_is_listening(account.extension_ws_port)
+
+    def _wait_port_released(self, port: int, timeout_seconds: float = 5.0) -> bool:
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            if not port_is_listening(port):
+                return True
+            time.sleep(0.1)
+        return not port_is_listening(port)
+
+    def _worker_port_details(self, account: AccountRecord) -> dict:
+        return {
+            "worker_api_listener_pid": self.inspector.listening_pid(account.worker_api_port),
+            "worker_ws_listener_pid": self.inspector.listening_pid(account.extension_ws_port),
+        }
+
+    def _termination_details(self, result) -> dict:
+        if hasattr(result, "to_dict"):
+            return result.to_dict()
+        return {}
 
     def _tcp_reachable(self, port: int) -> bool:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:

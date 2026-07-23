@@ -7,7 +7,7 @@ import pytest
 
 from runtime import cli
 from runtime import worker_entry
-from runtime.process_manager import BOOL, DWORD, HANDLE, INVALID_HANDLE_VALUE, KERNEL32, PROCESSENTRY32W, ProcessInspector, RuntimeManager
+from runtime.process_manager import BOOL, DWORD, HANDLE, INVALID_HANDLE_VALUE, KERNEL32, PROCESSENTRY32W, ProcessInspector, RuntimeManager, TerminationResult
 from runtime.registry import AccountRecord, AccountRegistry
 
 
@@ -35,6 +35,8 @@ class FakeInspector:
         self.terminated = []
         self.listeners = {}
         self.parents = {}
+        self.fail_terminate = set()
+        self.keep_listeners = set()
 
     def process_alive(self, pid):
         return pid in self.alive
@@ -42,13 +44,35 @@ class FakeInspector:
     def command_line(self, pid):
         return self.commands.get(pid, "")
 
-    def terminate(self, pid, timeout_seconds=8.0):
+    def terminate(self, pid, timeout_seconds=8.0, should_force=None):
         self.terminated.append(pid)
-        self.alive.discard(pid)
+        if pid in self.fail_terminate:
+            return TerminationResult(
+                success=False,
+                pid=pid,
+                graceful_attempted=True,
+                graceful_returncode=1,
+                graceful_stderr="simulated graceful failure",
+                forced_attempted=True,
+                forced_returncode=1,
+                forced_stderr="simulated forced failure",
+                process_alive_after=True,
+            )
+        killed = {pid}
+        for child_pid in list(self.alive):
+            current = child_pid
+            seen = set()
+            while current and current not in seen:
+                seen.add(current)
+                current = self.parents.get(current)
+                if current == pid:
+                    killed.add(child_pid)
+                    break
+        self.alive.difference_update(killed)
         for port, owner_pid in list(self.listeners.items()):
-            if owner_pid == pid:
+            if owner_pid in killed and port not in self.keep_listeners:
                 del self.listeners[port]
-        return True
+        return TerminationResult(success=True, pid=pid, graceful_attempted=True, graceful_returncode=0, process_alive_after=False)
 
     def listening_pid(self, port):
         return self.listeners.get(port)
@@ -223,6 +247,119 @@ def test_command_line_returns_empty_on_failure_timeout_or_missing(monkeypatch):
 
     monkeypatch.setattr("runtime.process_manager.subprocess.run", raise_timeout)
     assert ProcessInspector().command_line(36836) == ""
+
+
+def test_terminate_uses_graceful_taskkill_without_force_first(monkeypatch):
+    calls = []
+    alive = {38820}
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        alive.clear()
+        return subprocess.CompletedProcess(command, 0, stdout="SUCCESS", stderr="")
+
+    inspector = ProcessInspector()
+    monkeypatch.setattr("runtime.process_manager.subprocess.run", fake_run)
+    monkeypatch.setattr(inspector, "process_alive", lambda pid: int(pid) in alive)
+
+    result = inspector.terminate(38820)
+
+    assert result.success is True
+    assert calls == [["taskkill", "/PID", "38820", "/T"]]
+    assert "/IM" not in calls[0]
+    assert result.forced_attempted is False
+
+
+def test_terminate_forces_after_graceful_failure(monkeypatch):
+    calls = []
+    alive = {38820}
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if "/F" in command:
+            alive.clear()
+            return subprocess.CompletedProcess(command, 0, stdout="FORCED", stderr="")
+        return subprocess.CompletedProcess(command, 1, stdout="", stderr="Access is denied.")
+
+    inspector = ProcessInspector()
+    monkeypatch.setattr("runtime.process_manager.subprocess.run", fake_run)
+    monkeypatch.setattr(inspector, "process_alive", lambda pid: int(pid) in alive)
+
+    result = inspector.terminate(38820)
+
+    assert result.success is True
+    assert calls == [["taskkill", "/PID", "38820", "/T"], ["taskkill", "/PID", "38820", "/T", "/F"]]
+    assert result.graceful_returncode == 1
+    assert result.graceful_stderr == "Access is denied."
+    assert result.forced_returncode == 0
+
+
+def test_terminate_forces_when_graceful_succeeds_but_process_remains(monkeypatch):
+    calls = []
+    alive_checks = [True, True, False]
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    inspector = ProcessInspector()
+    monkeypatch.setattr("runtime.process_manager.subprocess.run", fake_run)
+    monkeypatch.setattr(inspector, "process_alive", lambda pid: alive_checks.pop(0) if alive_checks else False)
+
+    result = inspector.terminate(38820)
+
+    assert result.success is True
+    assert calls[-1] == ["taskkill", "/PID", "38820", "/T", "/F"]
+
+
+def test_terminate_forces_when_ports_still_listen_after_graceful(monkeypatch):
+    calls = []
+    alive_checks = [True, False, False]
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    inspector = ProcessInspector()
+    monkeypatch.setattr("runtime.process_manager.subprocess.run", fake_run)
+    monkeypatch.setattr(inspector, "process_alive", lambda pid: alive_checks.pop(0) if alive_checks else False)
+
+    result = inspector.terminate(38820, should_force=lambda: True)
+
+    assert result.success is True
+    assert calls == [["taskkill", "/PID", "38820", "/T"], ["taskkill", "/PID", "38820", "/T", "/F"]]
+
+
+def test_terminate_reports_forced_failure_details(monkeypatch):
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 1, stdout="not found", stderr="failed")
+
+    inspector = ProcessInspector()
+    monkeypatch.setattr("runtime.process_manager.subprocess.run", fake_run)
+    monkeypatch.setattr(inspector, "process_alive", lambda pid: True)
+
+    result = inspector.terminate(38820)
+
+    assert result.success is False
+    assert result.forced_attempted is True
+    assert result.forced_returncode == 1
+    assert result.process_alive_after is True
+
+
+def test_terminate_treats_already_gone_process_as_success(monkeypatch):
+    calls = []
+    inspector = ProcessInspector()
+    monkeypatch.setattr("runtime.process_manager.subprocess.run", lambda *args, **kwargs: calls.append(args) or pytest.fail("taskkill should not run"))
+    monkeypatch.setattr(inspector, "process_alive", lambda pid: False)
+
+    result = inspector.terminate(38820)
+
+    assert result.success is True
+    assert result.graceful_attempted is False
+    assert calls == []
 
 
 def test_parent_pid_returns_none_when_target_missing_and_closes_handle():
@@ -809,7 +946,7 @@ def test_stop_one_uses_repaired_chrome_pid(tmp_path, monkeypatch):
     inspector.alive.add(36836)
     inspector.commands[36836] = f'chrome --user-data-dir={account.profile_path} --remote-debugging-port=9300'
     manager = make_manager(tmp_path, registry, inspector=inspector)
-    monkeypatch.setattr("runtime.process_manager.port_is_listening", lambda port: port == 9300)
+    monkeypatch.setattr("runtime.process_manager.port_is_listening", lambda port: port in inspector.listeners)
 
     assert manager.stop_one("FLOW-005").result == "stopped"
     assert inspector.terminated == [36836]
@@ -846,7 +983,201 @@ def test_stop_one_stops_service_pid_before_verified_launcher_pid(tmp_path, monke
     monkeypatch.setattr("runtime.process_manager.port_is_listening", lambda port: port in inspector.listeners)
 
     assert manager.stop_one("FLOW-005").result == "stopped"
-    assert inspector.terminated == [38820, 352]
+    assert inspector.terminated == [352]
+
+
+def test_stop_one_preflight_worker_failure_does_not_stop_chrome(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    account = add_account(registry)
+    registry.mark_started("FLOW-005", chrome_pid=22224, worker_pid=38820)
+    inspector = FakeInspector()
+    inspector.listeners[9300] = 22224
+    inspector.listeners[8101] = 123
+    inspector.listeners[9200] = 456
+    inspector.alive.update({22224, 123, 456})
+    inspector.commands[22224] = f"chrome --user-data-dir={account.profile_path} --remote-debugging-port=9300"
+    add_running_worker(inspector, 123)
+    add_running_worker(inspector, 456)
+    manager = make_manager(tmp_path, registry, inspector=inspector)
+    monkeypatch.setattr("runtime.process_manager.port_is_listening", lambda port: port in inspector.listeners)
+
+    result = manager.stop_one("FLOW-005")
+
+    assert result.result == "ownership_not_verified"
+    assert result.details["target"] == "worker_service"
+    assert result.details["worker_api_listener_pid"] == 123
+    assert result.details["worker_ws_listener_pid"] == 456
+    assert inspector.terminated == []
+
+
+def test_stop_one_preflight_chrome_failure_does_not_stop_worker(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    add_account(registry)
+    registry.mark_started("FLOW-005", chrome_pid=22224, worker_pid=38820)
+    inspector = FakeInspector()
+    inspector.listeners[9300] = 22224
+    inspector.listeners[8101] = 38820
+    inspector.listeners[9200] = 38820
+    inspector.alive.update({22224, 38820})
+    inspector.commands[22224] = "chrome --user-data-dir=OTHER --remote-debugging-port=9300"
+    add_running_worker(inspector, 38820)
+    manager = make_manager(tmp_path, registry, inspector=inspector)
+    monkeypatch.setattr("runtime.process_manager.port_is_listening", lambda port: port in inspector.listeners)
+
+    result = manager.stop_one("FLOW-005")
+
+    assert result.result == "ownership_not_verified"
+    assert result.details["target"] == "chrome"
+    assert result.details["chrome_cdp_listener_pid"] == 22224
+    assert inspector.terminated == []
+
+
+def test_stop_one_handles_chrome_stopped_worker_running(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    add_account(registry)
+    registry.mark_started("FLOW-005", chrome_pid=22224, worker_pid=38820)
+    inspector = FakeInspector()
+    inspector.listeners[8101] = 38820
+    inspector.listeners[9200] = 38820
+    add_running_worker(inspector, 38820)
+    manager = make_manager(tmp_path, registry, inspector=inspector)
+    monkeypatch.setattr("runtime.process_manager.port_is_listening", lambda port: port in inspector.listeners)
+
+    result = manager.stop_one("FLOW-005")
+
+    assert result.result == "stopped"
+    assert inspector.terminated == [38820]
+    assert registry.get("FLOW-005").worker_pid is None
+    assert registry.get("FLOW-005").chrome_pid is None
+
+
+def test_stop_one_handles_worker_stopped_chrome_running(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    account = add_account(registry)
+    registry.mark_started("FLOW-005", chrome_pid=22224, worker_pid=38820)
+    inspector = FakeInspector()
+    inspector.listeners[9300] = 22224
+    inspector.alive.add(22224)
+    inspector.commands[22224] = f"chrome --user-data-dir={account.profile_path} --remote-debugging-port=9300"
+    manager = make_manager(tmp_path, registry, inspector=inspector)
+    monkeypatch.setattr("runtime.process_manager.port_is_listening", lambda port: port in inspector.listeners)
+
+    result = manager.stop_one("FLOW-005")
+
+    assert result.result == "stopped"
+    assert inspector.terminated == [22224]
+
+
+def test_stop_one_skips_dead_or_unverified_launcher(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    add_account(registry)
+    registry.mark_started("FLOW-005", worker_pid=352)
+    inspector = FakeInspector()
+    inspector.listeners[8101] = 38820
+    inspector.listeners[9200] = 38820
+    inspector.parents[38820] = 352
+    add_running_worker(inspector, 38820)
+    inspector.alive.add(352)
+    inspector.commands[352] = "python -m runtime.worker_entry --runtime-account-id FLOW-006 --runtime-api-port 8101 --runtime-ws-port 9200"
+    manager = make_manager(tmp_path, registry, inspector=inspector)
+    monkeypatch.setattr("runtime.process_manager.port_is_listening", lambda port: port in inspector.listeners)
+
+    result = manager.stop_one("FLOW-005")
+
+    assert result.result == "stopped"
+    assert inspector.terminated == [38820]
+
+
+def test_stop_one_worker_terminate_failure_does_not_stop_chrome(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    account = add_account(registry)
+    registry.mark_started("FLOW-005", chrome_pid=22224, worker_pid=38820)
+    inspector = FakeInspector()
+    inspector.listeners[9300] = 22224
+    inspector.listeners[8101] = 38820
+    inspector.listeners[9200] = 38820
+    inspector.alive.update({22224, 38820})
+    inspector.commands[22224] = f"chrome --user-data-dir={account.profile_path} --remote-debugging-port=9300"
+    add_running_worker(inspector, 38820)
+    inspector.fail_terminate.add(38820)
+    manager = make_manager(tmp_path, registry, inspector=inspector)
+    monkeypatch.setattr("runtime.process_manager.port_is_listening", lambda port: port in inspector.listeners)
+
+    result = manager.stop_one("FLOW-005")
+
+    assert result.result == "stop_failed"
+    assert result.details["target"] == "worker_service"
+    assert result.details["graceful_returncode"] == 1
+    assert result.details["forced_returncode"] == 1
+    assert result.details["process_alive_after"] is True
+    assert result.details["remaining_ports"]["worker_api_listener_pid"] == 38820
+    assert inspector.terminated == [38820]
+    assert registry.get("FLOW-005").chrome_pid == 22224
+    assert registry.get("FLOW-005").worker_pid == 38820
+
+
+def test_stop_one_worker_ports_not_released_returns_stop_failed(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    account = add_account(registry)
+    registry.mark_started("FLOW-005", chrome_pid=22224, worker_pid=38820)
+    inspector = FakeInspector()
+    inspector.listeners[9300] = 22224
+    inspector.listeners[8101] = 38820
+    inspector.listeners[9200] = 38820
+    inspector.keep_listeners.update({8101, 9200})
+    inspector.alive.update({22224, 38820})
+    inspector.commands[22224] = f"chrome --user-data-dir={account.profile_path} --remote-debugging-port=9300"
+    add_running_worker(inspector, 38820)
+    manager = make_manager(tmp_path, registry, inspector=inspector)
+    manager._wait_worker_ports_released = lambda account: False
+    monkeypatch.setattr("runtime.process_manager.port_is_listening", lambda port: port in inspector.listeners)
+
+    result = manager.stop_one("FLOW-005")
+
+    assert result.result == "stop_failed"
+    assert result.details["stage"] == "wait_ports"
+    assert result.details["remaining_ports"]["worker_api_listener_pid"] == 38820
+    assert inspector.terminated == [38820]
+    assert registry.get("FLOW-005").chrome_pid == 22224
+
+
+def test_stop_one_chrome_terminate_failure_returns_stop_failed(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    account = add_account(registry)
+    registry.mark_started("FLOW-005", chrome_pid=22224)
+    inspector = FakeInspector()
+    inspector.listeners[9300] = 22224
+    inspector.alive.add(22224)
+    inspector.commands[22224] = f"chrome --user-data-dir={account.profile_path} --remote-debugging-port=9300"
+    inspector.fail_terminate.add(22224)
+    manager = make_manager(tmp_path, registry, inspector=inspector)
+    monkeypatch.setattr("runtime.process_manager.port_is_listening", lambda port: port in inspector.listeners)
+
+    result = manager.stop_one("FLOW-005")
+
+    assert result.result == "stop_failed"
+    assert result.details["target"] == "chrome"
+    assert inspector.terminated == [22224]
+
+
+def test_stop_one_chrome_port_not_released_returns_stop_failed(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    account = add_account(registry)
+    registry.mark_started("FLOW-005", chrome_pid=22224)
+    inspector = FakeInspector()
+    inspector.listeners[9300] = 22224
+    inspector.keep_listeners.add(9300)
+    inspector.alive.add(22224)
+    inspector.commands[22224] = f"chrome --user-data-dir={account.profile_path} --remote-debugging-port=9300"
+    manager = make_manager(tmp_path, registry, inspector=inspector)
+    manager._wait_port_released = lambda port: False
+    monkeypatch.setattr("runtime.process_manager.port_is_listening", lambda port: port in inspector.listeners)
+
+    result = manager.stop_one("FLOW-005")
+
+    assert result.result == "stop_failed"
+    assert result.details["target"] == "chrome"
+    assert result.details["remaining_ports"]["chrome_cdp_listener_pid"] == 22224
 
 
 def test_import_existing_safely_corrects_planned_only(tmp_path):
