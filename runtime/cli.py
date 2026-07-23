@@ -6,6 +6,7 @@ import json
 import sys
 from dataclasses import asdict
 
+from .extension_bootstrap import ExtensionBootstrapResult, ExtensionBootstrapper
 from .process_manager import RuntimeManager
 from .registry import AccountRegistry, plan_to_dict
 
@@ -22,6 +23,16 @@ def build_parser() -> argparse.ArgumentParser:
     for name in ("open-login", "start-one", "status", "stop-one"):
         parser_one = sub.add_parser(name)
         parser_one.add_argument("account_id")
+
+    sub.add_parser("init-extension-template")
+
+    bootstrap = sub.add_parser("bootstrap-extension")
+    bootstrap.add_argument("account_id")
+    bootstrap.add_argument("--repair", action="store_true")
+
+    bootstrap_batch = sub.add_parser("bootstrap-batch")
+    bootstrap_batch.add_argument("account_ids", nargs="+")
+    bootstrap_batch.add_argument("--repair", action="store_true")
 
     import_existing = sub.add_parser("import-existing")
     import_existing.add_argument("--dry-run", action="store_true")
@@ -56,6 +67,21 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
         return 0 if result.ok or result.result in {"stopped", "already_stopped", "already_running", "opened"} else 1
 
+    if args.command == "init-extension-template":
+        result = _run_bootstrap_command(lambda: ExtensionBootstrapper(registry).init_template())
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        return 0 if result.ok else 1
+
+    if args.command == "bootstrap-extension":
+        result = _run_bootstrap_command(lambda: ExtensionBootstrapper(registry).bootstrap_account(args.account_id, repair=args.repair), args.account_id)
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        return 0 if result.ok else 1
+
+    if args.command == "bootstrap-batch":
+        result = _run_bootstrap_command(lambda: ExtensionBootstrapper(registry).bootstrap_batch(args.account_ids, repair=args.repair))
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        return 0 if result.ok else 1
+
     if args.command == "import-existing":
         plan = registry.import_existing_workers(dry_run=args.dry_run)
         print(json.dumps(plan_to_dict(plan), ensure_ascii=False, indent=2))
@@ -71,6 +97,18 @@ def main(argv: list[str] | None = None) -> int:
         return 1 if plan.issues else 0
 
     return 2
+
+
+def _run_bootstrap_command(action, account_id: str | None = None):
+    try:
+        return action()
+    except Exception as error:
+        return ExtensionBootstrapResult(
+            "failed",
+            account_id,
+            False,
+            {"stage": "cli_bootstrap", "error": type(error).__name__},
+        )
 
 
 if __name__ == "__main__":

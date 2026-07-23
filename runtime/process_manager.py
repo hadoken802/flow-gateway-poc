@@ -370,6 +370,15 @@ class RuntimeManager:
         extension_connected = bool(worker_health.get("extension_connected"))
         extension_account_id = worker_health.get("account_id")
         account_match = extension_connected and extension_account_id == account.account_id
+        extension_expected_ws_url = f"ws://127.0.0.1:{account.extension_ws_port}"
+        if account_match:
+            extension_bootstrap_status = "extension_ready"
+        elif extension_connected:
+            extension_bootstrap_status = "account_mismatch"
+        elif worker_health:
+            extension_bootstrap_status = "extension_not_connected"
+        else:
+            extension_bootstrap_status = "extension_missing"
         profile_exists = Path(account.profile_path).exists()
         if worker_alive and chrome_alive and worker_health and cdp_reachable:
             runtime_status = "running" if account_match else "unhealthy"
@@ -394,6 +403,11 @@ class RuntimeManager:
             "extension_connected": extension_connected,
             "extension_account_id": extension_account_id,
             "account_match": account_match,
+            "extension_present": extension_connected,
+            "extension_configured": account_match,
+            "extension_bootstrap_status": extension_bootstrap_status,
+            "extension_expected_account_id": account.account_id,
+            "extension_expected_ws_url": extension_expected_ws_url,
             "profile_path": account.profile_path,
             "profile_exists": profile_exists,
             "last_started_at": account.last_started_at,

@@ -5,8 +5,8 @@
  * Captures bearer token, solves reCAPTCHA, proxies API calls through browser.
  */
 
-const DEFAULT_ACCOUNT_ID = 'FLOW-001';
-const DEFAULT_AGENT_WS_URL = 'ws://127.0.0.1:9222';
+const DEFAULT_ACCOUNT_ID = '';
+const DEFAULT_AGENT_WS_URL = '';
 const KEEPALIVE_INTERVAL_MS = 20000;
 // NOTE: This is a browser-restricted public API key — safe to ship in extension bundles.
 const API_KEY = 'AIzaSyBtrm0o5ab1c-Ec8ZuLcGt3oJAA5VWt3pY';
@@ -87,16 +87,16 @@ async function init() {
   if (data.flowKey) flowKey = data.flowKey;
   if (data.metrics) Object.assign(metrics, data.metrics);
   if (data.callbackSecret) callbackSecret = data.callbackSecret;
-  accountId = data.account_id || DEFAULT_ACCOUNT_ID;
-  wsUrl = data.ws_url || DEFAULT_AGENT_WS_URL;
-  connectToAgent();
+  accountId = data.account_id || '';
+  wsUrl = data.ws_url || '';
+  if (accountId && wsUrl) connectToAgent();
   chrome.alarms.create('keepAlive', { periodInMinutes: 0.4 });
 }
 
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== 'local') return;
-  if (changes.account_id) accountId = changes.account_id.newValue || DEFAULT_ACCOUNT_ID;
-  if (changes.ws_url) wsUrl = changes.ws_url.newValue || DEFAULT_AGENT_WS_URL;
+  if (changes.account_id) accountId = changes.account_id.newValue || '';
+  if (changes.ws_url) wsUrl = changes.ws_url.newValue || '';
   if (changes.account_id || changes.ws_url) {
     manualDisconnect = false;
     clearReconnectTimer();
@@ -188,6 +188,7 @@ async function captureTokenFromFlowTab() {
 
 function connectToAgent() {
   if (manualDisconnect) return;
+  if (!accountId || !wsUrl) return;
   if (ws?.readyState === WebSocket.CONNECTING) return;
   if (ws?.readyState === WebSocket.OPEN) return;
   clearReconnectTimer();
@@ -199,8 +200,8 @@ function connectToAgent() {
       old.close();
     }
     const socketId = ++activeSocketId;
-    ws = new WebSocket(wsUrl || DEFAULT_AGENT_WS_URL);
-    console.log(`[FlowAgent] Connecting account=${accountId || DEFAULT_ACCOUNT_ID} ws=${wsUrl || DEFAULT_AGENT_WS_URL}`);
+    ws = new WebSocket(wsUrl);
+    console.log(`[FlowAgent] Connecting account=${accountId} ws=${wsUrl}`);
     ws._flowSocketId = socketId;
   } catch (e) {
     console.error('[FlowAgent] WS connect error:', e);
@@ -216,8 +217,8 @@ function connectToAgent() {
     setState('idle');
     ws.send(JSON.stringify({
       type: 'register',
-      account_id: accountId || DEFAULT_ACCOUNT_ID,
-      profile_id: accountId || DEFAULT_ACCOUNT_ID,
+      account_id: accountId,
+      profile_id: accountId,
     }));
 
     // Token refresh alarm — 45 min gives buffer before ~60 min expiry
@@ -329,7 +330,12 @@ function clearKeepaliveTimer() {
 function sendToAgent(msg) {
   // API responses (with msg.id) go via HTTP — immune to WS disconnect
   if (msg.id) {
-    fetch(getAgentHttpUrl() + '/api/ext/callback', {
+    const agentHttpUrl = getAgentHttpUrl();
+    if (!agentHttpUrl) {
+      if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+      return;
+    }
+    fetch(agentHttpUrl + '/api/ext/callback', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(msg),
@@ -347,7 +353,8 @@ function sendToAgent(msg) {
 
 function getAgentHttpUrl() {
   try {
-    const url = new URL(wsUrl || DEFAULT_AGENT_WS_URL);
+    if (!wsUrl) return null;
+    const url = new URL(wsUrl);
     const protocol = url.protocol === 'wss:' ? 'https:' : 'http:';
     const mappedPorts = { 'FLOW-001': '8100', 'FLOW-002': '8112', 'FLOW-003': '8113' };
     const port = mappedPorts[accountId] || (url.port === '9212' ? '8112' : url.port === '9213' ? '8113' : '8100');
@@ -355,7 +362,7 @@ function getAgentHttpUrl() {
     console.log(`[FlowAgent] HTTP callback target ${httpUrl}`);
     return httpUrl;
   } catch {
-    return 'http://127.0.0.1:8100';
+    return null;
   }
 }
 
