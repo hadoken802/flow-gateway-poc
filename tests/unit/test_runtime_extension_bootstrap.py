@@ -1519,6 +1519,49 @@ def test_bootstrap_gpu_retry_exhausted_when_second_fresh_profile_chrome_exits(tm
     assert result.details["bootstrap_profile_rebuild_used"] is True
 
 
+def test_dawn_lock_probe_triggers_once_from_safe_stderr_path(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    account = add_account(registry)
+    profile = Path(account.profile_path)
+    target = profile / "GPUPersistentCache" / "DawnGraphiteCache" / "abc" / "cache.db"
+    target.parent.mkdir(parents=True)
+    target.write_text("cache", encoding="utf-8")
+    bootstrapper = ExtensionBootstrapper(registry, runtime=FakeRuntime(), cdp=FakeCdp(), profiles_root=registry.profiles_root)
+    calls = []
+
+    def fake_probe(path, expected_profile_root, **kwargs):
+        calls.append((path, expected_profile_root, kwargs))
+        return {
+            "target_path_safe": True,
+            "target_relative": "GPUPersistentCache/DawnGraphiteCache/abc/cache.db",
+            "summary": {
+                "dawn_lock_probe_sample_count": 3,
+                "dawn_lock_probe_holder_count": 1,
+                "dawn_lock_probe_holder_classification": "external_process",
+                "dawn_lock_probe_current_attempt_chrome_detected": False,
+                "dawn_lock_probe_previous_attempt_chrome_detected": False,
+                "dawn_lock_probe_external_process_detected": True,
+            },
+        }
+
+    monkeypatch.setattr("runtime.extension_bootstrap.probe_dawn_cache_lock", fake_probe)
+    line = (
+        f'[1000:2000:0724/191153.365:ERROR:x] Failed to open persistent cache files in directory '
+        f'"{target}": sharing violation (0x20)'
+    )
+
+    assert bootstrapper._maybe_probe_dawn_lock_from_stderr_line(account, line, attempt=1, chrome_pid=1000) is True
+    assert bootstrapper._maybe_probe_dawn_lock_from_stderr_line(account, line, attempt=1, chrome_pid=1000) is True
+
+    details = bootstrapper._collect_dawn_lock_probe_details(1000)
+    assert len(calls) == 1
+    assert details["dawn_lock_probe_triggered"] is True
+    assert details["dawn_lock_probe_path_safe"] is True
+    assert details["dawn_lock_probe_target_relative"] == "GPUPersistentCache/DawnGraphiteCache/abc/cache.db"
+    assert details["dawn_lock_probe_holder_classification"] == "external_process"
+    assert details["dawn_lock_probe_external_process_detected"] is True
+
+
 def test_bootstrap_chrome_failure_classifier_does_not_retry_profile_lock_or_google_update_access(tmp_path):
     registry = make_registry(tmp_path)
     bootstrapper = ExtensionBootstrapper(registry, runtime=FakeRuntime(), cdp=FakeCdp(), profiles_root=registry.profiles_root)

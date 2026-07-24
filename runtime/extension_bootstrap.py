@@ -8,6 +8,7 @@ import secrets
 import hashlib
 import shutil
 import stat
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,7 @@ from .paths import EXTENSION_DIR, PROFILES_ROOT
 from .port_allocator import port_can_bind, port_is_listening
 from .process_manager import RuntimeManager, RuntimeResult
 from .registry import AccountRecord, AccountRegistry
+from .windows_lock_probe import probe_dawn_cache_lock
 
 
 TEMPLATE_PROFILE_NAME = "_FLOWKIT_TEMPLATE"
@@ -357,6 +359,8 @@ class ExtensionBootstrapper:
         self.sleep = sleep
         self.template_cdp_port = int(template_cdp_port)
         self._bootstrap_chrome_processes: dict[int, object] = {}
+        self._dawn_lock_probe_watchers: dict[int, tuple[threading.Event, threading.Thread]] = {}
+        self._dawn_lock_probe_results: dict[int, dict] = {}
 
     @property
     def template_path(self) -> Path:
@@ -652,6 +656,7 @@ class ExtensionBootstrapper:
                 if first_error.result != "bootstrap_chrome_exited":
                     raise
                 classification = self._classify_bootstrap_chrome_failure(diagnostics.get("first_attempt_stderr_log"))
+                diagnostics.update(self._collect_dawn_lock_probe_details(chrome_pid))
                 diagnostics["first_attempt_failure_class"] = classification["failure_class"]
                 diagnostics["bootstrap_chrome_retry_reason"] = classification["failure_class"]
                 diagnostics["bootstrap_chrome_retry_eligible"] = bool(classification["retry_eligible"])
@@ -726,6 +731,7 @@ class ExtensionBootstrapper:
                     )
                     diagnostics["second_attempt_cdp_ready"] = True
                 except CdpError as second_error:
+                    diagnostics.update(self._collect_dawn_lock_probe_details(chrome_pid))
                     diagnostics["second_attempt_cdp_ready"] = False
                     diagnostics["second_attempt_exit_code"] = (second_error.details or {}).get("chrome_exit_code")
                     compensation = self._compensate_owned(account, chrome_started_by_bootstrap, worker_started, chrome_pid, worker_pid)
@@ -777,6 +783,7 @@ class ExtensionBootstrapper:
 
             diagnostics["wait_extension_ready_started_at"] = self._utc_now()
             status = self._wait_extension_ready(account, chrome_pid=chrome_pid, diagnostics=diagnostics)
+            diagnostics.update(self._collect_dawn_lock_probe_details(chrome_pid))
             if status.details.get("account_match"):
                 details = self._extension_details(account, status.details)
                 details.update({
@@ -854,6 +861,7 @@ class ExtensionBootstrapper:
                 stderr_handle.close()
         self.registry.mark_started(account.account_id, chrome_pid=proc.pid)
         self._bootstrap_chrome_processes[int(proc.pid)] = proc
+        self._start_dawn_lock_probe_watcher(account, stderr_path, attempt, int(proc.pid))
         return RuntimeResult(
             "opened",
             account.account_id,
@@ -1410,6 +1418,127 @@ class ExtensionBootstrapper:
             log_dir / f"{account.account_id}-bootstrap-chrome-stdout.log",
             log_dir / f"{account.account_id}-bootstrap-chrome-stderr.log",
         )
+
+    def _start_dawn_lock_probe_watcher(self, account: AccountRecord, stderr_path: Path, attempt: int, chrome_pid: int) -> None:
+        stop_event = threading.Event()
+        thread = threading.Thread(
+            target=self._dawn_lock_probe_tail_worker,
+            args=(account, stderr_path, attempt, chrome_pid, stop_event),
+            name=f"dawn-lock-probe-{account.account_id}-{attempt}",
+            daemon=True,
+        )
+        self._dawn_lock_probe_watchers[chrome_pid] = (stop_event, thread)
+        thread.start()
+
+    def _dawn_lock_probe_tail_worker(self, account: AccountRecord, stderr_path: Path, attempt: int, chrome_pid: int, stop_event: threading.Event) -> None:
+        started = time.monotonic()
+        offset = 0
+        buffer = ""
+        while not stop_event.is_set() and time.monotonic() - started < 60:
+            try:
+                if stderr_path.exists():
+                    with stderr_path.open("r", encoding="utf-8", errors="ignore") as handle:
+                        handle.seek(offset)
+                        chunk = handle.read()
+                        offset = handle.tell()
+                    if chunk:
+                        buffer += chunk
+                        lines = buffer.splitlines(keepends=True)
+                        if lines and not lines[-1].endswith(("\n", "\r")):
+                            buffer = lines.pop()
+                        else:
+                            buffer = ""
+                        for line in lines:
+                            if self._maybe_probe_dawn_lock_from_stderr_line(account, line, attempt, chrome_pid):
+                                return
+            except Exception as error:
+                self._dawn_lock_probe_results[chrome_pid] = {
+                    "dawn_lock_probe_triggered": False,
+                    "dawn_lock_probe_completed": False,
+                    "dawn_lock_probe_timed_out": False,
+                    "dawn_lock_probe_error": type(error).__name__,
+                }
+                return
+            self.sleep(0.05)
+
+    def _maybe_probe_dawn_lock_from_stderr_line(self, account: AccountRecord, line: str, attempt: int, chrome_pid: int) -> bool:
+        if int(chrome_pid) in self._dawn_lock_probe_results:
+            return True
+        if not re.search(r"DawnGraphiteCache|GPUPersistentCache", line, re.IGNORECASE):
+            return False
+        if not re.search(r"0x20|sharing violation|另一个程序正在使用此文件", line, re.IGNORECASE):
+            return False
+        match = re.search(r"([A-Z]:\\[^\"<>|]+(?:GPUPersistentCache\\DawnGraphiteCache|DawnGraphiteCache)[^\"<>|]*)", line)
+        if not match:
+            self._dawn_lock_probe_results[int(chrome_pid)] = {
+                "dawn_lock_probe_triggered": True,
+                "dawn_lock_probe_completed": True,
+                "dawn_lock_probe_timed_out": False,
+                "dawn_lock_probe_path_safe": False,
+                "dawn_lock_probe_error": "dawn_cache_path_not_found",
+            }
+            return True
+        previous_pids = {pid for pid in self._bootstrap_chrome_processes if pid != int(chrome_pid)}
+        current_account = self.registry.get(account.account_id) or account
+        worker_pids = {pid for pid in (getattr(current_account, "worker_pid", None),) if pid}
+        probe = probe_dawn_cache_lock(
+            match.group(1),
+            account.profile_path,
+            current_attempt_pids={int(chrome_pid)},
+            previous_attempt_pids=previous_pids,
+            worker_pids=worker_pids,
+            attempt_number=attempt,
+            sleep=self.sleep,
+        )
+        summary = probe.get("summary") or {}
+        self._dawn_lock_probe_results[int(chrome_pid)] = {
+            "dawn_lock_probe_triggered": True,
+            "dawn_lock_probe_completed": True,
+            "dawn_lock_probe_timed_out": False,
+            "dawn_lock_probe_path_safe": bool(probe.get("target_path_safe")),
+            "dawn_lock_probe_target_relative": probe.get("target_relative"),
+            "dawn_lock_probe_error": probe.get("probe_error"),
+            **summary,
+        }
+        return True
+
+    def _collect_dawn_lock_probe_details(self, chrome_pid: int | None) -> dict:
+        if not chrome_pid:
+            return {}
+        pid = int(chrome_pid)
+        watcher = self._dawn_lock_probe_watchers.pop(pid, None)
+        if watcher:
+            stop_event, thread = watcher
+            deadline = time.monotonic() + 0.75
+            while pid not in self._dawn_lock_probe_results and thread.is_alive() and time.monotonic() < deadline:
+                self.sleep(0.05)
+            stop_event.set()
+            thread.join(timeout=0.5)
+            if pid not in self._dawn_lock_probe_results and thread.is_alive():
+                return {
+                    "dawn_lock_probe_triggered": False,
+                    "dawn_lock_probe_completed": False,
+                    "dawn_lock_probe_timed_out": True,
+                    "dawn_lock_probe_path_safe": None,
+                    "dawn_lock_probe_sample_count": 0,
+                    "dawn_lock_probe_holder_count": None,
+                    "dawn_lock_probe_holder_classification": "probe_not_completed",
+                    "dawn_lock_probe_current_attempt_chrome_detected": False,
+                    "dawn_lock_probe_previous_attempt_chrome_detected": False,
+                    "dawn_lock_probe_external_process_detected": False,
+                }
+        return self._dawn_lock_probe_results.get(pid, {
+            "dawn_lock_probe_triggered": False,
+            "dawn_lock_probe_completed": False,
+            "dawn_lock_probe_timed_out": False,
+            "dawn_lock_probe_path_safe": None,
+            "dawn_lock_probe_sample_count": 0,
+            "dawn_lock_probe_holder_count": 0,
+            "dawn_lock_probe_holder_classification": "no_holder_found",
+            "dawn_lock_probe_current_attempt_chrome_detected": False,
+            "dawn_lock_probe_previous_attempt_chrome_detected": False,
+            "dawn_lock_probe_external_process_detected": False,
+        })
 
     def _redacted_bootstrap_command(self, command: list[str]) -> list[str]:
         redacted = []
