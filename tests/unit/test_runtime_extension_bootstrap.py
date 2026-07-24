@@ -1560,6 +1560,93 @@ def test_dawn_lock_probe_triggers_once_from_safe_stderr_path(tmp_path, monkeypat
     assert details["dawn_lock_probe_target_relative"] == "GPUPersistentCache/DawnGraphiteCache/abc/cache.db"
     assert details["dawn_lock_probe_holder_classification"] == "external_process"
     assert details["dawn_lock_probe_external_process_detected"] is True
+    assert details["bootstrap_chrome_attempt_diagnostics"][0]["attempt_number"] == 1
+
+
+def test_dawn_lock_probe_error_is_not_reported_as_no_holder_found(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    account = add_account(registry)
+    profile = Path(account.profile_path)
+    target = profile / "GPUPersistentCache" / "DawnGraphiteCache" / "abc"
+    target.mkdir(parents=True)
+    bootstrapper = ExtensionBootstrapper(registry, runtime=FakeRuntime(), cdp=FakeCdp(), profiles_root=registry.profiles_root)
+
+    def fake_probe(*_args, **_kwargs):
+        return {
+            "target_path_safe": True,
+            "target_relative": "GPUPersistentCache/DawnGraphiteCache/abc",
+            "resource_kind": "directory",
+            "candidate_count": 1,
+            "probe_error": "OSError",
+            "probe_error_stage": "RmGetList",
+            "probe_rm_result_code": 5,
+            "summary": {
+                "dawn_lock_probe_sample_count": 1,
+                "dawn_lock_probe_holder_count": None,
+                "dawn_lock_probe_holder_classification": "probe_error",
+                "dawn_lock_probe_current_attempt_chrome_detected": False,
+                "dawn_lock_probe_previous_attempt_chrome_detected": False,
+                "dawn_lock_probe_external_process_detected": False,
+            },
+        }
+
+    monkeypatch.setattr("runtime.extension_bootstrap.probe_dawn_cache_lock", fake_probe)
+    line = f'[1000:2000:0724/191153.365:ERROR:x] "{target}": sharing violation (0x20)'
+
+    assert bootstrapper._maybe_probe_dawn_lock_from_stderr_line(account, line, attempt=1, chrome_pid=1000) is True
+
+    details = bootstrapper._collect_dawn_lock_probe_details(1000)
+    assert details["dawn_lock_probe_error"] == "OSError"
+    assert details["dawn_lock_probe_rm_result_code"] == 5
+    assert details["dawn_lock_probe_holder_count"] is None
+    assert details["dawn_lock_probe_holder_classification"] == "probe_error"
+
+
+def test_dawn_lock_probe_attempt_diagnostics_are_independent(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    account = add_account(registry)
+    profile = Path(account.profile_path)
+    target = profile / "GPUPersistentCache" / "DawnGraphiteCache" / "abc"
+    target.mkdir(parents=True)
+    bootstrapper = ExtensionBootstrapper(registry, runtime=FakeRuntime(), cdp=FakeCdp(), profiles_root=registry.profiles_root)
+
+    def fake_probe(*_args, **kwargs):
+        attempt = kwargs["attempt_number"]
+        if attempt == 1:
+            classification = "probe_error"
+            holder_count = None
+            probe_error = "OSError"
+        else:
+            classification = "external_process"
+            holder_count = 1
+            probe_error = None
+        return {
+            "target_path_safe": True,
+            "target_relative": "GPUPersistentCache/DawnGraphiteCache/abc",
+            "resource_kind": "directory",
+            "candidate_count": 1,
+            "probe_error": probe_error,
+            "summary": {
+                "dawn_lock_probe_sample_count": 1,
+                "dawn_lock_probe_holder_count": holder_count,
+                "dawn_lock_probe_holder_classification": classification,
+                "dawn_lock_probe_current_attempt_chrome_detected": False,
+                "dawn_lock_probe_previous_attempt_chrome_detected": False,
+                "dawn_lock_probe_external_process_detected": classification == "external_process",
+            },
+        }
+
+    monkeypatch.setattr("runtime.extension_bootstrap.probe_dawn_cache_lock", fake_probe)
+    line = f'[1000:2000:0724/191153.365:ERROR:x] "{target}": sharing violation (0x20)'
+
+    assert bootstrapper._maybe_probe_dawn_lock_from_stderr_line(account, line, attempt=1, chrome_pid=1000) is True
+    assert bootstrapper._maybe_probe_dawn_lock_from_stderr_line(account, line, attempt=2, chrome_pid=2000) is True
+
+    details = bootstrapper._collect_dawn_lock_probe_details(2000)
+    attempts = details["bootstrap_chrome_attempt_diagnostics"]
+    assert [item["attempt_number"] for item in attempts] == [1, 2]
+    assert attempts[0]["dawn_lock_probe"]["dawn_lock_probe_holder_classification"] == "probe_error"
+    assert attempts[1]["dawn_lock_probe"]["dawn_lock_probe_holder_classification"] == "external_process"
 
 
 def test_bootstrap_chrome_failure_classifier_does_not_retry_profile_lock_or_google_update_access(tmp_path):

@@ -4,9 +4,11 @@ import pytest
 
 from runtime.windows_lock_probe import (
     LockHolder,
+    RestartManagerProbeError,
     classify_lock_holder,
     is_safe_dawn_cache_path,
     probe_candidates,
+    probe_dawn_cache_lock,
     summarize_probe_samples,
 )
 
@@ -84,11 +86,103 @@ def test_summarizes_multiple_samples_without_expanding_sensitive_data():
 
 
 def test_directory_probe_candidates_include_cache_files(tmp_path):
-    target = tmp_path / "profile" / "GPUPersistentCache" / "DawnGraphiteCache" / "abc"
+    profile = tmp_path / "profile"
+    target = profile / "GPUPersistentCache" / "DawnGraphiteCache" / "abc"
     (target / "cache.db").parent.mkdir(parents=True)
     (target / "cache.db").write_text("cache", encoding="utf-8")
 
-    candidates = probe_candidates(target)
+    candidates = probe_candidates(target, profile)
 
-    assert candidates[0] == target
-    assert target / "cache.db" in candidates
+    assert candidates["resource_kind"] == "directory"
+    assert target / "cache.db" in candidates["candidates"]
+
+
+def test_directory_candidates_are_bounded_and_sorted_by_mtime(tmp_path):
+    profile = tmp_path / "profile"
+    target = profile / "GPUPersistentCache" / "DawnGraphiteCache" / "abc"
+    target.mkdir(parents=True)
+    for index in range(40):
+        item = target / f"cache-{index}.db"
+        item.write_text("cache", encoding="utf-8")
+        item.touch()
+
+    candidates = probe_candidates(target, profile, max_files=32)
+
+    assert len(candidates["candidates"]) == 32
+
+
+def test_empty_directory_reports_no_candidate_files(tmp_path):
+    profile = tmp_path / "profile"
+    target = profile / "GPUPersistentCache" / "DawnGraphiteCache" / "abc"
+    target.mkdir(parents=True)
+
+    result = probe_dawn_cache_lock(target, profile, samples=(0.0,), sleep=lambda _: None)
+
+    assert result["summary"]["dawn_lock_probe_holder_count"] is None
+    assert result["summary"]["dawn_lock_probe_holder_classification"] == "no_candidate_files"
+
+
+def test_probe_error_is_not_reported_as_no_holder_found(tmp_path):
+    profile = tmp_path / "profile"
+    target = profile / "GPUPersistentCache" / "DawnGraphiteCache" / "abc"
+    (target / "cache.db").parent.mkdir(parents=True)
+    (target / "cache.db").write_text("cache", encoding="utf-8")
+
+    class FailingProbe:
+        def holders_for_paths(self, _paths):
+            raise OSError(5, "RmGetList failed")
+
+    result = probe_dawn_cache_lock(target, profile, samples=(0.0,), sleep=lambda _: None, probe=FailingProbe())
+
+    assert result["summary"]["dawn_lock_probe_holder_count"] is None
+    assert result["summary"]["dawn_lock_probe_holder_classification"] == "probe_error"
+    assert result["probe_error_type"] == "OSError"
+
+
+@pytest.mark.parametrize(
+    ("stage", "code"),
+    [
+        ("RmStartSession", 1001),
+        ("RmRegisterResources", 1002),
+        ("RmGetList", 1003),
+    ],
+)
+def test_restart_manager_errors_preserve_stage_and_code(tmp_path, stage, code):
+    profile = tmp_path / "profile"
+    target = profile / "GPUPersistentCache" / "DawnGraphiteCache" / "abc"
+    (target / "cache.db").parent.mkdir(parents=True)
+    (target / "cache.db").write_text("cache", encoding="utf-8")
+
+    class FailingProbe:
+        def holders_for_paths(self, _paths):
+            raise RestartManagerProbeError(stage, stage, code)
+
+    result = probe_dawn_cache_lock(target, profile, samples=(0.0,), sleep=lambda _: None, probe=FailingProbe())
+
+    assert result["probe_error_stage"] == stage
+    assert result["probe_error_function"] == stage
+    assert result["probe_rm_result_code"] == code
+    assert result["summary"]["dawn_lock_probe_holder_count"] is None
+    assert result["summary"]["dawn_lock_probe_holder_classification"] == "probe_error"
+
+
+def test_partial_probe_error_is_distinct_from_no_holder_found(tmp_path):
+    profile = tmp_path / "profile"
+    target = profile / "GPUPersistentCache" / "DawnGraphiteCache" / "abc"
+    (target / "cache.db").parent.mkdir(parents=True)
+    (target / "cache.db").write_text("cache", encoding="utf-8")
+
+    class FlakyProbe:
+        def __init__(self):
+            self.calls = 0
+
+        def holders_for_paths(self, _paths):
+            self.calls += 1
+            if self.calls == 1:
+                raise OSError(5, "RmGetList failed")
+            return []
+
+    result = probe_dawn_cache_lock(target, profile, samples=(0.0, 0.0), sleep=lambda _: None, probe=FlakyProbe())
+
+    assert result["summary"]["dawn_lock_probe_holder_count"] == 0
+    assert result["summary"]["dawn_lock_probe_holder_classification"] == "partial_probe_error"

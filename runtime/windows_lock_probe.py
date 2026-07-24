@@ -7,6 +7,7 @@ import time
 from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 
 
 ERROR_MORE_DATA = 234
@@ -26,6 +27,19 @@ SENSITIVE_PROFILE_NAMES = {
     "indexeddb",
     "session storage",
 }
+
+
+class RestartManagerProbeError(OSError):
+    def __init__(self, stage: str, function: str, rm_result_code: int | None = None, original: BaseException | None = None):
+        message = f"{function} failed"
+        super().__init__(rm_result_code or getattr(original, "errno", None) or 0, message)
+        self.stage = stage
+        self.function = function
+        self.rm_result_code = rm_result_code
+        self.winerror = getattr(original, "winerror", None)
+        self.errno = getattr(original, "errno", None)
+        self.message_safe = message
+        self.secondary_cleanup_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -117,6 +131,7 @@ def is_safe_dawn_cache_path(target_path: str | Path, expected_profile_root: str 
         "reason": "none",
         "target_path": str(target_resolved),
         "relative_path": relative.as_posix(),
+        "dawn_root": str(profile_resolved / "GPUPersistentCache" / "DawnGraphiteCache"),
     }
 
 
@@ -215,6 +230,9 @@ def classify_lock_holder(
 def summarize_probe_samples(samples: list[dict]) -> dict:
     classifications: list[str] = []
     holder_count = 0
+    completed_samples = [sample for sample in samples if sample.get("rm_get_list_completed")]
+    error_samples = [sample for sample in samples if sample.get("probe_error_type") or sample.get("probe_error_stage")]
+    no_candidate_samples = [sample for sample in samples if sample.get("classification") == "no_candidate_files"]
     for sample in samples:
         holder_count += int(sample.get("holder_count") or 0)
         for holder in sample.get("holders") or []:
@@ -228,15 +246,30 @@ def summarize_probe_samples(samples: list[dict]) -> dict:
         "worker_process",
         "pid_reused_or_unknown",
     ]
-    selected = "no_holder_found"
-    for item in priority:
-        if item in classifications:
-            selected = item
-            break
+    selected = None
+    if classifications:
+        for item in priority:
+            if item in classifications:
+                selected = item
+                break
+    elif error_samples and not completed_samples:
+        selected = "probe_error"
+    elif error_samples and completed_samples:
+        selected = "partial_probe_error"
+    elif no_candidate_samples and len(no_candidate_samples) == len(samples):
+        selected = "no_candidate_files"
+    elif completed_samples:
+        selected = "no_holder_found"
+    elif not samples:
+        selected = "probe_not_completed"
+    else:
+        selected = "probe_not_completed"
+    reported_holder_count = holder_count if completed_samples or classifications else None
     return {
         "dawn_lock_probe_sample_count": len(samples),
-        "dawn_lock_probe_holder_count": holder_count,
+        "dawn_lock_probe_holder_count": reported_holder_count,
         "dawn_lock_probe_holder_classification": selected,
+        "dawn_lock_probe_no_candidate_files": selected == "no_candidate_files",
         "dawn_lock_probe_current_attempt_chrome_detected": "current_attempt_chrome" in classifications,
         "dawn_lock_probe_previous_attempt_chrome_detected": "previous_attempt_chrome" in classifications,
         "dawn_lock_probe_external_process_detected": "external_process" in classifications,
@@ -272,16 +305,23 @@ class RestartManagerLockProbe:
         self._rstrtmgr.RmEndSession.restype = wintypes.DWORD
 
     def holders(self, target_path: str | Path) -> list[LockHolder]:
+        return self.holders_for_paths([target_path])
+
+    def holders_for_paths(self, target_paths: Iterable[str | Path]) -> list[LockHolder]:
+        paths = [str(path) for path in target_paths]
+        if not paths:
+            return []
         session = wintypes.DWORD()
         key = ctypes.create_unicode_buffer(RM_SESSION_KEY_LEN + 1)
         result = self._rstrtmgr.RmStartSession(ctypes.byref(session), 0, key)
         if result != 0:
-            raise OSError(result, "RmStartSession failed")
+            raise RestartManagerProbeError("RmStartSession", "RmStartSession", int(result))
+        primary_error: RestartManagerProbeError | None = None
         try:
-            path_array = (wintypes.LPCWSTR * 1)(str(target_path))
-            result = self._rstrtmgr.RmRegisterResources(session, 1, path_array, 0, None, 0, None)
+            path_array = (wintypes.LPCWSTR * len(paths))(*paths)
+            result = self._rstrtmgr.RmRegisterResources(session, len(paths), path_array, 0, None, 0, None)
             if result != 0:
-                raise OSError(result, "RmRegisterResources failed")
+                raise RestartManagerProbeError("RmRegisterResources", "RmRegisterResources", int(result))
             infos = None
             count = wintypes.UINT(0)
             for _ in range(2):
@@ -292,17 +332,17 @@ class RestartManagerLockProbe:
                 if result == 0 and needed.value == 0:
                     return []
                 if result not in (ERROR_MORE_DATA, 0):
-                    raise OSError(result, "RmGetList failed")
+                    raise RestartManagerProbeError("RmGetList", "RmGetList", int(result))
                 count = wintypes.UINT(needed.value)
                 infos = (RM_PROCESS_INFO * max(1, needed.value))()
                 result = self._rstrtmgr.RmGetList(session, ctypes.byref(needed), ctypes.byref(count), infos, ctypes.byref(reboot_reasons))
                 if result == ERROR_MORE_DATA:
                     continue
                 if result != 0:
-                    raise OSError(result, "RmGetList failed")
+                    raise RestartManagerProbeError("RmGetList", "RmGetList", int(result))
                 break
             else:
-                raise OSError(ERROR_MORE_DATA, "RmGetList changed during query")
+                raise RestartManagerProbeError("RmGetList", "RmGetList", ERROR_MORE_DATA)
             holders: list[LockHolder] = []
             for index in range(count.value):
                 info = infos[index]
@@ -319,23 +359,82 @@ class RestartManagerLockProbe:
                     )
                 )
             return holders
+        except RestartManagerProbeError as error:
+            primary_error = error
+            raise
         finally:
-            self._rstrtmgr.RmEndSession(session)
+            cleanup_result = self._rstrtmgr.RmEndSession(session)
+            if cleanup_result != 0 and primary_error is not None:
+                primary_error.secondary_cleanup_error = f"RmEndSession:{int(cleanup_result)}"
 
 
-def probe_candidates(target_path: str | Path, max_files: int = 10) -> list[Path]:
+def probe_candidates(target_path: str | Path, expected_profile_root: str | Path | None = None, max_files: int = 32, max_depth: int = 2) -> dict:
     target = Path(target_path)
-    candidates = [target]
+    profile = Path(expected_profile_root) if expected_profile_root is not None else None
+    safe = is_safe_dawn_cache_path(target, profile or target.parents[2])
+    if not safe.get("ok"):
+        return {"ok": False, "reason": safe.get("reason"), "resource_kind": "unknown", "candidates": [], "candidate_relative_paths": []}
+    target_resolved = Path(safe["target_path"])
+    dawn_root = Path(safe["dawn_root"]).resolve(strict=False)
+
+    def safe_file(path: Path) -> Path | None:
+        try:
+            if path.is_symlink():
+                return None
+            resolved = path.resolve(strict=False)
+            resolved.relative_to(dawn_root)
+            if not resolved.is_file():
+                return None
+            return resolved
+        except Exception:
+            return None
+
+    if target_resolved.is_file():
+        return {
+            "ok": True,
+            "reason": "none",
+            "resource_kind": "file",
+            "candidates": [target_resolved],
+            "candidate_relative_paths": [target_resolved.relative_to(dawn_root).as_posix()],
+        }
+    if not target_resolved.is_dir():
+        return {"ok": True, "reason": "none", "resource_kind": "missing", "candidates": [], "candidate_relative_paths": []}
+
+    candidates: list[Path] = []
     try:
-        if target.is_dir():
-            for child in target.rglob("*"):
-                if child.is_file():
-                    candidates.append(child)
-                    if len(candidates) >= max_files + 1:
-                        break
+        for child in target_resolved.rglob("*"):
+            try:
+                rel = child.resolve(strict=False).relative_to(target_resolved)
+                if len(rel.parts) > max_depth:
+                    continue
+                candidate = safe_file(child)
+                if candidate is not None:
+                    candidates.append(candidate)
+            except Exception:
+                continue
     except OSError:
-        pass
-    return candidates
+        return {"ok": True, "reason": "candidate_enumeration_failed", "resource_kind": "directory", "candidates": [], "candidate_relative_paths": []}
+    candidates = sorted(set(candidates), key=lambda path: path.stat().st_mtime if path.exists() else 0, reverse=True)[:max_files]
+    return {
+        "ok": True,
+        "reason": "none",
+        "resource_kind": "directory",
+        "candidates": candidates,
+        "candidate_relative_paths": [path.relative_to(dawn_root).as_posix() for path in candidates],
+    }
+
+
+def _safe_error_details(error: BaseException, stage: str | None = None, function: str | None = None) -> dict:
+    return {
+        "probe_error_type": type(error).__name__,
+        "probe_error_stage": getattr(error, "stage", stage),
+        "probe_error_function": getattr(error, "function", function),
+        "probe_rm_result_code": getattr(error, "rm_result_code", None),
+        "probe_winerror": getattr(error, "winerror", None),
+        "probe_errno": getattr(error, "errno", None),
+        "probe_error_message_safe": getattr(error, "message_safe", str(error).splitlines()[0][:160]),
+        "probe_secondary_cleanup_error": getattr(error, "secondary_cleanup_error", None),
+    }
 
 
 def probe_dawn_cache_lock(
@@ -358,7 +457,12 @@ def probe_dawn_cache_lock(
         "samples": [],
     }
     if not safe.get("ok"):
-        result["summary"] = summarize_probe_samples([])
+        result["probe_error"] = "path_not_safe"
+        result["summary"] = {
+            **summarize_probe_samples([]),
+            "dawn_lock_probe_holder_count": None,
+            "dawn_lock_probe_holder_classification": "path_not_safe",
+        }
         return result
     try:
         probe = probe or RestartManagerLockProbe()
@@ -366,28 +470,74 @@ def probe_dawn_cache_lock(
             int(pid): get_process_start_time(int(pid))
             for pid in set(current_attempt_pids or set()) | set(previous_attempt_pids or set()) | set(worker_pids or set())
         }
-        for delay in samples:
+        for index, delay in enumerate(samples):
             if delay > 0:
                 sleep(delay)
-            sample = {"sampled_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "holders": []}
-            holders_by_pid: dict[int, LockHolder] = {}
-            for candidate in probe_candidates(safe["target_path"]):
-                for holder in probe.holders(candidate):
-                    holders_by_pid.setdefault(holder.pid, holder)
-            holders = list(holders_by_pid.values())
-            for holder in holders:
-                classification = classify_lock_holder(
-                    holder,
-                    current_attempt_pids,
-                    previous_attempt_pids,
-                    worker_pids,
-                    known_process_start_times,
-                )
-                sample["holders"].append(LockHolder(**{**holder.__dict__, "classification": classification}).to_dict())
-            sample["holder_count"] = len(sample["holders"])
+            started = time.perf_counter()
+            sample = {
+                "sample_index": index,
+                "sampled_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "holders": [],
+                "rm_session_started": False,
+                "rm_resources_registered": False,
+                "rm_get_list_completed": False,
+            }
+            candidates = probe_candidates(safe["target_path"], expected_profile_root)
+            sample["resource_kind"] = candidates.get("resource_kind")
+            sample["candidate_count"] = len(candidates.get("candidates") or [])
+            sample["candidate_relative_paths"] = candidates.get("candidate_relative_paths") or []
+            try:
+                if not candidates.get("ok"):
+                    sample["classification"] = "path_not_safe"
+                elif not candidates.get("candidates"):
+                    sample["classification"] = "no_candidate_files"
+                else:
+                    sample["rm_session_started"] = True
+                    sample["rm_resources_registered"] = True
+                    holders_by_pid: dict[int, LockHolder] = {}
+                    for holder in probe.holders_for_paths(candidates["candidates"]):
+                        holders_by_pid.setdefault(holder.pid, holder)
+                    sample["rm_get_list_completed"] = True
+                    holders = list(holders_by_pid.values())
+                    for holder in holders:
+                        classification = classify_lock_holder(
+                            holder,
+                            current_attempt_pids,
+                            previous_attempt_pids,
+                            worker_pids,
+                            known_process_start_times,
+                        )
+                        sample["holders"].append(LockHolder(**{**holder.__dict__, "classification": classification}).to_dict())
+                    sample["holder_count"] = len(sample["holders"])
+            except Exception as error:
+                sample.update(_safe_error_details(error))
+                sample["classification"] = "probe_error"
+            finally:
+                sample["duration_ms"] = int((time.perf_counter() - started) * 1000)
             result["samples"].append(sample)
         result["summary"] = summarize_probe_samples(result["samples"])
     except Exception as error:
+        result.update(_safe_error_details(error))
         result["probe_error"] = type(error).__name__
         result["summary"] = summarize_probe_samples(result["samples"])
+    errors = [sample for sample in result["samples"] if sample.get("probe_error_type") or sample.get("probe_error_stage")]
+    if errors:
+        first = errors[0]
+        result["probe_error"] = first.get("probe_error_type")
+        for key in (
+            "probe_error_type",
+            "probe_error_stage",
+            "probe_error_function",
+            "probe_rm_result_code",
+            "probe_winerror",
+            "probe_errno",
+            "probe_error_message_safe",
+            "probe_secondary_cleanup_error",
+        ):
+            result[key] = first.get(key)
+    if result["samples"]:
+        first_sample = result["samples"][0]
+        result["resource_kind"] = first_sample.get("resource_kind")
+        result["candidate_count"] = max(int(sample.get("candidate_count") or 0) for sample in result["samples"])
+        result["candidate_relative_paths"] = next((sample.get("candidate_relative_paths") for sample in result["samples"] if sample.get("candidate_relative_paths")), [])
     return result

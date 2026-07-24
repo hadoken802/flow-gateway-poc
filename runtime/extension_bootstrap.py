@@ -361,6 +361,7 @@ class ExtensionBootstrapper:
         self._bootstrap_chrome_processes: dict[int, object] = {}
         self._dawn_lock_probe_watchers: dict[int, tuple[threading.Event, threading.Thread]] = {}
         self._dawn_lock_probe_results: dict[int, dict] = {}
+        self._dawn_lock_probe_attempt_results: dict[int, dict] = {}
 
     @property
     def template_path(self) -> Path:
@@ -1491,14 +1492,29 @@ class ExtensionBootstrapper:
             sleep=self.sleep,
         )
         summary = probe.get("summary") or {}
-        self._dawn_lock_probe_results[int(chrome_pid)] = {
+        probe_details = {
             "dawn_lock_probe_triggered": True,
             "dawn_lock_probe_completed": True,
             "dawn_lock_probe_timed_out": False,
             "dawn_lock_probe_path_safe": bool(probe.get("target_path_safe")),
             "dawn_lock_probe_target_relative": probe.get("target_relative"),
+            "dawn_lock_probe_resource_kind": probe.get("resource_kind"),
+            "dawn_lock_probe_candidate_count": probe.get("candidate_count"),
+            "dawn_lock_probe_candidate_relative_paths": probe.get("candidate_relative_paths"),
+            "dawn_lock_probe_no_candidate_files": summary.get("dawn_lock_probe_no_candidate_files"),
             "dawn_lock_probe_error": probe.get("probe_error"),
+            "dawn_lock_probe_error_stage": probe.get("probe_error_stage"),
+            "dawn_lock_probe_error_function": probe.get("probe_error_function"),
+            "dawn_lock_probe_rm_result_code": probe.get("probe_rm_result_code"),
+            "dawn_lock_probe_winerror": probe.get("probe_winerror"),
+            "dawn_lock_probe_errno": probe.get("probe_errno"),
             **summary,
+        }
+        self._dawn_lock_probe_results[int(chrome_pid)] = probe_details
+        self._dawn_lock_probe_attempt_results[int(attempt)] = {
+            "attempt_number": int(attempt),
+            "chrome_pid": int(chrome_pid),
+            "dawn_lock_probe": probe_details,
         }
         return True
 
@@ -1515,7 +1531,7 @@ class ExtensionBootstrapper:
             stop_event.set()
             thread.join(timeout=0.5)
             if pid not in self._dawn_lock_probe_results and thread.is_alive():
-                return {
+                details = {
                     "dawn_lock_probe_triggered": False,
                     "dawn_lock_probe_completed": False,
                     "dawn_lock_probe_timed_out": True,
@@ -1527,7 +1543,13 @@ class ExtensionBootstrapper:
                     "dawn_lock_probe_previous_attempt_chrome_detected": False,
                     "dawn_lock_probe_external_process_detected": False,
                 }
-        return self._dawn_lock_probe_results.get(pid, {
+                if self._dawn_lock_probe_attempt_results:
+                    details["bootstrap_chrome_attempt_diagnostics"] = [
+                        self._dawn_lock_probe_attempt_results[key]
+                        for key in sorted(self._dawn_lock_probe_attempt_results)
+                    ]
+                return details
+        details = self._dawn_lock_probe_results.get(pid, {
             "dawn_lock_probe_triggered": False,
             "dawn_lock_probe_completed": False,
             "dawn_lock_probe_timed_out": False,
@@ -1539,6 +1561,15 @@ class ExtensionBootstrapper:
             "dawn_lock_probe_previous_attempt_chrome_detected": False,
             "dawn_lock_probe_external_process_detected": False,
         })
+        if self._dawn_lock_probe_attempt_results:
+            details = {
+                **details,
+                "bootstrap_chrome_attempt_diagnostics": [
+                    self._dawn_lock_probe_attempt_results[key]
+                    for key in sorted(self._dawn_lock_probe_attempt_results)
+                ],
+            }
+        return details
 
     def _redacted_bootstrap_command(self, command: list[str]) -> list[str]:
         redacted = []
