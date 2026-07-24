@@ -1219,10 +1219,21 @@ def test_bootstrap_retries_once_for_gpu_chrome_exit_before_cdp_ready(tmp_path):
     registry = make_registry(tmp_path)
     account = add_account(registry)
     ready_template(registry.profiles_root)
+    template_cache = registry.profiles_root / TEMPLATE_PROFILE_NAME / "GPUPersistentCache" / "DawnGraphiteCache" / "abc" / "cache.db"
+    template_cache.parent.mkdir(parents=True)
+    template_cache.write_text("cache", encoding="utf-8")
     Path(account.profile_path).mkdir(parents=True)
     runtime = FakeRuntime(status={"extension_connected": True, "extension_account_id": "FLOW-006", "account_match": True})
     runtime.log_dir = tmp_path / "logs" / "runtime"
     runtime.poll_sequences = [[9], [None]]
+    original_popen = runtime.popen
+    cache_present_at_popen = []
+
+    def record_cache_state(command, **kwargs):
+        cache_present_at_popen.append((Path(account.profile_path) / "GPUPersistentCache").exists())
+        return original_popen(command, **kwargs)
+
+    runtime.popen = record_cache_state
 
     class GpuFailThenReadyCdp(FakeCdp):
         def __init__(self):
@@ -1282,6 +1293,91 @@ def test_bootstrap_retries_once_for_gpu_chrome_exit_before_cdp_ready(tmp_path):
     assert result.details["first_attempt_chrome_pid"] == 1000
     assert result.details["second_attempt_chrome_pid"] == 1001
     assert result.details["final_chrome_pid"] == 1001
+    assert cache_present_at_popen == [False, False]
+    attempts = result.details["bootstrap_chrome_attempt_diagnostics"]
+    cleanup_attempts = [item for item in attempts if "volatile_cache_cleanup" in item]
+    assert [item["attempt_number"] for item in cleanup_attempts] == [1, 2]
+    assert all(item["volatile_cache_cleanup"]["bootstrap_volatile_cache_cleanup_used"] is True for item in cleanup_attempts)
+
+
+def test_registered_empty_bootstrap_removes_gpupersistentcache_before_first_chrome(tmp_path):
+    registry = make_registry(tmp_path)
+    account = add_account(registry)
+    ready_template(registry.profiles_root)
+    template_cache = registry.profiles_root / TEMPLATE_PROFILE_NAME / "GPUPersistentCache" / "DawnGraphiteCache" / "abc" / "cache.db"
+    template_cache.parent.mkdir(parents=True)
+    template_cache.write_text("cache", encoding="utf-8")
+    profile = Path(account.profile_path)
+    profile.mkdir(parents=True)
+    runtime = FakeRuntime(status={"extension_connected": True, "extension_account_id": "FLOW-006", "account_match": True})
+    original_popen = runtime.popen
+
+    def assert_cache_removed_before_popen(command, **kwargs):
+        assert not (profile / "GPUPersistentCache").exists()
+        return original_popen(command, **kwargs)
+
+    runtime.popen = assert_cache_removed_before_popen
+    bootstrapper = ExtensionBootstrapper(registry, runtime=runtime, cdp=FakeCdp(EXPECTED_FLOWKIT_EXTENSION_ID), profiles_root=registry.profiles_root)
+
+    result = bootstrapper.bootstrap_account("FLOW-006")
+
+    assert result.ok is True
+    assert result.details["bootstrap_volatile_cache_cleanup_used"] is True
+    assert result.details["bootstrap_gpupersistentcache_present_before"] is True
+    assert result.details["bootstrap_gpupersistentcache_present_after"] is False
+
+
+def test_volatile_cache_cleanup_noops_when_gpupersistentcache_missing(tmp_path):
+    registry = make_registry(tmp_path)
+    account = add_account(registry)
+    profile = Path(account.profile_path)
+    profile.mkdir(parents=True)
+    bootstrapper = ExtensionBootstrapper(registry, runtime=FakeRuntime(), cdp=FakeCdp(), profiles_root=registry.profiles_root)
+
+    result = bootstrapper._cleanup_bootstrap_volatile_cache(
+        account,
+        {"profile_initialization_mode": "rebuilt_registered_empty_profile", "credential_storage_sanitized": True},
+        attempt=1,
+    )
+
+    assert result["ok"] is True
+    assert result["details"]["bootstrap_volatile_cache_cleanup_result"] == "no_op_missing"
+    assert result["details"]["bootstrap_gpupersistentcache_present_after"] is False
+
+
+def test_volatile_cache_cleanup_blocks_logged_in_profile(tmp_path):
+    registry = make_registry(tmp_path)
+    account = add_account(registry)
+    profile = Path(account.profile_path)
+    (profile / "Default").mkdir(parents=True)
+    (profile / "Default" / "Login Data").write_text("secretish", encoding="utf-8")
+    bootstrapper = ExtensionBootstrapper(registry, runtime=FakeRuntime(), cdp=FakeCdp(), profiles_root=registry.profiles_root)
+
+    result = bootstrapper._cleanup_bootstrap_volatile_cache(
+        account,
+        {"profile_initialization_mode": "rebuilt_registered_empty_profile", "credential_storage_sanitized": True},
+        attempt=1,
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "profile_volatile_cache_cleanup_failed"
+    assert result["details"]["bootstrap_volatile_cache_cleanup_block_reason"] == "google_login_artifacts_present"
+
+
+def test_volatile_cache_cleanup_blocks_account_path_mismatch(tmp_path):
+    registry = make_registry(tmp_path)
+    account = add_account(registry)
+    wrong = replace(account, profile_path=str(registry.profiles_root / "FLOW-007"))
+    bootstrapper = ExtensionBootstrapper(registry, runtime=FakeRuntime(), cdp=FakeCdp(), profiles_root=registry.profiles_root)
+
+    result = bootstrapper._cleanup_bootstrap_volatile_cache(
+        wrong,
+        {"profile_initialization_mode": "rebuilt_registered_empty_profile", "credential_storage_sanitized": True},
+        attempt=1,
+    )
+
+    assert result["ok"] is False
+    assert result["details"]["bootstrap_volatile_cache_cleanup_block_reason"] == "account_profile_path_mismatch"
 
 
 def test_bootstrap_gpu_chrome_exit_does_not_retry_when_worker_unhealthy_and_reports_reason(tmp_path):

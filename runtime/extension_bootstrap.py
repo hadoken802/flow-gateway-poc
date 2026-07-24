@@ -78,6 +78,7 @@ GPU_RETRY_FAILURE_CLASSES = {
     "gpu_process_crash_loop",
     "gpu_cache_sharing_violation",
 }
+VOLATILE_BOOTSTRAP_CACHE_DIR = Path("GPUPersistentCache")
 ALLOWED_REGISTERED_EMPTY_DIRS = {
     Path("."),
     Path("Default"),
@@ -596,6 +597,11 @@ class ExtensionBootstrapper:
             "credential_storage_sanitized": credential_storage_sanitized,
             "credential_storage_policy_version": CREDENTIAL_STORAGE_POLICY_VERSION if credential_storage_sanitized else None,
         }
+        if profile_initialization_mode == "rebuilt_registered_empty_profile":
+            volatile_cleanup = self._cleanup_bootstrap_volatile_cache(account, initialization_details, attempt=1)
+            initialization_details.update(volatile_cleanup["details"])
+            if not volatile_cleanup["ok"]:
+                return ExtensionBootstrapResult(volatile_cleanup["reason"], account.account_id, False, {**initialization_details, "stage": "volatile_cache_cleanup"})
         worker = self.runtime.start_worker_only(account.account_id)
         worker_started = worker.result == "started"
         worker_pid = (worker.details or {}).get("worker_pid")
@@ -640,6 +646,7 @@ class ExtensionBootstrapper:
             "first_attempt_chrome_pid": chrome_pid,
             "first_attempt_stdout_log": (chrome.details or {}).get("stdout_log"),
             "first_attempt_stderr_log": (chrome.details or {}).get("stderr_log"),
+            "bootstrap_chrome_attempt_diagnostics": list(initialization_details.get("bootstrap_chrome_attempt_diagnostics") or []),
         }
         try:
             try:
@@ -698,6 +705,19 @@ class ExtensionBootstrapper:
                     )
                 diagnostics["bootstrap_chrome_retry_permitted"] = True
                 diagnostics["bootstrap_chrome_retry_block_reason"] = "none"
+                volatile_cleanup = self._cleanup_bootstrap_volatile_cache(account, initialization_details, attempt=2)
+                prior_attempt_diagnostics = list(diagnostics.get("bootstrap_chrome_attempt_diagnostics") or [])
+                new_attempt_diagnostics = list((volatile_cleanup.get("details") or {}).get("bootstrap_chrome_attempt_diagnostics") or [])
+                volatile_cleanup["details"]["bootstrap_chrome_attempt_diagnostics"] = [*prior_attempt_diagnostics, *new_attempt_diagnostics]
+                diagnostics.update(volatile_cleanup["details"])
+                if not volatile_cleanup["ok"]:
+                    compensation = self._compensate_owned(account, False, worker_started, None, worker_pid)
+                    return ExtensionBootstrapResult(
+                        volatile_cleanup["reason"],
+                        account.account_id,
+                        False,
+                        {**initialization_details, **diagnostics, "stage": "volatile_cache_cleanup_retry", **compensation},
+                    )
                 nonce = secrets.token_urlsafe(18)
                 url = self.bootstrap_url(account, nonce, manifest.extension_id)
                 chrome = self._open_bootstrap_chrome(account, url, attempt=2)
@@ -1016,6 +1036,121 @@ class ExtensionBootstrapper:
     def _make_writable_and_retry(self, function, path, _exc_info) -> None:
         os.chmod(path, stat.S_IWRITE)
         function(path)
+
+    def _is_reparse_point(self, target: Path) -> bool:
+        try:
+            return bool(target.stat().st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+        except AttributeError:
+            return False
+        except OSError:
+            return False
+
+    def _cleanup_bootstrap_volatile_cache(self, account: AccountRecord, initialization_details: dict, attempt: int) -> dict:
+        details = {
+            "bootstrap_volatile_cache_cleanup_permitted": False,
+            "bootstrap_volatile_cache_cleanup_used": False,
+            "bootstrap_volatile_cache_cleanup_block_reason": "unknown",
+            "bootstrap_volatile_cache_cleanup_paths": [],
+            "bootstrap_gpupersistentcache_present_before": False,
+            "bootstrap_gpupersistentcache_file_count_before": 0,
+            "bootstrap_gpupersistentcache_size_before": 0,
+            "bootstrap_dawn_cache_present_before": False,
+            "bootstrap_dawn_cache_file_count_before": 0,
+            "bootstrap_gpupersistentcache_present_after": None,
+            "bootstrap_volatile_cache_cleanup_result": None,
+        }
+
+        def blocked(reason: str) -> dict:
+            details["bootstrap_volatile_cache_cleanup_block_reason"] = reason
+            return {"ok": False, "reason": "profile_volatile_cache_cleanup_failed", "details": self._with_attempt_cleanup(details, attempt)}
+
+        profile = Path(account.profile_path)
+        try:
+            profile_resolved = profile.resolve(strict=False)
+            profiles_root_resolved = self.profiles_root.resolve(strict=False)
+            expected_resolved = (self.profiles_root / account.account_id).resolve(strict=False)
+        except Exception:
+            return blocked("path_resolution_failed")
+        if initialization_details.get("profile_initialization_mode") != "rebuilt_registered_empty_profile":
+            return blocked("profile_not_registered_empty")
+        if initialization_details.get("credential_storage_sanitized") is not True:
+            return blocked("credential_storage_not_sanitized")
+        if not profile.is_absolute():
+            return blocked("profile_path_not_absolute")
+        if profile.name != account.account_id or profile_resolved != expected_resolved:
+            return blocked("account_profile_path_mismatch")
+        try:
+            profile_resolved.relative_to(profiles_root_resolved)
+        except ValueError:
+            return blocked("profile_path_outside_profiles_root")
+        if profile.name == TEMPLATE_PROFILE_NAME or "_failed_bootstrap" in {part.lower() for part in profile_resolved.parts}:
+            return blocked("profile_path_not_active_account")
+        if any((profile / name).exists() for name in ("Cookies", "Login Data", "Web Data")) or any((profile / "Default" / name).exists() for name in ("Cookies", "Login Data", "Web Data")):
+            return blocked("google_login_artifacts_present")
+
+        target = profile / VOLATILE_BOOTSTRAP_CACHE_DIR
+        try:
+            target_resolved = target.resolve(strict=False)
+            target_resolved.relative_to(profile_resolved)
+        except Exception:
+            return blocked("cache_path_not_safe")
+        if target.exists() and (target.is_symlink() or self._is_reparse_point(target)):
+            return blocked("cache_path_reparse_point")
+
+        files = []
+        if target.exists():
+            try:
+                files = [item for item in target.rglob("*") if item.is_file()]
+            except OSError:
+                return blocked("cache_metadata_failed")
+        dawn = target / "DawnGraphiteCache"
+        dawn_files = []
+        if dawn.exists():
+            try:
+                dawn_files = [item for item in dawn.rglob("*") if item.is_file()]
+            except OSError:
+                dawn_files = []
+        details.update({
+            "bootstrap_volatile_cache_cleanup_permitted": True,
+            "bootstrap_volatile_cache_cleanup_block_reason": "none",
+            "bootstrap_gpupersistentcache_present_before": target.exists(),
+            "bootstrap_gpupersistentcache_file_count_before": len(files),
+            "bootstrap_gpupersistentcache_size_before": sum(item.stat().st_size for item in files if item.exists()),
+            "bootstrap_dawn_cache_present_before": dawn.exists(),
+            "bootstrap_dawn_cache_file_count_before": len(dawn_files),
+            "bootstrap_volatile_cache_cleanup_paths": [VOLATILE_BOOTSTRAP_CACHE_DIR.as_posix()],
+        })
+        if not target.exists():
+            details["bootstrap_gpupersistentcache_present_after"] = False
+            details["bootstrap_volatile_cache_cleanup_result"] = "no_op_missing"
+            return {"ok": True, "reason": "none", "details": self._with_attempt_cleanup(details, attempt)}
+        try:
+            shutil.rmtree(target, onerror=self._make_writable_and_retry)
+        except Exception as error:
+            details["bootstrap_volatile_cache_cleanup_error"] = type(error).__name__
+            details["bootstrap_gpupersistentcache_present_after"] = target.exists()
+            details["bootstrap_volatile_cache_cleanup_result"] = "delete_failed"
+            return {"ok": False, "reason": "profile_volatile_cache_cleanup_failed", "details": self._with_attempt_cleanup(details, attempt)}
+        details["bootstrap_volatile_cache_cleanup_used"] = True
+        details["bootstrap_gpupersistentcache_present_after"] = target.exists()
+        details["bootstrap_volatile_cache_cleanup_result"] = "removed" if not target.exists() else "delete_incomplete"
+        if target.exists():
+            return {"ok": False, "reason": "profile_volatile_cache_cleanup_failed", "details": self._with_attempt_cleanup(details, attempt)}
+        return {"ok": True, "reason": "none", "details": self._with_attempt_cleanup(details, attempt)}
+
+    def _with_attempt_cleanup(self, cleanup_details: dict, attempt: int) -> dict:
+        attempt_detail = {
+            "attempt_number": int(attempt),
+            "volatile_cache_cleanup": {
+                key: value
+                for key, value in cleanup_details.items()
+                if key.startswith("bootstrap_volatile_cache_cleanup")
+                or key.startswith("bootstrap_gpupersistentcache")
+                or key.startswith("bootstrap_dawn_cache")
+            },
+        }
+        existing = list(cleanup_details.get("bootstrap_chrome_attempt_diagnostics") or [])
+        return {**cleanup_details, "bootstrap_chrome_attempt_diagnostics": [*existing, attempt_detail]}
 
     def _validate_account_config(self, account: AccountRecord) -> ExtensionBootstrapResult | None:
         if not ACCOUNT_ID_RE.match(account.account_id):
