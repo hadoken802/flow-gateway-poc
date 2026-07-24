@@ -678,24 +678,23 @@ class ExtensionBootstrapper:
                         False,
                         {**initialization_details, **diagnostics, "stage": "wait_cdp_ready", **compensation},
                     )
-                cleanup = self._cleanup_gpu_caches(account)
-                diagnostics["gpu_cache_cleanup_attempted"] = True
-                diagnostics["gpu_cache_cleanup_result"] = cleanup
-                if not cleanup["ok"]:
+                rebuild = self._rebuild_registered_empty_profile_for_retry(account, initialization_details)
+                diagnostics.update(rebuild["details"])
+                if not rebuild["ok"]:
                     diagnostics["bootstrap_chrome_retry_permitted"] = False
-                    diagnostics["bootstrap_chrome_retry_block_reason"] = "gpu_cache_cleanup_failed"
+                    diagnostics["bootstrap_chrome_retry_block_reason"] = rebuild["reason"]
                     compensation = self._compensate_owned(account, False, worker_started, None, worker_pid)
                     return ExtensionBootstrapResult(
-                        "gpu_cache_cleanup_failed",
+                        rebuild["reason"],
                         account.account_id,
                         False,
-                        {**initialization_details, **diagnostics, "stage": "gpu_cache_cleanup", **compensation},
+                        {**initialization_details, **diagnostics, "stage": "profile_rebuild_retry", **compensation},
                     )
                 diagnostics["bootstrap_chrome_retry_permitted"] = True
                 diagnostics["bootstrap_chrome_retry_block_reason"] = "none"
                 nonce = secrets.token_urlsafe(18)
                 url = self.bootstrap_url(account, nonce, manifest.extension_id)
-                chrome = self._open_bootstrap_chrome(account, url, attempt=2, extra_args=["--disable-gpu"])
+                chrome = self._open_bootstrap_chrome(account, url, attempt=2)
                 if chrome.result not in {"opened", "already_running"}:
                     compensation = self._compensate_owned(account, False, worker_started, None, worker_pid)
                     return ExtensionBootstrapResult(
@@ -794,6 +793,8 @@ class ExtensionBootstrapper:
                 )
             compensation = self._compensate_owned(account, chrome_started_by_bootstrap, worker_started, chrome_pid, worker_pid)
             result = status.result if status.result == "bootstrap_chrome_exited" else "extension_not_connected"
+            if diagnostics.get("bootstrap_chrome_retry_used") and result == "bootstrap_chrome_exited":
+                result = "bootstrap_chrome_retry_exhausted"
             if status.details.get("extension_connected") and not status.details.get("account_match"):
                 result = "account_mismatch"
             return ExtensionBootstrapResult(result, account.account_id, False, {**initialization_details, **diagnostics, **self._extension_details(account, status.details), "stage": "wait_extension_ready", **compensation})
@@ -1098,6 +1099,137 @@ class ExtensionBootstrapper:
             if not ok:
                 break
         return {"ok": ok, "cleaned": cleaned}
+
+    def _rebuild_registered_empty_profile_for_retry(self, account: AccountRecord, initialization_details: dict) -> dict:
+        details = {
+            "bootstrap_profile_rebuild_used": False,
+            "bootstrap_profile_rebuild_permitted": False,
+            "bootstrap_profile_rebuild_block_reason": "unknown",
+            "bootstrap_profile_stability_wait_ms": None,
+            "bootstrap_failed_profile_quarantined": False,
+            "bootstrap_failed_profile_quarantine_path_safe": False,
+            "bootstrap_profile_rebuild_result": None,
+            "bootstrap_profile_rebuild_mode": None,
+            "bootstrap_second_attempt_uses_fresh_profile": False,
+            "gpu_cache_cleanup_attempted": False,
+        }
+        if initialization_details.get("profile_initialization_mode") != "rebuilt_registered_empty_profile":
+            details["bootstrap_profile_rebuild_block_reason"] = "profile_not_registered_empty"
+            return {"ok": False, "reason": "profile_not_registered_empty", "details": details}
+        if initialization_details.get("credential_storage_sanitized") is not True:
+            details["bootstrap_profile_rebuild_block_reason"] = "credential_storage_not_sanitized"
+            return {"ok": False, "reason": "credential_storage_not_sanitized", "details": details}
+        stable = self._wait_profile_stable_for_retry(account)
+        details["bootstrap_profile_stability_wait_ms"] = stable["wait_ms"]
+        if not stable["ok"]:
+            details["bootstrap_profile_rebuild_block_reason"] = stable["reason"]
+            return {"ok": False, "reason": stable["reason"], "details": details}
+        quarantine = self._quarantine_failed_bootstrap_profile(account)
+        details.update(quarantine["details"])
+        if not quarantine["ok"]:
+            details["bootstrap_profile_rebuild_block_reason"] = quarantine["reason"]
+            return {"ok": False, "reason": quarantine["reason"], "details": details}
+        copied = self.copy_template_to_profile(account)
+        if not copied.ok:
+            details["bootstrap_profile_rebuild_block_reason"] = "profile_rebuild_failed"
+            details["bootstrap_profile_rebuild_result"] = copied.result
+            return {"ok": False, "reason": "profile_rebuild_failed", "details": details}
+        details.update({
+            "bootstrap_profile_rebuild_used": True,
+            "bootstrap_profile_rebuild_permitted": True,
+            "bootstrap_profile_rebuild_block_reason": "none",
+            "bootstrap_profile_rebuild_result": "rebuilt_registered_empty_profile",
+            "bootstrap_profile_rebuild_mode": "template_recopy_after_gpu_failure",
+            "bootstrap_second_attempt_uses_fresh_profile": True,
+        })
+        return {"ok": True, "reason": "none", "details": details}
+
+    def _wait_profile_stable_for_retry(self, account: AccountRecord, timeout_seconds: float = 3.0, quiet_seconds: float = 0.5) -> dict:
+        started = time.monotonic()
+        last_mtime = self._profile_latest_mtime(Path(account.profile_path))
+        stable_since = started
+        while time.monotonic() - started < timeout_seconds:
+            current_mtime = self._profile_latest_mtime(Path(account.profile_path))
+            if current_mtime == last_mtime:
+                if time.monotonic() - stable_since >= quiet_seconds:
+                    return {"ok": True, "reason": "none", "wait_ms": int((time.monotonic() - started) * 1000)}
+            else:
+                last_mtime = current_mtime
+                stable_since = time.monotonic()
+            self.sleep(0.1)
+        return {"ok": False, "reason": "profile_not_stable_for_retry", "wait_ms": int((time.monotonic() - started) * 1000)}
+
+    def _profile_latest_mtime(self, profile: Path) -> float:
+        latest = 0.0
+        for relative in (Path("."), Path("Default"), Path("GPUPersistentCache"), Path("Default") / "GPUPersistentCache"):
+            target = profile / relative
+            if not target.exists():
+                continue
+            try:
+                latest = max(latest, target.stat().st_mtime)
+                if target.is_dir():
+                    for child in target.rglob("*"):
+                        try:
+                            latest = max(latest, child.stat().st_mtime)
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+        return latest
+
+    def _quarantine_failed_bootstrap_profile(self, account: AccountRecord) -> dict:
+        profile = Path(account.profile_path)
+        details = {
+            "bootstrap_failed_profile_quarantine_path": None,
+            "bootstrap_failed_profile_size_bytes": None,
+            "bootstrap_failed_profile_file_count": None,
+        }
+        try:
+            profile_root = profile.resolve(strict=False)
+            profiles_root = self.profiles_root.resolve(strict=False)
+            expected = (self.profiles_root / account.account_id).resolve(strict=False)
+            if profile_root != expected:
+                return {"ok": False, "reason": "profile_not_retryable", "details": details}
+            profile_root.relative_to(profiles_root)
+            failed_root = self.profiles_root / "_failed_bootstrap"
+            failed_root.mkdir(parents=True, exist_ok=True)
+            failed_root_resolved = failed_root.resolve(strict=False)
+            failed_root_resolved.relative_to(profiles_root)
+            timestamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+            target = failed_root / f"{account.account_id}-{timestamp}-attempt-1"
+            suffix = 1
+            while target.exists():
+                target = failed_root / f"{account.account_id}-{timestamp}-attempt-1-{suffix}"
+                suffix += 1
+            target_resolved = target.resolve(strict=False)
+            target_resolved.relative_to(failed_root_resolved)
+            size, file_count = self._profile_size_and_file_count(profile)
+            profile.rename(target)
+            details.update({
+                "bootstrap_failed_profile_quarantined": True,
+                "bootstrap_failed_profile_quarantine_path_safe": True,
+                "bootstrap_failed_profile_quarantine_path": str(target),
+                "bootstrap_failed_profile_size_bytes": size,
+                "bootstrap_failed_profile_file_count": file_count,
+            })
+            return {"ok": True, "reason": "none", "details": details}
+        except Exception as error:
+            details["bootstrap_failed_profile_quarantine_error"] = type(error).__name__
+            return {"ok": False, "reason": "failed_profile_quarantine_failed", "details": details}
+
+    def _profile_size_and_file_count(self, profile: Path) -> tuple[int, int]:
+        total = 0
+        count = 0
+        if not profile.exists():
+            return total, count
+        for child in profile.rglob("*"):
+            if child.is_file():
+                count += 1
+                try:
+                    total += child.stat().st_size
+                except OSError:
+                    continue
+        return total, count
 
     def _worker_still_healthy_for_retry(self, account: AccountRecord, worker_pid: int | None) -> dict:
         started = time.monotonic()
