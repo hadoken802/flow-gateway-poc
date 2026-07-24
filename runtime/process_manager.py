@@ -954,41 +954,74 @@ class RuntimeManager:
         expected_worker_pid = account.worker_pid
         expected_runtime_instance_id = account.runtime_instance_id
         expected_runtime_ownership_version = account.runtime_ownership_version
+        details = {
+            "verified": False,
+            "reason": "unknown",
+            "method": "worker_challenge",
+            "worker_launcher_pid": pid,
+            "registry_worker_pid": expected_worker_pid,
+            "worker_launcher_alive": None,
+            "worker_launcher_probe_status": "not_checked",
+            "worker_api_reachable": False,
+            "worker_ws_reachable": False,
+            "worker_api_listener_pid": None,
+            "worker_ws_listener_pid": None,
+            "worker_listener_pid_consistent": False,
+            "worker_identity_match": False,
+            "worker_challenge_verified": False,
+            "worker_pid_cas_applied": False,
+        }
         probe = self.inspector.probe_process(pid)
+        details["worker_launcher_alive"] = probe.alive is True
+        details["worker_launcher_probe_status"] = probe.status
+        has_runtime_identity = bool(expected_runtime_instance_id and account.runtime_secret_ref and expected_runtime_ownership_version)
         if probe.alive is False:
-            return {"verified": False, "reason": "process_not_found", "method": None}
+            if not has_runtime_identity:
+                return {**details, "reason": "process_not_found", "method": None}
         if probe.alive is None:
-            return {"verified": False, "reason": f"process_probe_{probe.status}", "method": None}
-        if not expected_runtime_instance_id or not account.runtime_secret_ref or not expected_runtime_ownership_version:
-            return {"verified": False, "reason": "legacy_runtime_unverified", "method": None}
+            if not has_runtime_identity:
+                return {**details, "reason": f"process_probe_{probe.status}", "method": None}
+        if not has_runtime_identity:
+            return {**details, "reason": "legacy_runtime_unverified", "method": None}
         ports = self._worker_port_details(account)
         api_pid = ports["worker_api_listener_pid"]
         ws_pid = ports["worker_ws_listener_pid"]
-        if not api_pid or not ws_pid or int(api_pid) != int(ws_pid):
-            return {"verified": False, "reason": "worker_port_pid_mismatch", "method": "worker_challenge"}
+        details["worker_api_listener_pid"] = api_pid
+        details["worker_ws_listener_pid"] = ws_pid
+        details["worker_api_reachable"] = bool(api_pid)
+        details["worker_ws_reachable"] = bool(ws_pid)
+        if not api_pid:
+            return {**details, "reason": "worker_api_not_ready"}
+        if not ws_pid:
+            return {**details, "reason": "worker_ws_not_ready"}
+        if int(api_pid) != int(ws_pid):
+            return {**details, "reason": "worker_api_ws_pid_mismatch"}
+        details["worker_listener_pid_consistent"] = True
         health = self._worker_health(account)
         if not health:
-            return {"verified": False, "reason": "worker_health_unreachable", "method": "worker_challenge"}
+            return {**details, "reason": "worker_health_unreachable"}
         if health.get("account_id") != account.account_id:
-            return {"verified": False, "reason": "worker_identity_mismatch", "method": "worker_challenge"}
+            return {**details, "reason": "worker_identity_mismatch"}
         if health.get("runtime_instance_id") != expected_runtime_instance_id:
-            return {"verified": False, "reason": "runtime_instance_mismatch", "method": "worker_challenge"}
+            return {**details, "reason": "runtime_instance_mismatch"}
         if int(health.get("runtime_ownership_version") or 0) != int(expected_runtime_ownership_version):
-            return {"verified": False, "reason": "ownership_protocol_unsupported", "method": "worker_challenge"}
+            return {**details, "reason": "ownership_protocol_unsupported"}
+        details["worker_identity_match"] = True
         try:
             secret = read_runtime_secret(account.runtime_secret_ref, self.ownership_protector)
         except OwnershipError as error:
-            return {"verified": False, "reason": str(error), "method": "worker_challenge"}
+            return {**details, "reason": str(error)}
         challenge = generate_challenge()
         response = self._worker_ownership_challenge(account, challenge)
         if not response.get("ok"):
-            return {"verified": False, "reason": response.get("reason") or "ownership_challenge_failed", "method": "worker_challenge"}
+            return {**details, "reason": response.get("reason") or "ownership_challenge_failed"}
         if response.get("account_id") != account.account_id:
-            return {"verified": False, "reason": "worker_identity_mismatch", "method": "worker_challenge"}
+            return {**details, "reason": "worker_identity_mismatch"}
         if response.get("runtime_instance_id") != expected_runtime_instance_id:
-            return {"verified": False, "reason": "runtime_instance_mismatch", "method": "worker_challenge"}
+            return {**details, "reason": "runtime_instance_mismatch"}
         if not verify_challenge_response(secret, account.account_id, expected_runtime_instance_id, challenge, response.get("challenge_response", ""), int(expected_runtime_ownership_version)):
-            return {"verified": False, "reason": "ownership_challenge_failed", "method": "worker_challenge"}
+            return {**details, "reason": "ownership_challenge_failed"}
+        details["worker_challenge_verified"] = True
         updated = self.registry.mark_worker_ownership_verified_if_current(
             account.account_id,
             expected_runtime_instance_id,
@@ -998,8 +1031,14 @@ class RuntimeManager:
             "worker_challenge",
         )
         if not updated:
-            return {"verified": False, "reason": "runtime_identity_changed", "method": "worker_challenge"}
-        return {"verified": True, "reason": "verified", "method": "worker_challenge"}
+            return {**details, "reason": "runtime_identity_changed"}
+        return {
+            **details,
+            "verified": True,
+            "reason": "verified",
+            "method": "worker_challenge",
+            "worker_pid_cas_applied": int(api_pid) != int(expected_worker_pid or 0),
+        }
 
     def _worker_ownership_challenge(self, account: AccountRecord, challenge: str) -> dict:
         if not validate_challenge(challenge):

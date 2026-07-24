@@ -69,6 +69,18 @@ class FakeRuntime:
         self.worker_only_started = []
         self.start_one_calls = []
         self.poll_sequences = []
+        self.worker_ownership_payload = {
+            "verified": True,
+            "reason": "verified",
+            "method": "worker_challenge",
+            "worker_launcher_alive": True,
+            "worker_api_reachable": True,
+            "worker_ws_reachable": True,
+            "worker_listener_pid_consistent": True,
+            "worker_identity_match": True,
+            "worker_challenge_verified": True,
+            "worker_pid_cas_applied": False,
+        }
 
     def _find_chrome(self):
         return Path("C:/Chrome/chrome.exe")
@@ -125,6 +137,9 @@ class FakeRuntime:
         payload.setdefault("extension_account_id", account_id)
         payload.setdefault("account_match", payload.get("extension_account_id") == account_id and payload.get("extension_connected"))
         return RuntimeResult("running", account_id, bool(payload.get("account_match")), details=payload)
+
+    def _worker_runtime_ownership(self, account, worker_pid):
+        return {**self.worker_ownership_payload}
 
 
 class FakeCdp:
@@ -1254,10 +1269,138 @@ def test_bootstrap_retries_once_for_gpu_chrome_exit_before_cdp_ready(tmp_path):
     assert runtime.launched[0][1][-1] != runtime.launched[1][1][-1]
     assert result.details["bootstrap_chrome_attempts"] == 2
     assert result.details["bootstrap_chrome_retry_used"] is True
+    assert result.details["bootstrap_chrome_retry_permitted"] is True
+    assert result.details["bootstrap_chrome_retry_block_reason"] == "none"
     assert result.details["bootstrap_chrome_retry_reason"] == "gpu_process_unusable"
     assert result.details["first_attempt_chrome_pid"] == 1000
     assert result.details["second_attempt_chrome_pid"] == 1001
     assert result.details["final_chrome_pid"] == 1001
+
+
+def test_bootstrap_gpu_chrome_exit_does_not_retry_when_worker_unhealthy_and_reports_reason(tmp_path):
+    registry = make_registry(tmp_path)
+    account = add_account(registry)
+    ready_template(registry.profiles_root)
+    Path(account.profile_path).mkdir(parents=True)
+    runtime = FakeRuntime(status={
+        "worker_health_reachable": False,
+        "worker_pid": 2001,
+        "extension_connected": False,
+        "extension_account_id": "FLOW-006",
+        "account_match": False,
+    })
+    runtime.worker_ownership_payload = {
+        "verified": False,
+        "reason": "worker_health_unreachable",
+        "method": "worker_challenge",
+        "worker_launcher_alive": True,
+        "worker_api_reachable": True,
+        "worker_ws_reachable": True,
+        "worker_listener_pid_consistent": True,
+        "worker_identity_match": True,
+        "worker_challenge_verified": False,
+        "worker_pid_cas_applied": False,
+    }
+    runtime.log_dir = tmp_path / "logs" / "runtime"
+    runtime.poll_sequences = [[9]]
+
+    class GpuFailCdp(FakeCdp):
+        def wait_ready(self, cdp_port, **kwargs):
+            raise CdpError(
+                "bootstrap_chrome_exited",
+                {
+                    "stage": "wait_cdp_ready",
+                    "cdp_port": cdp_port,
+                    "chrome_pid": 1000,
+                    "chrome_exit_code": 9,
+                    "attempts": 1,
+                },
+            )
+
+    class StderrBootstrapper(ExtensionBootstrapper):
+        def _open_bootstrap_chrome(self, account, bootstrap_url, **kwargs):
+            result = super()._open_bootstrap_chrome(account, bootstrap_url, **kwargs)
+            Path(result.details["stderr_log"]).write_text(
+                "GPU process exited unexpectedly\n"
+                "FATAL: GPU process isn't usable. Goodbye.\n",
+                encoding="utf-8",
+            )
+            return result
+
+    bootstrapper = StderrBootstrapper(registry, runtime=runtime, cdp=GpuFailCdp(), profiles_root=registry.profiles_root, sleep=lambda _: None)
+
+    result = bootstrapper.bootstrap_account("FLOW-006")
+
+    assert result.ok is False
+    assert result.result == "bootstrap_chrome_exited"
+    assert len(runtime.launched) == 1
+    assert result.details["bootstrap_chrome_retry_eligible"] is True
+    assert result.details["bootstrap_chrome_retry_classified_eligible"] is True
+    assert result.details["bootstrap_chrome_retry_permitted"] is False
+    assert result.details["bootstrap_chrome_retry_block_reason"] == "worker_health_unreachable"
+    assert result.details["bootstrap_worker_health_reason"] == "worker_health_unreachable"
+    assert result.details["bootstrap_worker_challenge_verified"] is False
+    assert result.details["bootstrap_chrome_retry_used"] is False
+    assert result.details["bootstrap_chrome_attempts"] == 1
+
+
+def test_bootstrap_gpu_retry_uses_worker_challenge_when_status_is_stale(tmp_path):
+    registry = make_registry(tmp_path)
+    account = add_account(registry)
+    ready_template(registry.profiles_root)
+    Path(account.profile_path).mkdir(parents=True)
+    runtime = FakeRuntime(status={
+        "worker_health_reachable": False,
+        "worker_pid": 2001,
+        "extension_connected": True,
+        "extension_account_id": "FLOW-006",
+        "account_match": True,
+    })
+    runtime.log_dir = tmp_path / "logs" / "runtime"
+    runtime.poll_sequences = [[9], [None]]
+
+    class GpuFailThenReadyCdp(FakeCdp):
+        def __init__(self):
+            super().__init__(EXPECTED_FLOWKIT_EXTENSION_ID)
+            self.ready_calls = []
+
+        def wait_ready(self, cdp_port, **kwargs):
+            self.ready_calls.append(kwargs)
+            if len(self.ready_calls) == 1:
+                raise CdpError(
+                    "bootstrap_chrome_exited",
+                    {
+                        "stage": "wait_cdp_ready",
+                        "cdp_port": cdp_port,
+                        "chrome_pid": 1000,
+                        "chrome_exit_code": 9,
+                        "attempts": 1,
+                    },
+                )
+            return {"Browser": "Chrome"}
+
+    class StderrBootstrapper(ExtensionBootstrapper):
+        def _open_bootstrap_chrome(self, account, bootstrap_url, **kwargs):
+            result = super()._open_bootstrap_chrome(account, bootstrap_url, **kwargs)
+            if len(runtime.launched) == 1:
+                Path(result.details["stderr_log"]).write_text(
+                    "GPU process exited unexpectedly\n"
+                    "FATAL: GPU process isn't usable. Goodbye.\n",
+                    encoding="utf-8",
+                )
+            return result
+
+    bootstrapper = StderrBootstrapper(registry, runtime=runtime, cdp=GpuFailThenReadyCdp(), profiles_root=registry.profiles_root, sleep=lambda _: None)
+
+    result = bootstrapper.bootstrap_account("FLOW-006")
+
+    assert result.ok is True
+    assert len(runtime.launched) == 2
+    assert result.details["bootstrap_chrome_retry_used"] is True
+    assert result.details["bootstrap_chrome_retry_permitted"] is True
+    assert result.details["bootstrap_chrome_retry_block_reason"] == "none"
+    assert result.details["bootstrap_worker_challenge_verified"] is True
+    assert result.details["bootstrap_worker_health_reason"] == "none"
 
 
 def test_bootstrap_chrome_failure_classifier_does_not_retry_profile_lock_or_google_update_access(tmp_path):

@@ -655,10 +655,22 @@ class ExtensionBootstrapper:
                 diagnostics["first_attempt_failure_class"] = classification["failure_class"]
                 diagnostics["bootstrap_chrome_retry_reason"] = classification["failure_class"]
                 diagnostics["bootstrap_chrome_retry_eligible"] = bool(classification["retry_eligible"])
+                diagnostics["bootstrap_chrome_retry_classified_eligible"] = bool(classification["retry_eligible"])
                 diagnostics["bootstrap_chrome_failure_key_lines"] = classification["key_lines"]
-                if not classification["retry_eligible"] or not self._worker_still_healthy_for_retry(account, worker_pid):
+                if not classification["retry_eligible"]:
+                    diagnostics["bootstrap_chrome_retry_permitted"] = False
+                    diagnostics["bootstrap_chrome_retry_block_reason"] = "failure_class_not_retryable"
                     raise first_error
-                if not self._chrome_retry_safe(account, chrome_pid):
+                worker_health = self._worker_still_healthy_for_retry(account, worker_pid)
+                diagnostics.update(worker_health["details"])
+                if not worker_health["healthy"]:
+                    diagnostics["bootstrap_chrome_retry_permitted"] = False
+                    diagnostics["bootstrap_chrome_retry_block_reason"] = worker_health["reason"]
+                    raise first_error
+                chrome_ok, chrome_block_reason = self._chrome_retry_safe(account, chrome_pid)
+                if not chrome_ok:
+                    diagnostics["bootstrap_chrome_retry_permitted"] = False
+                    diagnostics["bootstrap_chrome_retry_block_reason"] = chrome_block_reason
                     compensation = self._compensate_owned(account, False, worker_started, None, worker_pid)
                     return ExtensionBootstrapResult(
                         "bootstrap_chrome_retry_unsafe",
@@ -670,6 +682,8 @@ class ExtensionBootstrapper:
                 diagnostics["gpu_cache_cleanup_attempted"] = True
                 diagnostics["gpu_cache_cleanup_result"] = cleanup
                 if not cleanup["ok"]:
+                    diagnostics["bootstrap_chrome_retry_permitted"] = False
+                    diagnostics["bootstrap_chrome_retry_block_reason"] = "gpu_cache_cleanup_failed"
                     compensation = self._compensate_owned(account, False, worker_started, None, worker_pid)
                     return ExtensionBootstrapResult(
                         "gpu_cache_cleanup_failed",
@@ -677,6 +691,8 @@ class ExtensionBootstrapper:
                         False,
                         {**initialization_details, **diagnostics, "stage": "gpu_cache_cleanup", **compensation},
                     )
+                diagnostics["bootstrap_chrome_retry_permitted"] = True
+                diagnostics["bootstrap_chrome_retry_block_reason"] = "none"
                 nonce = secrets.token_urlsafe(18)
                 url = self.bootstrap_url(account, nonce, manifest.extension_id)
                 chrome = self._open_bootstrap_chrome(account, url, attempt=2, extra_args=["--disable-gpu"])
@@ -1083,39 +1099,127 @@ class ExtensionBootstrapper:
                 break
         return {"ok": ok, "cleaned": cleaned}
 
-    def _worker_still_healthy_for_retry(self, account: AccountRecord, worker_pid: int | None) -> bool:
+    def _worker_still_healthy_for_retry(self, account: AccountRecord, worker_pid: int | None) -> dict:
+        started = time.monotonic()
+        last_result = self._worker_retry_health_once(account, worker_pid)
+        transient = {"worker_api_not_ready", "worker_ws_not_ready", "worker_health_unreachable", "worker_status_unavailable"}
+        while not last_result["healthy"] and last_result["reason"] in transient and time.monotonic() - started < 2.0:
+            self.sleep(0.2)
+            last_result = self._worker_retry_health_once(account, worker_pid)
+        return last_result
+
+    def _worker_retry_health_once(self, account: AccountRecord, worker_pid: int | None) -> dict:
+        details = {
+            "bootstrap_worker_health_reason": "unknown",
+            "bootstrap_worker_launcher_alive": None,
+            "bootstrap_worker_api_reachable": False,
+            "bootstrap_worker_ws_reachable": False,
+            "bootstrap_worker_listener_pid_consistent": False,
+            "bootstrap_worker_identity_match": False,
+            "bootstrap_worker_challenge_verified": False,
+            "bootstrap_worker_pid_cas_applied": False,
+        }
         if not worker_pid:
-            return False
+            details["bootstrap_worker_health_reason"] = "worker_registry_pid_missing"
+            return {"healthy": False, "reason": "worker_registry_pid_missing", "details": details}
+        current = self.registry.get(account.account_id) or account
+        ownership_fn = getattr(self.runtime, "_worker_runtime_ownership", None)
+        if callable(ownership_fn):
+            ownership = ownership_fn(current, worker_pid)
+            reason = self._worker_retry_reason(ownership.get("reason"))
+            details.update({
+                "bootstrap_worker_health_reason": "none" if ownership.get("verified") else reason,
+                "bootstrap_worker_launcher_alive": ownership.get("worker_launcher_alive"),
+                "bootstrap_worker_api_reachable": bool(ownership.get("worker_api_reachable")),
+                "bootstrap_worker_ws_reachable": bool(ownership.get("worker_ws_reachable")),
+                "bootstrap_worker_listener_pid_consistent": bool(ownership.get("worker_listener_pid_consistent")),
+                "bootstrap_worker_identity_match": bool(ownership.get("worker_identity_match")),
+                "bootstrap_worker_challenge_verified": bool(ownership.get("worker_challenge_verified")),
+                "bootstrap_worker_pid_cas_applied": bool(ownership.get("worker_pid_cas_applied")),
+            })
+            if ownership.get("worker_api_listener_pid") is not None:
+                details["bootstrap_worker_api_listener_pid"] = ownership.get("worker_api_listener_pid")
+            if ownership.get("worker_ws_listener_pid") is not None:
+                details["bootstrap_worker_ws_listener_pid"] = ownership.get("worker_ws_listener_pid")
+            return {"healthy": bool(ownership.get("verified")), "reason": "none" if ownership.get("verified") else reason, "details": details}
         try:
             status = self.runtime.status(account.account_id)
         except Exception:
-            return False
+            details["bootstrap_worker_health_reason"] = "worker_health_check_exception"
+            return {"healthy": False, "reason": "worker_health_check_exception", "details": details}
         details = status.details or {}
+        retry_details = {
+            "bootstrap_worker_health_reason": "none",
+            "bootstrap_worker_launcher_alive": None,
+            "bootstrap_worker_api_reachable": bool(details.get("worker_health_reachable")),
+            "bootstrap_worker_ws_reachable": details.get("worker_ws_listener_pid") is not None,
+            "bootstrap_worker_listener_pid_consistent": bool(
+                details.get("worker_api_listener_pid")
+                and details.get("worker_ws_listener_pid")
+                and int(details.get("worker_api_listener_pid")) == int(details.get("worker_ws_listener_pid"))
+            ),
+            "bootstrap_worker_identity_match": details.get("account_id") in (None, account.account_id),
+            "bootstrap_worker_challenge_verified": False,
+            "bootstrap_worker_pid_cas_applied": False,
+        }
         if details.get("worker_health_reachable") is False:
-            return False
+            retry_details["bootstrap_worker_health_reason"] = "worker_health_unreachable"
+            return {"healthy": False, "reason": "worker_health_unreachable", "details": retry_details}
         if details.get("worker_pid") not in (None, worker_pid):
-            return False
+            retry_details["bootstrap_worker_health_reason"] = "worker_pid_changed"
+            return {"healthy": False, "reason": "worker_pid_changed", "details": retry_details}
         if details.get("account_id") not in (None, account.account_id):
-            return False
-        return status.result in {"running", "partial"} or bool(details.get("extension_account_id") == account.account_id)
+            retry_details["bootstrap_worker_health_reason"] = "worker_account_mismatch"
+            return {"healthy": False, "reason": "worker_account_mismatch", "details": retry_details}
+        ok = status.result in {"running", "partial"} or bool(details.get("extension_account_id") == account.account_id)
+        if ok:
+            return {"healthy": True, "reason": "none", "details": retry_details}
+        retry_details["bootstrap_worker_health_reason"] = "worker_not_healthy"
+        return {"healthy": False, "reason": "worker_not_healthy", "details": retry_details}
 
-    def _chrome_retry_safe(self, account: AccountRecord, chrome_pid: int | None) -> bool:
+    def _worker_retry_reason(self, reason: str | None) -> str:
+        mapping = {
+            "process_not_found": "worker_launcher_exited",
+            "legacy_runtime_unverified": "legacy_runtime_unverified",
+            "worker_api_not_ready": "worker_api_not_ready",
+            "worker_ws_not_ready": "worker_ws_not_ready",
+            "worker_api_ws_pid_mismatch": "worker_api_ws_pid_mismatch",
+            "worker_port_pid_mismatch": "worker_api_ws_pid_mismatch",
+            "worker_health_unreachable": "worker_health_unreachable",
+            "worker_identity_mismatch": "worker_account_mismatch",
+            "runtime_instance_mismatch": "worker_runtime_instance_mismatch",
+            "ownership_protocol_unsupported": "worker_ownership_version_mismatch",
+            "ownership_secret_unavailable": "worker_secret_unavailable",
+            "ownership_challenge_failed": "worker_challenge_failed",
+            "ownership_challenge_timeout": "worker_challenge_timeout",
+            "runtime_identity_changed": "runtime_identity_changed",
+            "verified": "none",
+        }
+        if not reason:
+            return "worker_health_check_exception"
+        if reason.startswith("process_probe_"):
+            return "worker_launcher_probe_unavailable"
+        return mapping.get(reason, reason)
+
+    def _chrome_retry_safe(self, account: AccountRecord, chrome_pid: int | None) -> tuple[bool, str]:
         if not chrome_pid:
-            return False
+            return False, "first_chrome_pid_missing"
         proc = self._bootstrap_chrome_processes.get(int(chrome_pid))
         if proc is not None and hasattr(proc, "poll"):
             try:
                 if proc.poll() is None:
-                    return False
+                    return False, "first_chrome_not_confirmed_exited"
             except Exception:
-                return False
+                return False, "first_chrome_probe_failed"
         if port_is_listening(account.chrome_cdp_port):
-            return False
+            return False, "cdp_port_not_released"
         try:
             Path(account.profile_path).resolve(strict=False).relative_to(self.profiles_root.resolve(strict=False))
         except Exception:
-            return False
-        return Path(account.profile_path).name == account.account_id
+            return False, "profile_not_retryable"
+        if Path(account.profile_path).name != account.account_id:
+            return False, "profile_not_retryable"
+        return True, "none"
 
     def _wait_extension_ready(self, account: AccountRecord, attempts: int = 10, chrome_pid: int | None = None, diagnostics: dict | None = None) -> RuntimeResult:
         status = self.runtime.status(account.account_id)

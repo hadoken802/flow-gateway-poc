@@ -1604,7 +1604,7 @@ def test_worker_runtime_challenge_rejects_pid_and_identity_mismatch(tmp_path):
     inspector.listeners[account.worker_api_port] = 35088
     inspector.listeners[account.extension_ws_port] = 99999
 
-    assert manager.status("FLOW-012").details["worker_ownership_reason"] == "worker_port_pid_mismatch"
+    assert manager.status("FLOW-012").details["worker_ownership_reason"] == "worker_api_ws_pid_mismatch"
 
     inspector.listeners[account.extension_ws_port] = 35088
     manager._worker_health = lambda _account: {
@@ -1614,6 +1614,45 @@ def test_worker_runtime_challenge_rejects_pid_and_identity_mismatch(tmp_path):
     }
 
     assert manager.status("FLOW-012").details["worker_ownership_reason"] == "worker_identity_mismatch"
+
+
+def test_worker_runtime_challenge_repairs_listener_pid_when_launcher_probe_fails(tmp_path):
+    registry = make_registry(tmp_path)
+    account = add_account(registry, "FLOW-012")
+    inspector = FakeInspector()
+    manager = make_manager(tmp_path, registry, inspector=inspector, health={}, cdp=False)
+    identity = create_runtime_identity(account.account_id, registry.data_root, FakeSecretProtector())
+    registry.mark_worker_runtime_identity(account.account_id, identity.runtime_instance_id, identity.secret_ref, identity.secret_fingerprint, identity.version)
+    registry.mark_worker_process_started(account.account_id, 35088)
+    account = registry.get(account.account_id)
+    inspector.probe_status[35088] = "access_denied"
+    inspector.alive.add(35100)
+    inspector.listeners[account.worker_api_port] = 35100
+    inspector.listeners[account.extension_ws_port] = 35100
+    manager._worker_health = lambda _account: {
+        "account_id": "FLOW-012",
+        "runtime_instance_id": identity.runtime_instance_id,
+        "runtime_ownership_version": 1,
+    }
+
+    def challenge(_account, challenge):
+        return {
+            "ok": True,
+            "account_id": "FLOW-012",
+            "runtime_instance_id": identity.runtime_instance_id,
+            "challenge_response": sign_challenge(identity.secret, "FLOW-012", identity.runtime_instance_id, challenge),
+            "proof_version": 1,
+        }
+
+    manager._worker_ownership_challenge = challenge
+
+    status = manager.status("FLOW-012")
+    current = registry.get("FLOW-012")
+
+    assert status.details["worker_ownership_verified"] is True
+    assert status.details["worker_ownership_reason"] == "verified"
+    assert current.worker_pid == 35100
+    assert current.worker_ownership_method == "worker_challenge"
 
 
 def test_legacy_account_is_not_worker_verified(tmp_path):
