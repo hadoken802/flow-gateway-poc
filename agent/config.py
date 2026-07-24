@@ -31,6 +31,9 @@ def _mask_account(account_id: str) -> str:
 BASE_DIR = Path(os.environ.get("FLOW_AGENT_DIR", Path(__file__).parent.parent))
 FLOW_ACCOUNT_ID = os.environ.get("FLOW_ACCOUNT_ID", "FLOW-001")
 DB_PATH = _env_path("FLOW_DB_PATH", BASE_DIR / "flow_agent.db")
+FLOW_RUNTIME_INSTANCE_ID = os.environ.get("FLOW_RUNTIME_INSTANCE_ID", "")
+FLOW_RUNTIME_OWNERSHIP_SECRET = os.environ.get("FLOW_RUNTIME_OWNERSHIP_SECRET", "")
+FLOW_RUNTIME_OWNERSHIP_VERSION = int(os.environ.get("FLOW_RUNTIME_OWNERSHIP_VERSION", "0") or "0")
 
 # ─── API Server ──────────────────────────────────────────────
 API_HOST = os.environ.get("AGENT_API_HOST", os.environ.get("API_HOST", "127.0.0.1"))

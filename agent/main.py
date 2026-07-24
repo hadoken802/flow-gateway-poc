@@ -9,7 +9,7 @@ import websockets
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-from agent.config import FLOW_ACCOUNT_ID, API_HOST, API_PORT, WS_HOST, WS_PORT, EXTENSION_WS_MAX_SIZE_BYTES, DB_PATH, OUTPUT_DIR
+from agent.config import FLOW_ACCOUNT_ID, API_HOST, API_PORT, WS_HOST, WS_PORT, EXTENSION_WS_MAX_SIZE_BYTES, DB_PATH, OUTPUT_DIR, FLOW_RUNTIME_INSTANCE_ID, FLOW_RUNTIME_OWNERSHIP_SECRET, FLOW_RUNTIME_OWNERSHIP_VERSION
 from agent.db.schema import init_db, close_db
 from agent.api.characters import router as characters_router
 from agent.api.projects import router as projects_router
@@ -28,6 +28,7 @@ from agent.worker.processor import get_worker_controller
 from agent.services.flow_client import get_flow_client
 from agent.services.event_bus import event_bus
 from agent.sdk import init_sdk
+from runtime.ownership import OWNERSHIP_VERSION, sign_challenge, validate_challenge
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -241,8 +242,43 @@ async def health():
         "ws_port": WS_PORT,
         "ws_max_size_bytes": EXTENSION_WS_MAX_SIZE_BYTES,
         "extension_connected": client.connected,
+        "runtime_instance_id": FLOW_RUNTIME_INSTANCE_ID or None,
+        "runtime_ownership_version": FLOW_RUNTIME_OWNERSHIP_VERSION or None,
+        "runtime_ownership_capable": bool(FLOW_RUNTIME_INSTANCE_ID and FLOW_RUNTIME_OWNERSHIP_SECRET and FLOW_RUNTIME_OWNERSHIP_VERSION == OWNERSHIP_VERSION),
         "ws": client.ws_stats,
         "bootstrap_diagnostics": client.bootstrap_diagnostics,
+    }
+
+
+@app.post("/api/runtime/ownership/challenge")
+async def runtime_ownership_challenge(request: Request):
+    raw = await request.body()
+    if len(raw) > 1024:
+        return {"ok": False, "reason": "payload_too_large"}
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return {"ok": False, "reason": "invalid_json"}
+    allowed = {"account_id", "runtime_instance_id", "challenge", "proof_version"}
+    if set(data.keys()) - allowed:
+        return {"ok": False, "reason": "invalid_fields"}
+    if not FLOW_RUNTIME_INSTANCE_ID or not FLOW_RUNTIME_OWNERSHIP_SECRET or FLOW_RUNTIME_OWNERSHIP_VERSION != OWNERSHIP_VERSION:
+        return {"ok": False, "reason": "ownership_protocol_unsupported"}
+    if data.get("account_id") != FLOW_ACCOUNT_ID:
+        return {"ok": False, "reason": "account_mismatch"}
+    if data.get("runtime_instance_id") != FLOW_RUNTIME_INSTANCE_ID:
+        return {"ok": False, "reason": "runtime_instance_mismatch"}
+    if int(data.get("proof_version") or 0) != OWNERSHIP_VERSION:
+        return {"ok": False, "reason": "ownership_protocol_unsupported"}
+    challenge = data.get("challenge")
+    if not validate_challenge(challenge):
+        return {"ok": False, "reason": "invalid_challenge"}
+    return {
+        "ok": True,
+        "account_id": FLOW_ACCOUNT_ID,
+        "runtime_instance_id": FLOW_RUNTIME_INSTANCE_ID,
+        "challenge_response": sign_challenge(FLOW_RUNTIME_OWNERSHIP_SECRET, FLOW_ACCOUNT_ID, FLOW_RUNTIME_INSTANCE_ID, challenge, OWNERSHIP_VERSION),
+        "proof_version": OWNERSHIP_VERSION,
     }
 
 

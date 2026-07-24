@@ -9,8 +9,20 @@ import subprocess
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
+from .ownership import (
+    OWNERSHIP_VERSION,
+    OwnershipError,
+    OwnershipSecretProtector,
+    create_runtime_identity,
+    delete_secret_ref,
+    generate_challenge,
+    read_runtime_secret,
+    sign_challenge,
+    validate_challenge,
+    verify_challenge_response,
+)
 from .paths import EXTENSION_DIR, FLOWKIT_DIR, POC_ROOT
 from .port_allocator import port_can_bind, port_is_listening
 from .registry import AccountRecord, AccountRegistry
@@ -19,6 +31,7 @@ from .registry import AccountRecord, AccountRegistry
 FLOW_URL = "https://labs.google/fx/tools/flow"
 PYTHON_EXE = POC_ROOT / ".venv" / "Scripts" / "python.exe"
 TH32CS_SNAPPROCESS = 0x00000002
+PROCESS_TERMINATE = 0x0001
 DWORD = ctypes.c_ulong
 BOOL = ctypes.c_int
 HANDLE = ctypes.c_void_p
@@ -48,6 +61,10 @@ def _load_kernel32():
     kernel32.Process32FirstW.restype = BOOL
     kernel32.Process32NextW.argtypes = [HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
     kernel32.Process32NextW.restype = BOOL
+    kernel32.OpenProcess.argtypes = [DWORD, BOOL, DWORD]
+    kernel32.OpenProcess.restype = HANDLE
+    kernel32.TerminateProcess.argtypes = [HANDLE, ctypes.c_uint]
+    kernel32.TerminateProcess.restype = BOOL
     kernel32.CloseHandle.argtypes = [HANDLE]
     kernel32.CloseHandle.restype = BOOL
     return kernel32
@@ -99,6 +116,8 @@ class TerminationResult:
     forced_returncode: int | None = None
     forced_stdout: str = ""
     forced_stderr: str = ""
+    winapi_attempted: bool = False
+    winapi_success: bool = False
     process_alive_after: bool = False
     timeout: bool = False
     exception_type: str | None = None
@@ -330,9 +349,21 @@ class ProcessInspector:
                 result.exception_type = type(error).__name__
             except Exception as error:
                 result.exception_type = type(error).__name__
+        if self.process_alive(pid):
+            result.winapi_attempted = True
+            result.winapi_success = self._terminate_with_winapi(pid)
         result.process_alive_after = self.process_alive(pid)
         result.success = not result.process_alive_after
         return result
+
+    def _terminate_with_winapi(self, pid: int) -> bool:
+        handle = KERNEL32.OpenProcess(PROCESS_TERMINATE, False, DWORD(int(pid)))
+        if not handle:
+            return False
+        try:
+            return bool(KERNEL32.TerminateProcess(handle, 1))
+        finally:
+            KERNEL32.CloseHandle(handle)
 
     def _truncate_output(self, output: str | None, limit: int = 500) -> str:
         text = (output or "").strip()
@@ -350,6 +381,7 @@ class RuntimeManager:
         python_exe: Path | str = PYTHON_EXE,
         flow_url: str = FLOW_URL,
         log_dir: Path | str | None = None,
+        ownership_protector: OwnershipSecretProtector | None = None,
     ):
         self.registry = registry or AccountRegistry()
         self.inspector = inspector or ProcessInspector()
@@ -359,6 +391,7 @@ class RuntimeManager:
         self.python_exe = Path(python_exe)
         self.flow_url = flow_url
         self.log_dir = Path(log_dir) if log_dir else POC_ROOT / "logs" / "runtime"
+        self.ownership_protector = ownership_protector
 
     def open_login(self, account_id: str) -> RuntimeResult:
         account = self._account_or_error(account_id)
@@ -404,8 +437,7 @@ class RuntimeManager:
             if existing_worker_pid:
                 self._log(account.account_id, "start-one", {"step": "worker_reused", "pid": existing_worker_pid})
             else:
-                worker_proc = self._start_worker_process(account)
-                self.registry.mark_started(account.account_id, worker_pid=worker_proc.pid)
+                worker_proc = self._start_new_worker(account)
                 self._log(account.account_id, "start-one", {"step": "worker_started", "pid": worker_proc.pid, "command": self._safe_command(self.worker_command(account))})
             if existing_chrome_pid:
                 self.registry.mark_started(account.account_id, chrome_pid=existing_chrome_pid)
@@ -447,11 +479,10 @@ class RuntimeManager:
             self._log(account.account_id, "start-worker-only", {"result": "already_running", "pid": existing_worker_pid})
             return RuntimeResult("already_running", account.account_id, True, details={"worker_pid": existing_worker_pid})
         try:
-            worker_proc = self._start_worker_process(account)
+            worker_proc = self._start_new_worker(account)
         except Exception as error:
             self._log(account.account_id, "start-worker-only", {"result": "worker_start_failed", "error": str(error)})
             return RuntimeResult("worker_start_failed", account.account_id, False, str(error))
-        self.registry.mark_started(account.account_id, worker_pid=worker_proc.pid)
         self._log(account.account_id, "start-worker-only", {"result": "started", "pid": worker_proc.pid, "command": self._safe_command(self.worker_command(account))})
         return RuntimeResult("started", account.account_id, True, details={"worker_pid": worker_proc.pid})
 
@@ -465,7 +496,7 @@ class RuntimeManager:
         chrome_probe = self.inspector.probe_process(account.chrome_pid)
         worker_probe = self.inspector.probe_process(account.worker_pid)
         chrome_ownership = self._chrome_ownership(account, account.chrome_pid)
-        worker_ownership = self._worker_ownership(account, account.worker_pid)
+        worker_ownership = self._worker_runtime_ownership(account, account.worker_pid)
         chrome_alive = chrome_probe.alive is True
         account = self.registry.get(account_id) or account
         worker_alive = worker_probe.alive is True
@@ -491,7 +522,7 @@ class RuntimeManager:
         chrome_cdp_listener_pid = self.inspector.listening_pid(account.chrome_cdp_port)
         worker_ports_listening = bool(worker_api_listener_pid and worker_ws_listener_pid and int(worker_api_listener_pid) == int(worker_ws_listener_pid))
         chrome_port_listening = bool(chrome_cdp_listener_pid)
-        worker_service_reachable = bool(worker_health_matches and (worker_ports_listening or worker_ownership["verified"]))
+        worker_service_reachable = bool(worker_health_matches and (worker_ports_listening or worker_alive or worker_ownership["verified"]))
         chrome_service_reachable = bool(cdp_reachable and (chrome_port_listening or chrome_ownership["verified"]))
         runtime_healthy = bool(worker_service_reachable and chrome_service_reachable and account_match)
         if runtime_healthy:
@@ -544,6 +575,10 @@ class RuntimeManager:
             "last_error": account.last_error,
             "worker_ownership_verified": worker_ownership["verified"],
             "worker_ownership_reason": worker_ownership["reason"],
+            "worker_ownership_method": worker_ownership.get("method"),
+            "worker_ownership_verified_at": account.worker_ownership_verified_at,
+            "runtime_instance_id": account.runtime_instance_id,
+            "runtime_ownership_version": account.runtime_ownership_version,
             "ownership_status": ownership_status,
             "stop_safe": stop_safe,
         }
@@ -613,6 +648,8 @@ class RuntimeManager:
                 details = {"stage": "wait_ports", "target": "chrome", "pid": verified_chrome_pid, "remaining_ports": {"chrome_cdp_listener_pid": self.inspector.listening_pid(account.chrome_cdp_port)}}
                 self._log(account.account_id, "stop-one", {"result": "stop_failed", **details})
                 return RuntimeResult("stop_failed", account.account_id, False, details=details)
+        current = self.registry.get(account.account_id) or account
+        delete_secret_ref(current.runtime_secret_ref)
         self.registry.mark_stopped(account.account_id)
         self._log(account.account_id, "stop-one", {"result": "stopped", **plan})
         return RuntimeResult("stopped", account.account_id, True, details=plan)
@@ -654,13 +691,37 @@ class RuntimeManager:
         })
         return env
 
-    def _start_worker_process(self, account: AccountRecord):
+    def _start_new_worker(self, account: AccountRecord):
+        identity = create_runtime_identity(account.account_id, self.registry.data_root, self.ownership_protector)
+        self.registry.mark_worker_runtime_identity(
+            account.account_id,
+            identity.runtime_instance_id,
+            identity.secret_ref,
+            identity.secret_fingerprint,
+            identity.version,
+        )
+        try:
+            proc = self._start_worker_process(account, identity)
+        except Exception:
+            delete_secret_ref(identity.secret_ref)
+            raise
+        self.registry.mark_worker_process_started(account.account_id, proc.pid)
+        return proc
+
+    def _start_worker_process(self, account: AccountRecord, identity=None):
         log_handle = self._worker_log_file(account).open("ab")
         try:
+            env = self.worker_env(account)
+            if identity is not None:
+                env.update({
+                    "FLOW_RUNTIME_INSTANCE_ID": identity.runtime_instance_id,
+                    "FLOW_RUNTIME_OWNERSHIP_SECRET": identity.secret,
+                    "FLOW_RUNTIME_OWNERSHIP_VERSION": str(identity.version),
+                })
             return self.popen(
                 self.worker_command(account),
                 cwd=str(FLOWKIT_DIR),
-                env=self.worker_env(account),
+                env=env,
                 stdout=log_handle,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
@@ -865,14 +926,16 @@ class RuntimeManager:
         return None
 
     def _worker_pid_matches(self, account: AccountRecord, pid: int | None) -> bool:
-        return self._worker_ownership(account, pid)["verified"]
+        return self._worker_ownership(account, pid, allow_legacy_command_line=True)["verified"]
 
-    def _worker_ownership(self, account: AccountRecord, pid: int | None) -> dict:
+    def _worker_ownership(self, account: AccountRecord, pid: int | None, allow_legacy_command_line: bool = False) -> dict:
         probe = self.inspector.probe_process(pid)
         if probe.alive is False:
             return {"verified": False, "reason": "process_not_found"}
         if probe.alive is None:
             return {"verified": False, "reason": f"process_probe_{probe.status}"}
+        if not allow_legacy_command_line:
+            return {"verified": False, "reason": "legacy_runtime_unverified"}
         cmd_probe = self.inspector.command_line_probe(pid)
         if cmd_probe.status != "available":
             return {"verified": False, "reason": f"command_line_{cmd_probe.status}"}
@@ -887,11 +950,95 @@ class RuntimeManager:
             return {"verified": False, "reason": "ws_port_mismatch"}
         return {"verified": True, "reason": "verified"}
 
+    def _worker_runtime_ownership(self, account: AccountRecord, pid: int | None) -> dict:
+        expected_worker_pid = account.worker_pid
+        expected_runtime_instance_id = account.runtime_instance_id
+        expected_runtime_ownership_version = account.runtime_ownership_version
+        probe = self.inspector.probe_process(pid)
+        if probe.alive is False:
+            return {"verified": False, "reason": "process_not_found", "method": None}
+        if probe.alive is None:
+            return {"verified": False, "reason": f"process_probe_{probe.status}", "method": None}
+        if not expected_runtime_instance_id or not account.runtime_secret_ref or not expected_runtime_ownership_version:
+            return {"verified": False, "reason": "legacy_runtime_unverified", "method": None}
+        ports = self._worker_port_details(account)
+        api_pid = ports["worker_api_listener_pid"]
+        ws_pid = ports["worker_ws_listener_pid"]
+        if not api_pid or not ws_pid or int(api_pid) != int(ws_pid):
+            return {"verified": False, "reason": "worker_port_pid_mismatch", "method": "worker_challenge"}
+        health = self._worker_health(account)
+        if not health:
+            return {"verified": False, "reason": "worker_health_unreachable", "method": "worker_challenge"}
+        if health.get("account_id") != account.account_id:
+            return {"verified": False, "reason": "worker_identity_mismatch", "method": "worker_challenge"}
+        if health.get("runtime_instance_id") != expected_runtime_instance_id:
+            return {"verified": False, "reason": "runtime_instance_mismatch", "method": "worker_challenge"}
+        if int(health.get("runtime_ownership_version") or 0) != int(expected_runtime_ownership_version):
+            return {"verified": False, "reason": "ownership_protocol_unsupported", "method": "worker_challenge"}
+        try:
+            secret = read_runtime_secret(account.runtime_secret_ref, self.ownership_protector)
+        except OwnershipError as error:
+            return {"verified": False, "reason": str(error), "method": "worker_challenge"}
+        challenge = generate_challenge()
+        response = self._worker_ownership_challenge(account, challenge)
+        if not response.get("ok"):
+            return {"verified": False, "reason": response.get("reason") or "ownership_challenge_failed", "method": "worker_challenge"}
+        if response.get("account_id") != account.account_id:
+            return {"verified": False, "reason": "worker_identity_mismatch", "method": "worker_challenge"}
+        if response.get("runtime_instance_id") != expected_runtime_instance_id:
+            return {"verified": False, "reason": "runtime_instance_mismatch", "method": "worker_challenge"}
+        if not verify_challenge_response(secret, account.account_id, expected_runtime_instance_id, challenge, response.get("challenge_response", ""), int(expected_runtime_ownership_version)):
+            return {"verified": False, "reason": "ownership_challenge_failed", "method": "worker_challenge"}
+        updated = self.registry.mark_worker_ownership_verified_if_current(
+            account.account_id,
+            expected_runtime_instance_id,
+            expected_worker_pid,
+            int(expected_runtime_ownership_version),
+            int(api_pid),
+            "worker_challenge",
+        )
+        if not updated:
+            return {"verified": False, "reason": "runtime_identity_changed", "method": "worker_challenge"}
+        return {"verified": True, "reason": "verified", "method": "worker_challenge"}
+
+    def _worker_ownership_challenge(self, account: AccountRecord, challenge: str) -> dict:
+        if not validate_challenge(challenge):
+            return {"ok": False, "reason": "invalid_challenge"}
+        payload = json.dumps(
+            {
+                "account_id": account.account_id,
+                "runtime_instance_id": account.runtime_instance_id,
+                "challenge": challenge,
+                "proof_version": int(account.runtime_ownership_version or OWNERSHIP_VERSION),
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        request = Request(
+            f"http://127.0.0.1:{account.worker_api_port}/api/runtime/ownership/challenge",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=1.0) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except Exception:
+            return {"ok": False, "reason": "ownership_challenge_timeout"}
+        if not isinstance(data, dict) or not data.get("ok", True):
+            return {"ok": False, "reason": data.get("reason") if isinstance(data, dict) else "ownership_challenge_failed"}
+        return {"ok": True, **data}
+
     def _combined_ownership_status(self, chrome_ownership: dict, worker_ownership: dict) -> str:
         verified = [chrome_ownership["verified"], worker_ownership["verified"]]
         reasons = {chrome_ownership["reason"], worker_ownership["reason"]}
         if all(verified):
             return "verified"
+        if worker_ownership["verified"] and not chrome_ownership["verified"]:
+            return "worker_verified"
+        if chrome_ownership["verified"] and not worker_ownership["verified"]:
+            return "chrome_verified"
+        if "legacy_runtime_unverified" in reasons:
+            return "legacy_unverified"
         if "profile_mismatch" in reasons or "cdp_port_mismatch" in reasons or "account_mismatch" in reasons or "api_port_mismatch" in reasons or "ws_port_mismatch" in reasons:
             return "mismatch"
         if any(verified):
@@ -938,11 +1085,46 @@ class RuntimeManager:
             return sock.connect_ex(("127.0.0.1", int(port))) == 0
 
     def _stop_started(self, account: AccountRecord, worker_pid: int | None, chrome_pid: int | None) -> None:
-        if worker_pid and self.inspector.process_alive(worker_pid):
-            self.inspector.terminate(worker_pid)
+        for pid in self._owned_started_worker_stop_pids(account, worker_pid):
+            if self.inspector.process_alive(pid):
+                self.inspector.terminate(pid)
         if chrome_pid and self.inspector.process_alive(chrome_pid):
             self.inspector.terminate(chrome_pid)
+        current = self.registry.get(account.account_id) or account
+        delete_secret_ref(current.runtime_secret_ref)
         self.registry.mark_stopped(account.account_id)
+
+    def _owned_started_worker_stop_pids(self, account: AccountRecord, worker_pid: int | None) -> list[int]:
+        candidates: list[int] = []
+        if worker_pid:
+            candidates.append(int(worker_pid))
+
+        current = self.registry.get(account.account_id) or account
+        ports = self._worker_port_details(current)
+        api_pid = ports["worker_api_listener_pid"]
+        ws_pid = ports["worker_ws_listener_pid"]
+        if api_pid and ws_pid and int(api_pid) == int(ws_pid) and self._worker_health_matches_current_runtime(current):
+            listener_pid = int(api_pid)
+            candidates.append(listener_pid)
+            parent_pid = self.inspector.parent_pid(listener_pid)
+            if parent_pid:
+                candidates.append(int(parent_pid))
+
+        ordered: list[int] = []
+        for pid in candidates:
+            if pid not in ordered:
+                ordered.append(pid)
+        return ordered
+
+    def _worker_health_matches_current_runtime(self, account: AccountRecord) -> bool:
+        health = self._worker_health(account)
+        if health.get("account_id") != account.account_id:
+            return False
+        if account.runtime_instance_id and health.get("runtime_instance_id") != account.runtime_instance_id:
+            return False
+        if account.runtime_ownership_version and int(health.get("runtime_ownership_version") or 0) != int(account.runtime_ownership_version):
+            return False
+        return True
 
     def _safe_command(self, command: list[str]) -> list[str]:
         return [part for part in command if "token" not in part.lower() and "cookie" not in part.lower()]

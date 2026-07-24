@@ -12,7 +12,7 @@ from .paths import DATA_ROOT, OUTPUTS_ROOT, PROFILES_ROOT, REGISTRY_DB_PATH, WOR
 from .port_allocator import PortRanges, allocate_port_triplet
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 SCHEMA = """
@@ -34,6 +34,13 @@ CREATE TABLE IF NOT EXISTS flow_account_registry (
     worker_pid INTEGER,
     last_health_at TEXT,
     last_error TEXT,
+    runtime_instance_id TEXT,
+    runtime_secret_ref TEXT,
+    runtime_secret_fingerprint TEXT,
+    runtime_ownership_version INTEGER,
+    worker_process_started_at TEXT,
+    worker_ownership_verified_at TEXT,
+    worker_ownership_method TEXT,
     updated_at TEXT NOT NULL
 );
 """
@@ -78,6 +85,13 @@ class AccountRecord:
     worker_pid: int | None = None
     last_health_at: str | None = None
     last_error: str | None = None
+    runtime_instance_id: str | None = None
+    runtime_secret_ref: str | None = None
+    runtime_secret_fingerprint: str | None = None
+    runtime_ownership_version: int | None = None
+    worker_process_started_at: str | None = None
+    worker_ownership_verified_at: str | None = None
+    worker_ownership_method: str | None = None
 
 
 @dataclass(frozen=True)
@@ -284,6 +298,107 @@ class AccountRegistry:
             )
             conn.commit()
 
+    def mark_worker_runtime_identity(
+        self,
+        account_id: str,
+        runtime_instance_id: str,
+        runtime_secret_ref: str,
+        runtime_secret_fingerprint: str,
+        runtime_ownership_version: int,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE flow_account_registry
+                SET runtime_instance_id=?,
+                    runtime_secret_ref=?,
+                    runtime_secret_fingerprint=?,
+                    runtime_ownership_version=?,
+                    worker_ownership_verified_at=NULL,
+                    worker_ownership_method=NULL,
+                    last_error=NULL,
+                    updated_at=?
+                WHERE account_id=?
+                """,
+                (
+                    runtime_instance_id,
+                    runtime_secret_ref,
+                    runtime_secret_fingerprint,
+                    runtime_ownership_version,
+                    utc_now(),
+                    account_id,
+                ),
+            )
+            conn.commit()
+
+    def mark_worker_process_started(self, account_id: str, worker_pid: int, started_at: str | None = None) -> None:
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE flow_account_registry
+                SET worker_pid=?,
+                    worker_process_started_at=?,
+                    last_started_at=?,
+                    last_error=NULL,
+                    updated_at=?
+                WHERE account_id=?
+                """,
+                (worker_pid, started_at or now, now, now, account_id),
+            )
+            conn.commit()
+
+    def mark_worker_ownership_verified(self, account_id: str, method: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE flow_account_registry
+                SET worker_ownership_verified_at=?,
+                    worker_ownership_method=?,
+                    updated_at=?
+                WHERE account_id=?
+                """,
+                (utc_now(), method, utc_now(), account_id),
+            )
+            conn.commit()
+
+    def mark_worker_ownership_verified_if_current(
+        self,
+        account_id: str,
+        expected_runtime_instance_id: str,
+        expected_worker_pid: int | None,
+        expected_runtime_ownership_version: int,
+        verified_worker_pid: int,
+        method: str,
+    ) -> bool:
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE flow_account_registry
+                SET worker_pid=?,
+                    worker_ownership_verified_at=?,
+                    worker_ownership_method=?,
+                    updated_at=?
+                WHERE account_id=?
+                  AND runtime_instance_id=?
+                  AND runtime_ownership_version=?
+                  AND (worker_pid=? OR (worker_pid IS NULL AND ? IS NULL))
+                """,
+                (
+                    int(verified_worker_pid),
+                    utc_now(),
+                    method,
+                    utc_now(),
+                    account_id,
+                    expected_runtime_instance_id,
+                    int(expected_runtime_ownership_version),
+                    expected_worker_pid,
+                    expected_worker_pid,
+                ),
+            )
+            conn.commit()
+            return cursor.rowcount == 1
+
     def mark_health(self, account_id: str, last_error: str | None = None) -> None:
         with self.connect() as conn:
             conn.execute(
@@ -305,11 +420,29 @@ class AccountRegistry:
                 UPDATE flow_account_registry
                 SET chrome_pid={chrome_expr},
                     worker_pid={worker_expr},
+                    runtime_instance_id=CASE WHEN ? THEN NULL ELSE runtime_instance_id END,
+                    runtime_secret_ref=CASE WHEN ? THEN NULL ELSE runtime_secret_ref END,
+                    runtime_secret_fingerprint=CASE WHEN ? THEN NULL ELSE runtime_secret_fingerprint END,
+                    runtime_ownership_version=CASE WHEN ? THEN NULL ELSE runtime_ownership_version END,
+                    worker_process_started_at=CASE WHEN ? THEN NULL ELSE worker_process_started_at END,
+                    worker_ownership_verified_at=CASE WHEN ? THEN NULL ELSE worker_ownership_verified_at END,
+                    worker_ownership_method=CASE WHEN ? THEN NULL ELSE worker_ownership_method END,
                     last_stopped_at=?,
                     updated_at=?
                 WHERE account_id=?
                 """,
-                (utc_now(), utc_now(), account_id),
+                (
+                    int(clear_worker),
+                    int(clear_worker),
+                    int(clear_worker),
+                    int(clear_worker),
+                    int(clear_worker),
+                    int(clear_worker),
+                    int(clear_worker),
+                    utc_now(),
+                    utc_now(),
+                    account_id,
+                ),
             )
             conn.commit()
 
@@ -347,16 +480,37 @@ class AccountRegistry:
             conn.executescript(META_SCHEMA)
             conn.executescript(SCHEMA)
             conn.executescript(UNIQUE_INDEXES)
+            self._migrate_columns(conn)
             current = conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()
             if current is None:
                 conn.execute(
                     "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?)",
                     (str(SCHEMA_VERSION),),
                 )
+            else:
+                conn.execute(
+                    "UPDATE schema_meta SET value=? WHERE key='schema_version'",
+                    (str(SCHEMA_VERSION),),
+                )
             conn.commit()
         except Exception:
             conn.rollback()
             raise
+
+    def _migrate_columns(self, conn: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(flow_account_registry)").fetchall()}
+        additions = {
+            "runtime_instance_id": "TEXT",
+            "runtime_secret_ref": "TEXT",
+            "runtime_secret_fingerprint": "TEXT",
+            "runtime_ownership_version": "INTEGER",
+            "worker_process_started_at": "TEXT",
+            "worker_ownership_verified_at": "TEXT",
+            "worker_ownership_method": "TEXT",
+        }
+        for name, column_type in additions.items():
+            if name not in columns:
+                conn.execute(f"ALTER TABLE flow_account_registry ADD COLUMN {name} {column_type}")
 
     def _cleanup_created_dirs(self, created_dirs: list[Path]) -> None:
         for path in reversed(created_dirs):
@@ -417,6 +571,13 @@ class AccountRegistry:
             worker_pid=row["worker_pid"],
             last_health_at=row["last_health_at"],
             last_error=row["last_error"],
+            runtime_instance_id=row["runtime_instance_id"],
+            runtime_secret_ref=row["runtime_secret_ref"],
+            runtime_secret_fingerprint=row["runtime_secret_fingerprint"],
+            runtime_ownership_version=row["runtime_ownership_version"],
+            worker_process_started_at=row["worker_process_started_at"],
+            worker_ownership_verified_at=row["worker_ownership_verified_at"],
+            worker_ownership_method=row["worker_ownership_method"],
         )
 
 

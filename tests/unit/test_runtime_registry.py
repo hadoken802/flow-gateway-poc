@@ -199,7 +199,7 @@ def test_schema_migration_is_idempotent(tmp_path):
 
     with registry.connect() as conn:
         version = conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0]
-    assert version == "1"
+    assert version == "2"
 
 
 def test_schema_migration_adds_unique_indexes_to_existing_database(tmp_path):
@@ -237,6 +237,44 @@ def test_schema_migration_adds_unique_indexes_to_existing_database(tmp_path):
 
     with pytest.raises(sqlite3.IntegrityError):
         registry.register_many([duplicate], create_dirs=False)
+
+
+def test_schema_migration_adds_runtime_ownership_fields_to_existing_database(tmp_path):
+    registry = make_registry(tmp_path)
+    registry.db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(registry.db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE flow_account_registry (
+                account_id TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                profile_path TEXT NOT NULL,
+                worker_api_port INTEGER NOT NULL,
+                extension_ws_port INTEGER NOT NULL,
+                chrome_cdp_port INTEGER NOT NULL,
+                database_path TEXT NOT NULL,
+                output_dir TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'registered',
+                created_at TEXT NOT NULL,
+                last_started_at TEXT,
+                last_stopped_at TEXT,
+                chrome_pid INTEGER,
+                worker_pid INTEGER,
+                last_health_at TEXT,
+                last_error TEXT,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+
+    registry.list_accounts()
+
+    with registry.connect() as conn:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(flow_account_registry)").fetchall()}
+    assert "runtime_instance_id" in columns
+    assert "runtime_secret_ref" in columns
+    assert "worker_ownership_method" in columns
 
 
 def test_cli_show_and_failure_exit_code(tmp_path, monkeypatch, capsys):

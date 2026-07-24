@@ -14,6 +14,9 @@ def reload_config(monkeypatch, **env):
         "EXTENSION_WS_PORT",
         "FLOW_DB_PATH",
         "OUTPUT_DIR",
+        "FLOW_RUNTIME_INSTANCE_ID",
+        "FLOW_RUNTIME_OWNERSHIP_SECRET",
+        "FLOW_RUNTIME_OWNERSHIP_VERSION",
     ):
         monkeypatch.delenv(key, raising=False)
     for key, value in env.items():
@@ -86,6 +89,88 @@ async def test_health_returns_worker_identity(monkeypatch):
     assert response["account_id"] == "FLOW-002"
     assert response["api_port"] == 8112
     assert response["ws_port"] == 9212
+    assert response["runtime_ownership_capable"] is False
+    assert "FLOW_RUNTIME_OWNERSHIP_SECRET" not in response
+
+
+@pytest.mark.asyncio
+async def test_health_and_challenge_return_safe_runtime_ownership_fields(monkeypatch):
+    config = reload_config(
+        monkeypatch,
+        FLOW_ACCOUNT_ID="FLOW-002",
+        AGENT_API_PORT="8112",
+        EXTENSION_WS_PORT="9212",
+        FLOW_RUNTIME_INSTANCE_ID="11111111-1111-4111-8111-111111111111",
+        FLOW_RUNTIME_OWNERSHIP_SECRET="test-secret",
+        FLOW_RUNTIME_OWNERSHIP_VERSION="1",
+    )
+    import agent.main as main
+    from runtime.ownership import generate_challenge, sign_challenge
+
+    importlib.reload(main)
+    health = await main.health()
+    assert health["runtime_instance_id"] == "11111111-1111-4111-8111-111111111111"
+    assert health["runtime_ownership_version"] == 1
+    assert health["runtime_ownership_capable"] is True
+    assert "test-secret" not in json.dumps(health)
+
+    class FakeRequest:
+        def __init__(self, payload):
+            self.payload = payload
+
+        async def body(self):
+            return json.dumps(self.payload).encode("utf-8")
+
+    challenge = generate_challenge()
+    response = await main.runtime_ownership_challenge(FakeRequest({
+        "account_id": "FLOW-002",
+        "runtime_instance_id": "11111111-1111-4111-8111-111111111111",
+        "challenge": challenge,
+        "proof_version": 1,
+    }))
+    assert response["ok"] is True
+    assert response["challenge_response"] == sign_challenge("test-secret", "FLOW-002", "11111111-1111-4111-8111-111111111111", challenge)
+    assert "test-secret" not in json.dumps(response)
+
+
+@pytest.mark.asyncio
+async def test_challenge_rejects_account_runtime_and_invalid_challenge(monkeypatch):
+    reload_config(
+        monkeypatch,
+        FLOW_ACCOUNT_ID="FLOW-002",
+        FLOW_RUNTIME_INSTANCE_ID="11111111-1111-4111-8111-111111111111",
+        FLOW_RUNTIME_OWNERSHIP_SECRET="test-secret",
+        FLOW_RUNTIME_OWNERSHIP_VERSION="1",
+    )
+    import agent.main as main
+
+    importlib.reload(main)
+
+    class FakeRequest:
+        def __init__(self, payload):
+            self.payload = payload
+
+        async def body(self):
+            return json.dumps(self.payload).encode("utf-8")
+
+    assert (await main.runtime_ownership_challenge(FakeRequest({
+        "account_id": "FLOW-999",
+        "runtime_instance_id": "11111111-1111-4111-8111-111111111111",
+        "challenge": "A" * 43,
+        "proof_version": 1,
+    })))["reason"] == "account_mismatch"
+    assert (await main.runtime_ownership_challenge(FakeRequest({
+        "account_id": "FLOW-002",
+        "runtime_instance_id": "22222222-2222-4222-8222-222222222222",
+        "challenge": "A" * 43,
+        "proof_version": 1,
+    })))["reason"] == "runtime_instance_mismatch"
+    assert (await main.runtime_ownership_challenge(FakeRequest({
+        "account_id": "FLOW-002",
+        "runtime_instance_id": "11111111-1111-4111-8111-111111111111",
+        "challenge": "bad",
+        "proof_version": 1,
+    })))["reason"] == "invalid_challenge"
 
 
 def test_extension_options_files_are_declared():

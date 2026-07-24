@@ -6,6 +6,13 @@ from pathlib import Path
 import pytest
 
 from runtime import cli
+from runtime.ownership import (
+    canonical_payload,
+    create_runtime_identity,
+    generate_challenge,
+    sign_challenge,
+    verify_challenge_response,
+)
 from runtime import worker_entry
 from runtime.process_manager import BOOL, DWORD, HANDLE, INVALID_HANDLE_VALUE, KERNEL32, PROCESSENTRY32W, ProcessInspector, ProcessProbeResult, RuntimeManager, TerminationResult
 from runtime.registry import AccountRecord, AccountRegistry
@@ -26,6 +33,15 @@ class FakeProcess:
         self.cwd = cwd
         self.env = env or {}
         self.kwargs = _
+
+
+class FakeSecretProtector:
+    def protect(self, data: bytes) -> bytes:
+        return b"protected:" + data
+
+    def unprotect(self, data: bytes) -> bytes:
+        assert data.startswith(b"protected:")
+        return data.removeprefix(b"protected:")
 
 
 class FakeInspector:
@@ -190,7 +206,7 @@ def test_start_worker_only_uses_account_env_and_does_not_launch_chrome(tmp_path,
         launched.append(proc)
         return proc
 
-    manager = RuntimeManager(registry, inspector=inspector, popen=fake_popen, chrome_path=tmp_path / "chrome.exe", extension_dir=extension_dir)
+    manager = RuntimeManager(registry, inspector=inspector, popen=fake_popen, chrome_path=tmp_path / "chrome.exe", extension_dir=extension_dir, ownership_protector=FakeSecretProtector())
     monkeypatch.setattr("runtime.process_manager.port_is_listening", lambda port: False)
 
     result = manager.start_worker_only("FLOW-005")
@@ -206,8 +222,16 @@ def test_start_worker_only_uses_account_env_and_does_not_launch_chrome(tmp_path,
     assert launched[0].env["EXTENSION_WS_PORT"] == "9200"
     assert launched[0].env["FLOW_DB_PATH"] == account.database_path
     assert launched[0].env["OUTPUT_DIR"] == account.output_dir
+    assert launched[0].env["FLOW_RUNTIME_INSTANCE_ID"]
+    assert launched[0].env["FLOW_RUNTIME_OWNERSHIP_SECRET"]
+    assert launched[0].env["FLOW_RUNTIME_OWNERSHIP_VERSION"] == "1"
     assert launched[0].kwargs["stdin"] == subprocess.DEVNULL
     assert launched[0].kwargs["stderr"] == subprocess.STDOUT
+    stored = registry.get("FLOW-005")
+    assert stored.runtime_instance_id == launched[0].env["FLOW_RUNTIME_INSTANCE_ID"]
+    assert stored.runtime_secret_ref
+    assert stored.runtime_secret_fingerprint
+    assert stored.runtime_ownership_version == 1
 
 
 def make_manager(tmp_path, registry, inspector=None, health=None, cdp=False):
@@ -234,6 +258,7 @@ def make_manager(tmp_path, registry, inspector=None, health=None, cdp=False):
         extension_dir=extension,
         python_exe=tmp_path / "python.exe",
         log_dir=tmp_path / "logs" / "runtime",
+        ownership_protector=FakeSecretProtector(),
     )
     manager._worker_health = lambda account: health or {}
     manager._tcp_reachable = lambda port: cdp
@@ -675,7 +700,7 @@ def test_status_running_when_services_healthy_but_ownership_unknown(tmp_path, mo
     assert status.details["worker_process_probe_status"] == "alive"
     assert status.details["chrome_ownership_verified"] is False
     assert status.details["worker_ownership_verified"] is False
-    assert status.details["ownership_status"] == "unknown"
+    assert status.details["ownership_status"] == "legacy_unverified"
     assert status.details["stop_safe"] is False
     assert manager.stop_one("FLOW-012").result == "ownership_not_verified"
     assert inspector.terminated == []
@@ -1392,6 +1417,24 @@ def test_worker_entry_rejects_env_mismatch(monkeypatch, env_name, env_value, exp
     assert code == 2
 
 
+def test_worker_entry_rejects_invalid_runtime_identity(monkeypatch):
+    monkeypatch.setenv("FLOW_ACCOUNT_ID", "FLOW-005")
+    monkeypatch.setenv("AGENT_API_PORT", "8101")
+    monkeypatch.setenv("EXTENSION_WS_PORT", "9200")
+    monkeypatch.setenv("FLOW_RUNTIME_INSTANCE_ID", "not-a-uuid")
+    monkeypatch.setenv("FLOW_RUNTIME_OWNERSHIP_SECRET", "secret")
+    monkeypatch.setenv("FLOW_RUNTIME_OWNERSHIP_VERSION", "1")
+    monkeypatch.setattr(worker_entry.runpy, "run_module", lambda *args, **kwargs: pytest.fail("agent.main should not run"))
+
+    code = worker_entry.main([
+        "--runtime-account-id", "FLOW-005",
+        "--runtime-api-port", "8101",
+        "--runtime-ws-port", "9200",
+    ])
+
+    assert code == 2
+
+
 def test_worker_ownership_requires_worker_entry_account_api_and_ws(tmp_path):
     registry = make_registry(tmp_path)
     add_account(registry)
@@ -1401,16 +1444,197 @@ def test_worker_ownership_requires_worker_entry_account_api_and_ws(tmp_path):
     manager = make_manager(tmp_path, registry, inspector=inspector)
 
     inspector.commands[12] = "python -m runtime.worker_entry --runtime-account-id FLOW-005 --runtime-api-port 8101 --runtime-ws-port 9200"
-    assert manager.status("FLOW-005").details["worker_process_alive"] is True
+    assert manager._worker_ownership(registry.get("FLOW-005"), 12, allow_legacy_command_line=True)["verified"] is True
 
     inspector.commands[12] = "python -m runtime.worker_entry --runtime-account-id FLOW-006 --runtime-api-port 8101 --runtime-ws-port 9200"
-    mismatch = manager.status("FLOW-005").details
-    assert mismatch["worker_process_alive"] is True
-    assert mismatch["worker_ownership_verified"] is False
-    assert mismatch["worker_ownership_reason"] == "account_mismatch"
+    mismatch = manager._worker_ownership(registry.get("FLOW-005"), 12, allow_legacy_command_line=True)
+    assert mismatch["verified"] is False
+    assert mismatch["reason"] == "account_mismatch"
 
     inspector.commands[12] = "python -m agent.main --runtime-account-id FLOW-005 --runtime-api-port 8101 --runtime-ws-port 9200"
-    missing_entry = manager.status("FLOW-005").details
-    assert missing_entry["worker_process_alive"] is True
-    assert missing_entry["worker_ownership_verified"] is False
-    assert missing_entry["worker_ownership_reason"] == "worker_entry_missing"
+    missing_entry = manager._worker_ownership(registry.get("FLOW-005"), 12, allow_legacy_command_line=True)
+    assert missing_entry["verified"] is False
+    assert missing_entry["reason"] == "worker_entry_missing"
+
+
+def test_runtime_ownership_helpers_sign_and_verify_challenge(tmp_path):
+    identity = create_runtime_identity("FLOW-005", tmp_path / "data", FakeSecretProtector())
+    challenge = generate_challenge()
+
+    assert len(identity.secret) >= 32
+    assert identity.secret not in identity.secret_ref
+    assert canonical_payload("FLOW-005", identity.runtime_instance_id, challenge, 1) == canonical_payload("FLOW-005", identity.runtime_instance_id, challenge, 1)
+    response = sign_challenge(identity.secret, "FLOW-005", identity.runtime_instance_id, challenge)
+
+    assert verify_challenge_response(identity.secret, "FLOW-005", identity.runtime_instance_id, challenge, response)
+    assert not verify_challenge_response("wrong-secret", "FLOW-005", identity.runtime_instance_id, challenge, response)
+    assert not verify_challenge_response(identity.secret, "FLOW-006", identity.runtime_instance_id, challenge, response)
+
+
+def test_worker_runtime_challenge_verifies_without_command_line(tmp_path):
+    registry = make_registry(tmp_path)
+    account = add_account(registry, "FLOW-012")
+    inspector = FakeInspector()
+    manager = make_manager(tmp_path, registry, inspector=inspector, health={}, cdp=False)
+    identity = create_runtime_identity(account.account_id, registry.data_root, FakeSecretProtector())
+    registry.mark_worker_runtime_identity(account.account_id, identity.runtime_instance_id, identity.secret_ref, identity.secret_fingerprint, identity.version)
+    registry.mark_worker_process_started(account.account_id, 35088)
+    account = registry.get(account.account_id)
+    inspector.alive.add(35088)
+    inspector.listeners[account.worker_api_port] = 35088
+    inspector.listeners[account.extension_ws_port] = 35088
+    manager._worker_health = lambda _account: {
+        "account_id": "FLOW-012",
+        "runtime_instance_id": identity.runtime_instance_id,
+        "runtime_ownership_version": 1,
+        "extension_connected": True,
+    }
+
+    def challenge(_account, challenge):
+        return {
+            "ok": True,
+            "account_id": "FLOW-012",
+            "runtime_instance_id": identity.runtime_instance_id,
+            "challenge_response": sign_challenge(identity.secret, "FLOW-012", identity.runtime_instance_id, challenge),
+            "proof_version": 1,
+        }
+
+    manager._worker_ownership_challenge = challenge
+
+    status = manager.status("FLOW-012")
+
+    assert status.details["worker_ownership_verified"] is True
+    assert status.details["worker_ownership_reason"] == "verified"
+    assert status.details["worker_ownership_method"] == "worker_challenge"
+    assert status.details["ownership_status"] == "worker_verified"
+    assert status.details["stop_safe"] is False
+
+
+def test_worker_runtime_challenge_does_not_update_when_registry_identity_changes(tmp_path):
+    registry = make_registry(tmp_path)
+    account = add_account(registry, "FLOW-012")
+    inspector = FakeInspector()
+    manager = make_manager(tmp_path, registry, inspector=inspector, health={}, cdp=False)
+    identity = create_runtime_identity(account.account_id, registry.data_root, FakeSecretProtector())
+    replacement = create_runtime_identity(account.account_id, registry.data_root, FakeSecretProtector())
+    registry.mark_worker_runtime_identity(account.account_id, identity.runtime_instance_id, identity.secret_ref, identity.secret_fingerprint, identity.version)
+    registry.mark_worker_process_started(account.account_id, 35088)
+    account = registry.get(account.account_id)
+    inspector.alive.add(35088)
+    inspector.listeners[account.worker_api_port] = 35100
+    inspector.listeners[account.extension_ws_port] = 35100
+    manager._worker_health = lambda _account: {
+        "account_id": "FLOW-012",
+        "runtime_instance_id": identity.runtime_instance_id,
+        "runtime_ownership_version": 1,
+    }
+
+    def challenge(_account, challenge):
+        registry.mark_worker_runtime_identity(account.account_id, replacement.runtime_instance_id, replacement.secret_ref, replacement.secret_fingerprint, replacement.version)
+        registry.mark_worker_process_started(account.account_id, 36000)
+        return {
+            "ok": True,
+            "account_id": "FLOW-012",
+            "runtime_instance_id": identity.runtime_instance_id,
+            "challenge_response": sign_challenge(identity.secret, "FLOW-012", identity.runtime_instance_id, challenge),
+            "proof_version": 1,
+        }
+
+    manager._worker_ownership_challenge = challenge
+
+    status = manager.status("FLOW-012")
+    current = registry.get("FLOW-012")
+
+    assert status.details["worker_ownership_verified"] is False
+    assert status.details["worker_ownership_reason"] == "runtime_identity_changed"
+    assert current.runtime_instance_id == replacement.runtime_instance_id
+    assert current.worker_pid == 36000
+    assert current.worker_ownership_method is None
+
+
+def test_worker_runtime_challenge_does_not_update_when_worker_pid_changes(tmp_path):
+    registry = make_registry(tmp_path)
+    account = add_account(registry, "FLOW-012")
+    inspector = FakeInspector()
+    manager = make_manager(tmp_path, registry, inspector=inspector, health={}, cdp=False)
+    identity = create_runtime_identity(account.account_id, registry.data_root, FakeSecretProtector())
+    registry.mark_worker_runtime_identity(account.account_id, identity.runtime_instance_id, identity.secret_ref, identity.secret_fingerprint, identity.version)
+    registry.mark_worker_process_started(account.account_id, 35088)
+    account = registry.get(account.account_id)
+    inspector.alive.add(35088)
+    inspector.listeners[account.worker_api_port] = 35100
+    inspector.listeners[account.extension_ws_port] = 35100
+    manager._worker_health = lambda _account: {
+        "account_id": "FLOW-012",
+        "runtime_instance_id": identity.runtime_instance_id,
+        "runtime_ownership_version": 1,
+    }
+
+    def challenge(_account, challenge):
+        registry.mark_worker_process_started(account.account_id, 36000)
+        return {
+            "ok": True,
+            "account_id": "FLOW-012",
+            "runtime_instance_id": identity.runtime_instance_id,
+            "challenge_response": sign_challenge(identity.secret, "FLOW-012", identity.runtime_instance_id, challenge),
+            "proof_version": 1,
+        }
+
+    manager._worker_ownership_challenge = challenge
+
+    status = manager.status("FLOW-012")
+    current = registry.get("FLOW-012")
+
+    assert status.details["worker_ownership_verified"] is False
+    assert status.details["worker_ownership_reason"] == "runtime_identity_changed"
+    assert current.worker_pid == 36000
+    assert current.worker_ownership_method is None
+
+
+def test_worker_runtime_challenge_rejects_pid_and_identity_mismatch(tmp_path):
+    registry = make_registry(tmp_path)
+    account = add_account(registry, "FLOW-012")
+    inspector = FakeInspector()
+    manager = make_manager(tmp_path, registry, inspector=inspector, health={}, cdp=False)
+    identity = create_runtime_identity(account.account_id, registry.data_root, FakeSecretProtector())
+    registry.mark_worker_runtime_identity(account.account_id, identity.runtime_instance_id, identity.secret_ref, identity.secret_fingerprint, identity.version)
+    registry.mark_worker_process_started(account.account_id, 35088)
+    account = registry.get(account.account_id)
+    inspector.alive.add(35088)
+    inspector.listeners[account.worker_api_port] = 35088
+    inspector.listeners[account.extension_ws_port] = 99999
+
+    assert manager.status("FLOW-012").details["worker_ownership_reason"] == "worker_port_pid_mismatch"
+
+    inspector.listeners[account.extension_ws_port] = 35088
+    manager._worker_health = lambda _account: {
+        "account_id": "FLOW-999",
+        "runtime_instance_id": identity.runtime_instance_id,
+        "runtime_ownership_version": 1,
+    }
+
+    assert manager.status("FLOW-012").details["worker_ownership_reason"] == "worker_identity_mismatch"
+
+
+def test_legacy_account_is_not_worker_verified(tmp_path):
+    registry = make_registry(tmp_path)
+    account = add_account(registry, "FLOW-005")
+    registry.mark_started("FLOW-005", worker_pid=352)
+    inspector = FakeInspector()
+    inspector.alive.add(352)
+    inspector.listeners[account.worker_api_port] = 352
+    inspector.listeners[account.extension_ws_port] = 352
+    manager = make_manager(
+        tmp_path,
+        registry,
+        inspector=inspector,
+        health={"account_id": "FLOW-005", "extension_connected": True},
+        cdp=False,
+    )
+
+    status = manager.status("FLOW-005")
+
+    assert status.details["worker_ownership_verified"] is False
+    assert status.details["worker_ownership_reason"] == "legacy_runtime_unverified"
+    assert status.details["ownership_status"] == "legacy_unverified"
+    assert status.details["stop_safe"] is False

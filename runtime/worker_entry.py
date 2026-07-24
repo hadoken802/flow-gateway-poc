@@ -5,6 +5,7 @@ import argparse
 import os
 import runpy
 import sys
+import uuid
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -19,6 +20,19 @@ def _matches_env(name: str, expected: str) -> bool:
     return str(os.environ.get(name, "")).strip() == str(expected).strip()
 
 
+def _valid_runtime_identity() -> bool:
+    instance_id = os.environ.get("FLOW_RUNTIME_INSTANCE_ID", "").strip()
+    secret = os.environ.get("FLOW_RUNTIME_OWNERSHIP_SECRET", "").strip()
+    version = os.environ.get("FLOW_RUNTIME_OWNERSHIP_VERSION", "").strip()
+    if not instance_id and not secret and not version:
+        return True
+    try:
+        uuid.UUID(instance_id)
+    except ValueError:
+        return False
+    return bool(secret) and version == "1"
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     checks = [
@@ -30,6 +44,9 @@ def main(argv: list[str] | None = None) -> int:
         if not _matches_env(env_name, expected):
             print(f"{env_name} mismatch", file=sys.stderr)
             return 2
+    if not _valid_runtime_identity():
+        print("FLOW_RUNTIME_OWNERSHIP identity invalid", file=sys.stderr)
+        return 2
 
     sys.argv = ["agent.main"]
     runpy.run_module("agent.main", run_name="__main__")
