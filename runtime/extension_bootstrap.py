@@ -59,6 +59,23 @@ CREDENTIAL_STORAGE_RELATIVE_DIRS = (
     Path("Default") / "SharedStorage-shm",
     Path("Default") / "SharedStorage-journal",
 )
+GPU_CACHE_RELATIVE_DIRS = (
+    Path("GPUCache"),
+    Path("Default") / "GPUCache",
+    Path("GPUPersistentCache"),
+    Path("Default") / "GPUPersistentCache",
+    Path("GraphiteDawnCache"),
+    Path("DawnGraphiteCache"),
+    Path("GrShaderCache"),
+    Path("ShaderCache"),
+    Path("Default") / "GrShaderCache",
+    Path("Default") / "ShaderCache",
+)
+GPU_RETRY_FAILURE_CLASSES = {
+    "gpu_process_unusable",
+    "gpu_process_crash_loop",
+    "gpu_cache_sharing_violation",
+}
 ALLOWED_REGISTERED_EMPTY_DIRS = {
     Path("."),
     Path("Default"),
@@ -109,17 +126,53 @@ class CdpError(Exception):
 
 
 class CdpClient:
-    def wait_ready(self, cdp_port: int, attempts: int = 20, delay_seconds: float = 0.25, sleep=time.sleep) -> dict:
+    def wait_ready(
+        self,
+        cdp_port: int,
+        attempts: int = 20,
+        delay_seconds: float = 0.25,
+        sleep=time.sleep,
+        chrome_process=None,
+        chrome_pid: int | None = None,
+    ) -> dict:
         started = time.monotonic()
         last_error = None
         for attempt in range(1, attempts + 1):
+            exit_code = self._poll_process(chrome_process)
+            if exit_code is not None:
+                raise CdpError(
+                    "bootstrap_chrome_exited",
+                    {
+                        "stage": "wait_cdp_ready",
+                        "cdp_port": int(cdp_port),
+                        "attempts": attempt,
+                        "elapsed_seconds": round(time.monotonic() - started, 3),
+                        "last_error": "chrome_exited",
+                        "chrome_pid": chrome_pid,
+                        "chrome_exit_code": exit_code,
+                    },
+                )
             try:
                 with urlopen(f"http://127.0.0.1:{int(cdp_port)}/json/version", timeout=2.0) as response:
                     data = json.loads(response.read().decode("utf-8"))
                 if isinstance(data, dict):
                     return data
             except Exception as error:
-                last_error = type(error).__name__
+                last_error = self._cdp_probe_error_class(error)
+            exit_code = self._poll_process(chrome_process)
+            if exit_code is not None:
+                raise CdpError(
+                    "bootstrap_chrome_exited",
+                    {
+                        "stage": "wait_cdp_ready",
+                        "cdp_port": int(cdp_port),
+                        "attempts": attempt,
+                        "elapsed_seconds": round(time.monotonic() - started, 3),
+                        "last_error": "chrome_exited",
+                        "chrome_pid": chrome_pid,
+                        "chrome_exit_code": exit_code,
+                    },
+                )
             sleep(delay_seconds)
         raise CdpError(
             "cdp_not_ready",
@@ -131,6 +184,29 @@ class CdpClient:
                 "last_error": last_error,
             },
         )
+
+    def _poll_process(self, process) -> int | None:
+        if process is None or not hasattr(process, "poll"):
+            return None
+        try:
+            return process.poll()
+        except Exception:
+            return None
+
+    def _cdp_probe_error_class(self, error: Exception) -> str:
+        text = str(error).lower()
+        reason = getattr(error, "reason", None)
+        if reason is not None:
+            text = f"{text} {reason}".lower()
+        if "timed out" in text or "timeout" in text:
+            return "connection_timeout"
+        if "connection refused" in text or "actively refused" in text:
+            return "connection_refused"
+        if "connection reset" in text or "forcibly closed" in text:
+            return "connection_reset"
+        if isinstance(error, (json.JSONDecodeError, HTTPError)):
+            return "invalid_response"
+        return "unknown"
 
     def open_url(self, cdp_port: int, url: str) -> dict:
         target = f"http://127.0.0.1:{int(cdp_port)}/json/new?{quote(url, safe='')}"
@@ -356,16 +432,18 @@ class ExtensionBootstrapper:
         command.append("about:blank")
         return command
 
-    def bootstrap_chrome_command(self, account: AccountRecord, bootstrap_url: str) -> list[str]:
+    def bootstrap_chrome_command(self, account: AccountRecord, bootstrap_url: str, extra_args: list[str] | None = None) -> list[str]:
         chrome = self.runtime._find_chrome()
-        return [
+        command = [
             str(chrome),
             f"--user-data-dir={Path(account.profile_path)}",
             f"--remote-debugging-port={account.chrome_cdp_port}",
             "--no-first-run",
             "--no-default-browser-check",
-            bootstrap_url,
         ]
+        command.extend(extra_args or [])
+        command.append(bootstrap_url)
+        return command
 
     def mark_template_ready_for_verified_profile(self, verification: dict | None = None) -> None:
         manifest = self._manifest_info()
@@ -551,10 +629,100 @@ class ExtensionBootstrapper:
             "bootstrap_chrome_command": (chrome.details or {}).get("command"),
             "bootstrap_chrome_stdout_log": (chrome.details or {}).get("stdout_log"),
             "bootstrap_chrome_stderr_log": (chrome.details or {}).get("stderr_log"),
+            "bootstrap_chrome_attempts": 1,
+            "bootstrap_chrome_retry_used": False,
+            "bootstrap_chrome_retry_eligible": False,
+            "first_attempt_chrome_pid": chrome_pid,
+            "first_attempt_stdout_log": (chrome.details or {}).get("stdout_log"),
+            "first_attempt_stderr_log": (chrome.details or {}).get("stderr_log"),
         }
         try:
-            self.cdp.wait_ready(account.chrome_cdp_port, sleep=self.sleep)
+            try:
+                self.cdp.wait_ready(
+                    account.chrome_cdp_port,
+                    sleep=self.sleep,
+                    chrome_process=self._bootstrap_chrome_processes.get(int(chrome_pid)) if chrome_pid else None,
+                    chrome_pid=chrome_pid,
+                )
+                diagnostics["first_attempt_cdp_ready"] = True
+            except CdpError as first_error:
+                diagnostics["first_attempt_cdp_ready"] = False
+                diagnostics["first_attempt_exit_code"] = (first_error.details or {}).get("chrome_exit_code")
+                diagnostics["first_attempt_failure_class"] = None
+                if first_error.result != "bootstrap_chrome_exited":
+                    raise
+                classification = self._classify_bootstrap_chrome_failure(diagnostics.get("first_attempt_stderr_log"))
+                diagnostics["first_attempt_failure_class"] = classification["failure_class"]
+                diagnostics["bootstrap_chrome_retry_reason"] = classification["failure_class"]
+                diagnostics["bootstrap_chrome_retry_eligible"] = bool(classification["retry_eligible"])
+                diagnostics["bootstrap_chrome_failure_key_lines"] = classification["key_lines"]
+                if not classification["retry_eligible"] or not self._worker_still_healthy_for_retry(account, worker_pid):
+                    raise first_error
+                if not self._chrome_retry_safe(account, chrome_pid):
+                    compensation = self._compensate_owned(account, False, worker_started, None, worker_pid)
+                    return ExtensionBootstrapResult(
+                        "bootstrap_chrome_retry_unsafe",
+                        account.account_id,
+                        False,
+                        {**initialization_details, **diagnostics, "stage": "wait_cdp_ready", **compensation},
+                    )
+                cleanup = self._cleanup_gpu_caches(account)
+                diagnostics["gpu_cache_cleanup_attempted"] = True
+                diagnostics["gpu_cache_cleanup_result"] = cleanup
+                if not cleanup["ok"]:
+                    compensation = self._compensate_owned(account, False, worker_started, None, worker_pid)
+                    return ExtensionBootstrapResult(
+                        "gpu_cache_cleanup_failed",
+                        account.account_id,
+                        False,
+                        {**initialization_details, **diagnostics, "stage": "gpu_cache_cleanup", **compensation},
+                    )
+                nonce = secrets.token_urlsafe(18)
+                url = self.bootstrap_url(account, nonce, manifest.extension_id)
+                chrome = self._open_bootstrap_chrome(account, url, attempt=2, extra_args=["--disable-gpu"])
+                if chrome.result not in {"opened", "already_running"}:
+                    compensation = self._compensate_owned(account, False, worker_started, None, worker_pid)
+                    return ExtensionBootstrapResult(
+                        chrome.result,
+                        account.account_id,
+                        False,
+                        {**initialization_details, **diagnostics, **(chrome.details or {}), "stage": "open_bootstrap_chrome_retry", **compensation},
+                    )
+                chrome_started_by_bootstrap = chrome.result == "opened"
+                chrome_pid = (chrome.details or {}).get("chrome_pid")
+                diagnostics.update({
+                    "bootstrap_chrome_attempts": 2,
+                    "bootstrap_chrome_retry_used": True,
+                    "second_attempt_chrome_pid": chrome_pid,
+                    "second_attempt_stdout_log": (chrome.details or {}).get("stdout_log"),
+                    "second_attempt_stderr_log": (chrome.details or {}).get("stderr_log"),
+                    "chrome_spawned_at": (chrome.details or {}).get("chrome_spawned_at"),
+                    "chrome_pid": chrome_pid,
+                    "bootstrap_chrome_command": (chrome.details or {}).get("command"),
+                    "bootstrap_chrome_stdout_log": (chrome.details or {}).get("stdout_log"),
+                    "bootstrap_chrome_stderr_log": (chrome.details or {}).get("stderr_log"),
+                })
+                try:
+                    self.cdp.wait_ready(
+                        account.chrome_cdp_port,
+                        sleep=self.sleep,
+                        chrome_process=self._bootstrap_chrome_processes.get(int(chrome_pid)) if chrome_pid else None,
+                        chrome_pid=chrome_pid,
+                    )
+                    diagnostics["second_attempt_cdp_ready"] = True
+                except CdpError as second_error:
+                    diagnostics["second_attempt_cdp_ready"] = False
+                    diagnostics["second_attempt_exit_code"] = (second_error.details or {}).get("chrome_exit_code")
+                    compensation = self._compensate_owned(account, chrome_started_by_bootstrap, worker_started, chrome_pid, worker_pid)
+                    result = second_error.to_bootstrap_result(account.account_id)
+                    return ExtensionBootstrapResult(
+                        "bootstrap_chrome_retry_exhausted",
+                        account.account_id,
+                        False,
+                        {**initialization_details, **diagnostics, **(result.details or {}), **compensation},
+                    )
             diagnostics["cdp_ready_at"] = self._utc_now()
+            diagnostics["final_chrome_pid"] = chrome_pid
             discovery = self.cdp.discover_extension(account.chrome_cdp_port, manifest.options_page, manifest.service_worker)
             target_summary = discovery.get("target_summary") or {}
             diagnostics.update({
@@ -646,14 +814,14 @@ class ExtensionBootstrapper:
         })
         return f"chrome-extension://{extension_id}/options.html?{query}"
 
-    def _open_bootstrap_chrome(self, account: AccountRecord, bootstrap_url: str) -> RuntimeResult:
+    def _open_bootstrap_chrome(self, account: AccountRecord, bootstrap_url: str, attempt: int = 1, extra_args: list[str] | None = None) -> RuntimeResult:
         if self.runtime._owned_chrome_running(account):
             return RuntimeResult("already_running", account.account_id, True)
         conflict = self.runtime._listening_port_conflict(account, "chrome_cdp_port", account.chrome_cdp_port)
         if conflict:
             return conflict
-        command = self.bootstrap_chrome_command(account, bootstrap_url)
-        stdout_path, stderr_path = self._bootstrap_chrome_log_files(account)
+        command = self.bootstrap_chrome_command(account, bootstrap_url, extra_args=extra_args)
+        stdout_path, stderr_path = self._bootstrap_chrome_log_files(account, attempt=attempt)
         stdout_handle = stdout_path.open("ab")
         stderr_handle = stderr_path.open("ab")
         try:
@@ -675,6 +843,7 @@ class ExtensionBootstrapper:
             True,
             details={
                 "chrome_pid": proc.pid,
+                "bootstrap_chrome_attempt": attempt,
                 "chrome_spawned_at": self._utc_now(),
                 "command": self._redacted_bootstrap_command(command),
                 "stdout_log": str(stdout_path),
@@ -830,6 +999,124 @@ class ExtensionBootstrapper:
             return ExtensionBootstrapResult("invalid_ws_url", account.account_id, False, {"extension_ws_port": account.extension_ws_port})
         return None
 
+    def _classify_bootstrap_chrome_failure(self, stderr_log: str | None) -> dict:
+        text = ""
+        key_lines = []
+        if stderr_log:
+            try:
+                lines = Path(stderr_log).read_text(encoding="utf-8", errors="ignore").splitlines()
+            except Exception:
+                lines = []
+            safe_terms = (
+                "gpu",
+                "fatal",
+                "profile",
+                "singleton",
+                "devtools",
+                "remote-debugging",
+                "user data",
+                "extension",
+                "access denied",
+                "0x20",
+                "sharing violation",
+            )
+            for line in lines:
+                lowered = line.lower()
+                if any(term in lowered for term in safe_terms):
+                    sanitized = re.sub(r"chrome-extension://[^\\s]+", "chrome-extension://<redacted>", line)
+                    key_lines.append(sanitized[:300])
+            text = "\n".join(lines).lower()
+        failure_class = "unknown_early_exit"
+        if "gpu process isn't usable" in text:
+            failure_class = "gpu_process_unusable"
+        elif "gpu process exited unexpectedly" in text:
+            failure_class = "gpu_process_crash_loop"
+        elif (
+            any(term.lower() in text for term in ("GPUPersistentCache", "DawnGraphiteCache", "GPUCache", "GraphiteDawnCache"))
+            and any(term in text for term in ("0x20", "sharing violation", "used by another process"))
+        ):
+            failure_class = "gpu_cache_sharing_violation"
+        elif any(term in text for term in ("singletonlock", "profile in use", "user data directory is already in use")):
+            failure_class = "profile_lock_error"
+        elif "failed to load extension" in text or "extension load" in text:
+            failure_class = "extension_load_error"
+        elif "remote-debugging-port" in text and ("in use" in text or "bind" in text):
+            failure_class = "cdp_port_conflict"
+        elif "invalid user data" in text or "cannot create user data" in text:
+            failure_class = "invalid_user_data_dir"
+        elif "access denied" in text and "google update" not in text:
+            failure_class = "access_denied"
+        return {
+            "failure_class": failure_class,
+            "retry_eligible": failure_class in GPU_RETRY_FAILURE_CLASSES,
+            "key_lines": key_lines[:10],
+        }
+
+    def _cleanup_gpu_caches(self, account: AccountRecord) -> dict:
+        profile = Path(account.profile_path)
+        profile_root = profile.resolve(strict=False)
+        cleaned = []
+        ok = True
+        for relative in GPU_CACHE_RELATIVE_DIRS:
+            target = profile / relative
+            item = {
+                "path": relative.as_posix(),
+                "existed": target.exists(),
+                "removed": False,
+                "file_count": 0,
+            }
+            try:
+                resolved = target.resolve(strict=False)
+                resolved.relative_to(profile_root)
+                if target.exists():
+                    if target.is_dir():
+                        item["file_count"] = sum(1 for child in target.rglob("*") if child.is_file())
+                    elif target.is_file():
+                        item["file_count"] = 1
+                    self._remove_path(target)
+                    item["removed"] = True
+            except Exception as error:
+                item["error"] = type(error).__name__
+                ok = False
+            cleaned.append(item)
+            if not ok:
+                break
+        return {"ok": ok, "cleaned": cleaned}
+
+    def _worker_still_healthy_for_retry(self, account: AccountRecord, worker_pid: int | None) -> bool:
+        if not worker_pid:
+            return False
+        try:
+            status = self.runtime.status(account.account_id)
+        except Exception:
+            return False
+        details = status.details or {}
+        if details.get("worker_health_reachable") is False:
+            return False
+        if details.get("worker_pid") not in (None, worker_pid):
+            return False
+        if details.get("account_id") not in (None, account.account_id):
+            return False
+        return status.result in {"running", "partial"} or bool(details.get("extension_account_id") == account.account_id)
+
+    def _chrome_retry_safe(self, account: AccountRecord, chrome_pid: int | None) -> bool:
+        if not chrome_pid:
+            return False
+        proc = self._bootstrap_chrome_processes.get(int(chrome_pid))
+        if proc is not None and hasattr(proc, "poll"):
+            try:
+                if proc.poll() is None:
+                    return False
+            except Exception:
+                return False
+        if port_is_listening(account.chrome_cdp_port):
+            return False
+        try:
+            Path(account.profile_path).resolve(strict=False).relative_to(self.profiles_root.resolve(strict=False))
+        except Exception:
+            return False
+        return Path(account.profile_path).name == account.account_id
+
     def _wait_extension_ready(self, account: AccountRecord, attempts: int = 10, chrome_pid: int | None = None, diagnostics: dict | None = None) -> RuntimeResult:
         status = self.runtime.status(account.account_id)
         for _ in range(attempts - 1):
@@ -875,9 +1162,14 @@ class ExtensionBootstrapper:
                 return None
         return None
 
-    def _bootstrap_chrome_log_files(self, account: AccountRecord) -> tuple[Path, Path]:
+    def _bootstrap_chrome_log_files(self, account: AccountRecord, attempt: int | None = None) -> tuple[Path, Path]:
         log_dir = Path(getattr(self.runtime, "log_dir", self.profiles_root.parent / "logs" / "runtime"))
         log_dir.mkdir(parents=True, exist_ok=True)
+        if attempt:
+            return (
+                log_dir / f"{account.account_id}-bootstrap-chrome-attempt-{attempt}-stdout.log",
+                log_dir / f"{account.account_id}-bootstrap-chrome-attempt-{attempt}-stderr.log",
+            )
         return (
             log_dir / f"{account.account_id}-bootstrap-chrome-stdout.log",
             log_dir / f"{account.account_id}-bootstrap-chrome-stderr.log",

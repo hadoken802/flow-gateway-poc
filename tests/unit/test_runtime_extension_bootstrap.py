@@ -7,6 +7,7 @@ from dataclasses import replace
 from runtime import cli
 from runtime.extension_bootstrap import (
     CREDENTIAL_STORAGE_POLICY_VERSION,
+    CdpError,
     CdpClient,
     EXPECTED_FLOWKIT_EXTENSION_ID,
     ExtensionBootstrapper,
@@ -67,6 +68,7 @@ class FakeRuntime:
         self.launched = []
         self.worker_only_started = []
         self.start_one_calls = []
+        self.poll_sequences = []
 
     def _find_chrome(self):
         return Path("C:/Chrome/chrome.exe")
@@ -74,7 +76,19 @@ class FakeRuntime:
     def popen(self, command, **kwargs):
         pid = 1000 + len(self.launched)
         self.launched.append((pid, command, kwargs))
-        return type("Proc", (), {"pid": pid})()
+        sequence = list(self.poll_sequences.pop(0)) if self.poll_sequences else [None]
+
+        class Proc:
+            def __init__(self, proc_pid, poll_values):
+                self.pid = proc_pid
+                self.poll_values = poll_values
+
+            def poll(self):
+                if len(self.poll_values) > 1:
+                    return self.poll_values.pop(0)
+                return self.poll_values[0]
+
+        return Proc(pid, sequence)
 
     def open_login(self, account_id):
         self.opened.append(account_id)
@@ -310,6 +324,27 @@ def test_cdp_wait_ready_timeout_returns_structured_error(monkeypatch):
         assert error.result == "cdp_not_ready"
         assert error.details["cdp_port"] == 9304
         assert error.details["attempts"] == 2
+
+
+def test_cdp_wait_ready_stops_when_bootstrap_chrome_exits(monkeypatch):
+    calls = []
+
+    def fake_urlopen(url, timeout):
+        calls.append(url)
+        raise OSError("connection refused")
+
+    proc = type("Proc", (), {"poll": lambda self: 9})()
+    monkeypatch.setattr("runtime.extension_bootstrap.urlopen", fake_urlopen)
+
+    try:
+        CdpClient().wait_ready(9304, attempts=20, delay_seconds=0, sleep=lambda _: None, chrome_process=proc, chrome_pid=1234)
+        assert False
+    except Exception as error:
+        assert error.result == "bootstrap_chrome_exited"
+        assert error.details["chrome_pid"] == 1234
+        assert error.details["chrome_exit_code"] == 9
+        assert error.details["attempts"] == 1
+        assert len(calls) == 0
 
 
 def test_verify_extension_options_rejects_chrome_error_page(monkeypatch):
@@ -1158,11 +1193,117 @@ def test_bootstrap_chrome_logs_are_account_specific_and_handles_close(tmp_path):
     result = bootstrapper._open_bootstrap_chrome(account, bootstrapper.bootstrap_url(account, "SECRET_NONCE", EXPECTED_FLOWKIT_EXTENSION_ID))
 
     assert result.result == "opened"
-    assert result.details["stdout_log"].endswith("FLOW-006-bootstrap-chrome-stdout.log")
-    assert result.details["stderr_log"].endswith("FLOW-006-bootstrap-chrome-stderr.log")
+    assert result.details["stdout_log"].endswith("FLOW-006-bootstrap-chrome-attempt-1-stdout.log")
+    assert result.details["stderr_log"].endswith("FLOW-006-bootstrap-chrome-attempt-1-stderr.log")
     kwargs = runtime.launched[0][2]
     assert kwargs["stdout"].closed is True
     assert kwargs["stderr"].closed is True
+
+
+def test_bootstrap_retries_once_for_gpu_chrome_exit_before_cdp_ready(tmp_path):
+    registry = make_registry(tmp_path)
+    account = add_account(registry)
+    ready_template(registry.profiles_root)
+    Path(account.profile_path).mkdir(parents=True)
+    runtime = FakeRuntime(status={"extension_connected": True, "extension_account_id": "FLOW-006", "account_match": True})
+    runtime.log_dir = tmp_path / "logs" / "runtime"
+    runtime.poll_sequences = [[9], [None]]
+
+    class GpuFailThenReadyCdp(FakeCdp):
+        def __init__(self):
+            super().__init__(EXPECTED_FLOWKIT_EXTENSION_ID)
+            self.ready_calls = []
+
+        def wait_ready(self, cdp_port, **kwargs):
+            self.ready_calls.append(kwargs)
+            if len(self.ready_calls) == 1:
+                raise CdpError(
+                    "bootstrap_chrome_exited",
+                    {
+                        "stage": "wait_cdp_ready",
+                        "cdp_port": cdp_port,
+                        "chrome_pid": 1000,
+                        "chrome_exit_code": 9,
+                        "attempts": 1,
+                    },
+                )
+            return {"Browser": "Chrome"}
+
+    class StderrBootstrapper(ExtensionBootstrapper):
+        def _open_bootstrap_chrome(self, account, bootstrap_url, **kwargs):
+            result = super()._open_bootstrap_chrome(account, bootstrap_url, **kwargs)
+            if len(runtime.launched) == 1:
+                Path(result.details["stderr_log"]).write_text(
+                    "GPU process exited unexpectedly\n"
+                    "FATAL: GPU process isn't usable. Goodbye.\n"
+                    "GPUPersistentCache\\DawnGraphiteCache data_0 failed 0x20\n",
+                    encoding="utf-8",
+                )
+            return result
+
+    bootstrapper = StderrBootstrapper(registry, runtime=runtime, cdp=GpuFailThenReadyCdp(), profiles_root=registry.profiles_root, sleep=lambda _: None)
+
+    result = bootstrapper.bootstrap_account("FLOW-006")
+
+    assert result.ok is True
+    assert result.result == "extension_bootstrapped"
+    assert runtime.worker_only_started == ["FLOW-006"]
+    assert len(runtime.launched) == 2
+    assert "--disable-gpu" not in runtime.launched[0][1]
+    assert "--disable-gpu" in runtime.launched[1][1]
+    assert runtime.launched[0][1][-1] != runtime.launched[1][1][-1]
+    assert result.details["bootstrap_chrome_attempts"] == 2
+    assert result.details["bootstrap_chrome_retry_used"] is True
+    assert result.details["bootstrap_chrome_retry_reason"] == "gpu_process_unusable"
+    assert result.details["first_attempt_chrome_pid"] == 1000
+    assert result.details["second_attempt_chrome_pid"] == 1001
+    assert result.details["final_chrome_pid"] == 1001
+
+
+def test_bootstrap_chrome_failure_classifier_does_not_retry_profile_lock_or_google_update_access(tmp_path):
+    registry = make_registry(tmp_path)
+    bootstrapper = ExtensionBootstrapper(registry, runtime=FakeRuntime(), cdp=FakeCdp(), profiles_root=registry.profiles_root)
+    stderr = tmp_path / "stderr.log"
+
+    stderr.write_text("Google Update registry access denied\n", encoding="utf-8")
+    update_noise = bootstrapper._classify_bootstrap_chrome_failure(str(stderr))
+    assert update_noise["failure_class"] == "unknown_early_exit"
+    assert update_noise["retry_eligible"] is False
+
+    stderr.write_text("user data directory is already in use: SingletonLock\n", encoding="utf-8")
+    profile_lock = bootstrapper._classify_bootstrap_chrome_failure(str(stderr))
+    assert profile_lock["failure_class"] == "profile_lock_error"
+    assert profile_lock["retry_eligible"] is False
+
+
+def test_gpu_cache_cleanup_only_removes_whitelisted_profile_caches(tmp_path):
+    registry = make_registry(tmp_path)
+    account = add_account(registry)
+    profile = Path(account.profile_path)
+    preserved = [
+        profile / "Default" / "Preferences",
+        profile / "Default" / "Secure Preferences",
+        profile / "Default" / "Extension State" / "LOCK",
+        profile / "Default" / "Local Extension Settings" / EXPECTED_FLOWKIT_EXTENSION_ID / "000003.log",
+        profile / "Default" / "Service Worker" / "Database" / "CURRENT",
+        profile / "Default" / "WebStorage" / "QuotaManager",
+    ]
+    removed = [
+        profile / "GPUCache" / "data_0",
+        profile / "Default" / "GPUCache" / "data_1",
+        profile / "GPUPersistentCache" / "DawnGraphiteCache" / "data_2",
+        profile / "Default" / "ShaderCache" / "data_3",
+    ]
+    for path in preserved + removed:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x", encoding="utf-8")
+
+    bootstrapper = ExtensionBootstrapper(registry, runtime=FakeRuntime(), cdp=FakeCdp(), profiles_root=registry.profiles_root)
+    result = bootstrapper._cleanup_gpu_caches(account)
+
+    assert result["ok"] is True
+    assert all(not path.exists() for path in removed)
+    assert all(path.exists() for path in preserved)
 
 
 def test_bootstrap_chrome_command_redacts_nonce_and_sensitive_query(tmp_path):
