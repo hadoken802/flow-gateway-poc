@@ -328,6 +328,8 @@ class CdpClient:
                 "type": target_type,
                 "category": category,
                 "extension_id_matches": extension_id_matches,
+                "extension_id": parsed.netloc if parsed.scheme == "chrome-extension" and EXTENSION_ID_RE.match(parsed.netloc) else None,
+                "path": parsed.path.lstrip("/") if parsed.scheme == "chrome-extension" else None,
                 "url": safe_url,
             })
         return summary
@@ -601,7 +603,7 @@ class ExtensionBootstrapper:
         if not manifest:
             return ExtensionBootstrapResult("extension_missing", account.account_id, False, {"extension_dir": str(self.extension_dir)})
         nonce = secrets.token_urlsafe(18)
-        url = self.bootstrap_url(account, nonce, manifest.extension_id)
+        url = self.bootstrap_url(account, nonce, EXPECTED_FLOWKIT_EXTENSION_ID)
         profile_extension_gate = self._profile_extension_state_gate(profile)
         initialization_details = {
             "profile_initialization_mode": profile_initialization_mode,
@@ -609,7 +611,7 @@ class ExtensionBootstrapper:
             "credential_storage_sanitized": credential_storage_sanitized,
             "credential_storage_policy_version": CREDENTIAL_STORAGE_POLICY_VERSION if credential_storage_sanitized else None,
             **profile_extension_gate,
-            **self._bootstrap_url_extension_diagnostics(url, manifest.extension_id),
+            **self._bootstrap_url_extension_diagnostics(url, EXPECTED_FLOWKIT_EXTENSION_ID),
         }
         if profile_initialization_mode == "rebuilt_registered_empty_profile":
             volatile_cleanup = self._cleanup_bootstrap_volatile_cache(account, initialization_details, attempt=1)
@@ -741,7 +743,7 @@ class ExtensionBootstrapper:
                         {**initialization_details, **diagnostics, "stage": "volatile_cache_cleanup_retry", **compensation},
                     )
                 nonce = secrets.token_urlsafe(18)
-                url = self.bootstrap_url(account, nonce, manifest.extension_id)
+                url = self.bootstrap_url(account, nonce, EXPECTED_FLOWKIT_EXTENSION_ID)
                 chrome = self._open_bootstrap_chrome(account, url, attempt=2)
                 if chrome.result not in {"opened", "already_running"}:
                     compensation = self._compensate_owned(account, False, worker_started, None, worker_pid)
@@ -796,25 +798,22 @@ class ExtensionBootstrapper:
                     )
             diagnostics["cdp_ready_at"] = self._utc_now()
             diagnostics["final_chrome_pid"] = chrome_pid
-            extension_load = self._wait_expected_extension_loaded(account, manifest, chrome_pid=chrome_pid)
+            extension_load = self._wait_expected_extension_loaded(account, manifest, chrome_pid=chrome_pid, command=diagnostics.get("bootstrap_chrome_command"))
             diagnostics.update(extension_load.details or {})
-            extension_id = (extension_load.details or {}).get("discovered_extension_id")
-            if extension_load.result == "extension_id_mismatch":
-                return ExtensionBootstrapResult(
-                    "extension_id_mismatch",
-                    account.account_id,
-                    False,
-                    {**initialization_details, **diagnostics},
-                )
             if not extension_load.ok:
+                compensation = self._compensate_owned(account, chrome_started_by_bootstrap, worker_started, chrome_pid, worker_pid)
                 return ExtensionBootstrapResult(
                     extension_load.result,
                     account.account_id,
                     False,
-                    {**initialization_details, **diagnostics, "template_ready": self.template_ready(), "repair": repair},
+                    {**initialization_details, **diagnostics, "template_ready": self.template_ready(), "repair": repair, **compensation},
                 )
+            extension_id = (extension_load.details or {}).get("runtime_extension_id")
             try:
-                opened = self.cdp.open_url(account.chrome_cdp_port, self.bootstrap_url(account, nonce, extension_id))
+                runtime_bootstrap_url = self.bootstrap_url(account, nonce, extension_id)
+                diagnostics.update(self._bootstrap_url_extension_diagnostics(runtime_bootstrap_url, extension_id))
+                diagnostics["bootstrap_url_uses_runtime_extension_id"] = True
+                opened = self.cdp.open_url(account.chrome_cdp_port, runtime_bootstrap_url)
                 opened_url = str(opened.get("url") or opened.get("targetUrl") or "")
                 opened_parsed = urlparse(opened_url)
                 diagnostics.update({
@@ -1692,33 +1691,39 @@ class ExtensionBootstrapper:
             return False, "profile_not_retryable"
         return True, "none"
 
-    def _wait_expected_extension_loaded(self, account: AccountRecord, manifest: ExtensionIdentity, chrome_pid: int | None = None, attempts: int = 50) -> RuntimeResult:
+    def _wait_expected_extension_loaded(self, account: AccountRecord, manifest: ExtensionIdentity, chrome_pid: int | None = None, attempts: int = 50, command: list[str] | None = None) -> RuntimeResult:
         started = time.monotonic()
         last_discovery: dict = {}
         for attempt in range(1, attempts + 1):
             discovery = self.cdp.discover_extension(account.chrome_cdp_port, manifest.options_page, manifest.service_worker)
             last_discovery = discovery or {}
             target_summary = last_discovery.get("target_summary") or {}
-            extension_id = last_discovery.get("discovered_extension_id")
+            candidates = self._runtime_extension_candidates(target_summary, manifest)
+            runtime_extension_id = candidates[0] if len(candidates) == 1 else None
             details = {
                 "extension_load_wait_attempts": attempt,
                 "extension_load_elapsed_ms": int((time.monotonic() - started) * 1000),
-                "discovered_extension_id": extension_id,
-                "expected_extension_id": manifest.extension_id,
-                "expected_extension_loaded": extension_id == manifest.extension_id,
-                "service_worker_target_seen": bool(target_summary.get("service_worker_target_seen") or last_discovery.get("service_worker_target_url")),
+                "discovered_extension_id": runtime_extension_id or last_discovery.get("discovered_extension_id"),
+                "legacy_expected_extension_id": EXPECTED_FLOWKIT_EXTENSION_ID,
+                "runtime_extension_id": runtime_extension_id,
+                "runtime_id_matches_legacy_expected": runtime_extension_id == EXPECTED_FLOWKIT_EXTENSION_ID if runtime_extension_id else False,
+                "expected_extension_id": runtime_extension_id or EXPECTED_FLOWKIT_EXTENSION_ID,
+                "expected_extension_loaded": bool(runtime_extension_id),
+                "extension_loaded_from_command_line": self._extension_loaded_from_command_line(command),
+                "service_worker_target_seen": bool(candidates or target_summary.get("service_worker_target_seen") or last_discovery.get("service_worker_target_url")),
                 "options_target_seen": bool(target_summary.get("options_target_seen") or last_discovery.get("options_target_url")),
                 "target_summary_before_options_open": target_summary,
             }
-            if extension_id and extension_id != manifest.extension_id:
-                return RuntimeResult("extension_id_mismatch", account.account_id, False, details=details)
-            if extension_id == manifest.extension_id and details["service_worker_target_seen"]:
+            if len(candidates) > 1:
+                return RuntimeResult("extension_target_ambiguous", account.account_id, False, details=details)
+            if runtime_extension_id and details["extension_loaded_from_command_line"]:
                 return RuntimeResult("extension_loaded", account.account_id, True, details=details)
             if chrome_pid and self._chrome_exit_code(chrome_pid) is not None:
                 details["chrome_exit_code"] = self._chrome_exit_code(chrome_pid)
                 return RuntimeResult("bootstrap_chrome_exited", account.account_id, False, details=details)
             self.sleep(0.2)
         target_summary = (last_discovery.get("target_summary") or {}) if isinstance(last_discovery, dict) else {}
+        candidates = self._runtime_extension_candidates(target_summary, manifest)
         return RuntimeResult(
             "extension_load_timeout",
             account.account_id,
@@ -1726,14 +1731,38 @@ class ExtensionBootstrapper:
             details={
                 "extension_load_wait_attempts": attempts,
                 "extension_load_elapsed_ms": int((time.monotonic() - started) * 1000),
-                "discovered_extension_id": (last_discovery or {}).get("discovered_extension_id") if isinstance(last_discovery, dict) else None,
-                "expected_extension_id": manifest.extension_id,
+                "discovered_extension_id": candidates[0] if len(candidates) == 1 else ((last_discovery or {}).get("discovered_extension_id") if isinstance(last_discovery, dict) else None),
+                "legacy_expected_extension_id": EXPECTED_FLOWKIT_EXTENSION_ID,
+                "runtime_extension_id": candidates[0] if len(candidates) == 1 else None,
+                "runtime_id_matches_legacy_expected": candidates[0] == EXPECTED_FLOWKIT_EXTENSION_ID if len(candidates) == 1 else False,
+                "expected_extension_id": candidates[0] if len(candidates) == 1 else EXPECTED_FLOWKIT_EXTENSION_ID,
                 "expected_extension_loaded": False,
+                "extension_loaded_from_command_line": self._extension_loaded_from_command_line(command),
                 "service_worker_target_seen": bool(target_summary.get("service_worker_target_seen")),
                 "options_target_seen": bool(target_summary.get("options_target_seen")),
                 "target_summary_before_options_open": target_summary,
             },
         )
+
+    def _runtime_extension_candidates(self, target_summary: dict, manifest: ExtensionIdentity) -> list[str]:
+        candidates: list[str] = []
+        for target in target_summary.get("targets") or []:
+            if target.get("type") != "service_worker":
+                continue
+            if target.get("path") != manifest.service_worker:
+                continue
+            extension_id = target.get("extension_id")
+            if isinstance(extension_id, str) and EXTENSION_ID_RE.match(extension_id) and extension_id not in candidates:
+                candidates.append(extension_id)
+        return candidates
+
+    def _extension_loaded_from_command_line(self, command: list[str] | None) -> bool:
+        if not command:
+            return False
+        extension_dir = str(self.extension_dir.resolve())
+        load_args = [str(part) for part in command if str(part).startswith("--load-extension=")]
+        except_args = [str(part) for part in command if str(part).startswith("--disable-extensions-except=")]
+        return load_args == [f"--load-extension={extension_dir}"] and except_args == [f"--disable-extensions-except={extension_dir}"]
 
     def _wait_extension_ready(self, account: AccountRecord, attempts: int = 75, chrome_pid: int | None = None, diagnostics: dict | None = None) -> RuntimeResult:
         started = time.monotonic()
