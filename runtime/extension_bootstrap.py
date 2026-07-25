@@ -970,9 +970,15 @@ class ExtensionBootstrapper:
             "profile_initialization_mode",
             "registered_empty_safe_to_rebuild",
             "template_marker_present_before_launch",
+            "template_marker_valid",
+            "template_marker_extension_id",
+            "template_marker_extension_id_match",
             "expected_extension_id",
+            "template_preferences_extension_entry_present",
             "expected_extension_id_present_in_preferences",
             "expected_extension_id_present_in_secure_preferences",
+            "secure_preferences_extension_manifest_present",
+            "secure_preferences_extension_disabled_or_blocked",
             "expected_extension_local_state_present",
             "bootstrap_url_extension_id",
             "bootstrap_url_extension_id_match",
@@ -1033,15 +1039,25 @@ class ExtensionBootstrapper:
         secure_preferences = profile / "Default" / "Secure Preferences"
         local_state = profile / "Default" / "Local Extension Settings" / EXPECTED_FLOWKIT_EXTENSION_ID
         expected_in_preferences = self._file_contains(preferences, EXPECTED_FLOWKIT_EXTENSION_ID)
-        expected_in_secure_preferences = self._file_contains(secure_preferences, EXPECTED_FLOWKIT_EXTENSION_ID)
+        marker_details = self._template_marker_gate(marker)
+        secure_details = self._secure_preferences_extension_gate(secure_preferences)
         local_state_present = local_state.is_dir()
         return {
             "template_marker_present_before_launch": marker.is_file(),
+            **marker_details,
             "expected_extension_id": EXPECTED_FLOWKIT_EXTENSION_ID,
+            "template_preferences_extension_entry_present": expected_in_preferences,
             "expected_extension_id_present_in_preferences": expected_in_preferences,
-            "expected_extension_id_present_in_secure_preferences": expected_in_secure_preferences,
+            **secure_details,
             "expected_extension_local_state_present": local_state_present,
-            "template_extension_state_ready": bool(marker.is_file() and expected_in_preferences and expected_in_secure_preferences and local_state_present),
+            "template_extension_state_ready": bool(
+                marker_details["template_marker_valid"]
+                and marker_details["template_marker_extension_id_match"]
+                and secure_details["expected_extension_id_present_in_secure_preferences"]
+                and secure_details["secure_preferences_extension_manifest_present"]
+                and not secure_details["secure_preferences_extension_disabled_or_blocked"]
+                and local_state_present
+            ),
         }
 
     def _file_contains(self, path: Path, text: str) -> bool:
@@ -1049,6 +1065,64 @@ class ExtensionBootstrapper:
             return text in path.read_text(encoding="utf-8", errors="ignore")
         except Exception:
             return False
+
+    def _template_marker_gate(self, marker_path: Path) -> dict:
+        details = {
+            "template_marker_valid": False,
+            "template_marker_extension_id": None,
+            "template_marker_extension_id_match": False,
+        }
+        try:
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        except Exception:
+            return details
+        required = {
+            "template",
+            "ready",
+            "extension_id",
+            "extension_version",
+            "options_page",
+            "service_worker",
+            "extension_dir",
+            "manifest_sha256",
+            "first_launch_verified",
+            "persistence_verified",
+            "verified_without_load_extension",
+            "verified_at",
+        }
+        extension_id = str(marker.get("extension_id") or "")
+        details["template_marker_valid"] = bool(required.issubset(marker) and marker.get("ready") is True)
+        details["template_marker_extension_id"] = extension_id
+        details["template_marker_extension_id_match"] = extension_id == EXPECTED_FLOWKIT_EXTENSION_ID
+        return details
+
+    def _secure_preferences_extension_gate(self, secure_preferences: Path) -> dict:
+        details = {
+            "expected_extension_id_present_in_secure_preferences": False,
+            "secure_preferences_extension_manifest_present": False,
+            "secure_preferences_extension_disabled_or_blocked": False,
+        }
+        try:
+            data = json.loads(secure_preferences.read_text(encoding="utf-8"))
+        except Exception:
+            return details
+        settings = ((data.get("extensions") or {}).get("settings") or {})
+        extension = settings.get(EXPECTED_FLOWKIT_EXTENSION_ID)
+        if not isinstance(extension, dict):
+            return details
+        details["expected_extension_id_present_in_secure_preferences"] = True
+        details["secure_preferences_extension_manifest_present"] = isinstance(extension.get("manifest"), dict)
+        disable_reasons = extension.get("disable_reasons") or []
+        state = extension.get("state")
+        blacklist_state = extension.get("blacklist_state")
+        blocklist_state = extension.get("blocklist_state")
+        details["secure_preferences_extension_disabled_or_blocked"] = bool(
+            state not in (None, 1)
+            or disable_reasons
+            or blacklist_state not in (None, 0)
+            or blocklist_state not in (None, 0)
+        )
+        return details
 
     def _bootstrap_url_extension_diagnostics(self, bootstrap_url: str, expected_extension_id: str) -> dict:
         parsed = urlparse(bootstrap_url)
