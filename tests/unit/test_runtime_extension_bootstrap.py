@@ -70,6 +70,7 @@ class FakeRuntime:
         self.worker_only_started = []
         self.start_one_calls = []
         self.poll_sequences = []
+        self.status_sequence = []
         self.worker_ownership_payload = {
             "verified": True,
             "reason": "verified",
@@ -134,7 +135,7 @@ class FakeRuntime:
         self.stopped_pids = {"worker_pid": worker_pid, "chrome_pid": chrome_pid}
 
     def status(self, account_id):
-        payload = {**self.status_payload}
+        payload = {**(self.status_sequence.pop(0) if self.status_sequence else self.status_payload)}
         payload.setdefault("extension_account_id", account_id)
         payload.setdefault("account_match", payload.get("extension_account_id") == account_id and payload.get("extension_connected"))
         return RuntimeResult("running", account_id, bool(payload.get("account_match")), details=payload)
@@ -144,10 +145,12 @@ class FakeRuntime:
 
 
 class FakeCdp:
-    def __init__(self, extension_id=EXPECTED_FLOWKIT_EXTENSION_ID):
+    def __init__(self, extension_id=EXPECTED_FLOWKIT_EXTENSION_ID, discover_sequence=None):
         self.extension_id_value = extension_id
         self.opened_urls = []
         self.ready_calls = []
+        self.discover_sequence = list(discover_sequence or [])
+        self.discover_calls = []
 
     def wait_ready(self, cdp_port, **kwargs):
         self.ready_calls.append(cdp_port)
@@ -157,13 +160,17 @@ class FakeCdp:
         return self.extension_id_value
 
     def discover_extension(self, cdp_port, options_page, service_worker):
-        if not self.extension_id_value:
+        self.discover_calls.append(cdp_port)
+        extension_id = self.discover_sequence.pop(0) if self.discover_sequence else self.extension_id_value
+        if not extension_id:
             return {"discovered_extension_id": None, "options_target_url": None, "service_worker_target_url": None}
         return {
-            "discovered_extension_id": self.extension_id_value,
-            "options_target_url": f"chrome-extension://{self.extension_id_value}/{options_page}",
-            "service_worker_target_url": f"chrome-extension://{self.extension_id_value}/{service_worker}",
-            "target_summary": self.target_summary(self.list_targets(cdp_port), self.extension_id_value, options_page, service_worker),
+            "discovered_extension_id": extension_id,
+            "options_target_url": f"chrome-extension://{extension_id}/{options_page}",
+            "service_worker_target_url": f"chrome-extension://{extension_id}/{service_worker}",
+            "target_summary": self.target_summary([
+                {"type": "service_worker", "url": f"chrome-extension://{extension_id}/{service_worker}"},
+            ], extension_id, options_page, service_worker),
         }
 
     def extension_present(self, cdp_port):
@@ -726,9 +733,11 @@ def test_bootstrap_generates_account_specific_url_and_verifies_connection(tmp_pa
     assert runtime.start_one_calls == []
     assert runtime.worker_only_started == ["FLOW-006"]
     command = runtime.launched[0][1]
-    assert any(f"chrome-extension://{EXPECTED_FLOWKIT_EXTENSION_ID}/options.html?" in part for part in command)
-    assert any("account_id=FLOW-006" in part for part in command)
-    assert any("ws_url=ws%3A%2F%2F127.0.0.1%3A9201" in part for part in command)
+    assert command[-1] == "about:blank"
+    assert cdp.opened_urls
+    assert urlparse(cdp.opened_urls[0][1]).netloc == EXPECTED_FLOWKIT_EXTENSION_ID
+    assert "account_id=FLOW-006" in cdp.opened_urls[0][1]
+    assert "ws_url=ws%3A%2F%2F127.0.0.1%3A9201" in cdp.opened_urls[0][1]
     assert not any("labs.google" in part or "aisandbox" in part for part in command)
     assert result.details["extension_expected_ws_url"] == "ws://127.0.0.1:9201"
 
@@ -1125,10 +1134,12 @@ def test_bootstrap_uses_different_config_per_account(tmp_path):
 
     first_command = bootstrapper.runtime.launched[0][1]
     second_command = bootstrapper.runtime.launched[1][1]
-    assert any("account_id=FLOW-006" in part for part in first_command)
-    assert any("ws_url=ws%3A%2F%2F127.0.0.1%3A9201" in part for part in first_command)
-    assert any("account_id=FLOW-007" in part for part in second_command)
-    assert any("ws_url=ws%3A%2F%2F127.0.0.1%3A9202" in part for part in second_command)
+    assert first_command[-1] == "about:blank"
+    assert second_command[-1] == "about:blank"
+    assert "account_id=FLOW-006" in cdp.opened_urls[0][1]
+    assert "ws_url=ws%3A%2F%2F127.0.0.1%3A9201" in cdp.opened_urls[0][1]
+    assert "account_id=FLOW-007" in cdp.opened_urls[1][1]
+    assert "ws_url=ws%3A%2F%2F127.0.0.1%3A9202" in cdp.opened_urls[1][1]
 
 
 def test_bootstrap_rejects_invalid_account_id_or_port(tmp_path):
@@ -1161,7 +1172,7 @@ def test_extension_missing_returns_precise_status(tmp_path):
 
     result = bootstrapper.bootstrap_account("FLOW-006", repair=True)
 
-    assert result.result == "extension_install_required"
+    assert result.result == "extension_load_timeout"
     assert result.details["template_ready"] is True
 
 
@@ -1190,7 +1201,7 @@ def test_extension_missing_with_ready_template_returns_install_required_without_
 
     result = bootstrapper.bootstrap_account("FLOW-006", repair=True)
 
-    assert result.result == "extension_install_required"
+    assert result.result == "extension_load_timeout"
     assert cdp.opened_urls == []
 
 
@@ -1371,7 +1382,7 @@ def test_cli_bootstrap_exception_returns_json_without_traceback(tmp_path, monkey
     assert output.err == ""
 
 
-def test_regular_chrome_command_does_not_readd_extension_flags(tmp_path):
+def test_regular_chrome_command_loads_flowkit_extension_deterministically(tmp_path):
     registry = make_registry(tmp_path)
     account = add_account(registry)
     chrome = tmp_path / "chrome.exe"
@@ -1380,18 +1391,25 @@ def test_regular_chrome_command_does_not_readd_extension_flags(tmp_path):
 
     command = manager.chrome_command(account)
 
-    assert not any("--load-extension" in part for part in command)
-    assert not any("--disable-extensions-except" in part for part in command)
+    assert command.count("--disable-skia-graphite") == 1
+    assert len([part for part in command if str(part).startswith("--load-extension=")]) == 1
+    assert len([part for part in command if str(part).startswith("--disable-extensions-except=")]) == 1
+    assert "--disable-gpu" not in command
 
 
-def test_bootstrap_chrome_command_opens_options_not_flow_url(tmp_path):
+def test_bootstrap_chrome_command_loads_extension_and_starts_about_blank(tmp_path):
     registry = make_registry(tmp_path)
     account = add_account(registry)
     bootstrapper = ExtensionBootstrapper(registry, runtime=FakeRuntime(), cdp=FakeCdp(), profiles_root=registry.profiles_root)
 
-    command = bootstrapper.bootstrap_chrome_command(account, f"chrome-extension://{EXPECTED_FLOWKIT_EXTENSION_ID}/options.html?bootstrap=1")
+    command = bootstrapper.bootstrap_chrome_command(account, f"chrome-extension://{EXPECTED_FLOWKIT_EXTENSION_ID}/options.html?bootstrap=1&nonce=SECRET")
 
-    assert any("chrome-extension://" in part and "options.html?bootstrap=1" in part for part in command)
+    assert command.count("--disable-skia-graphite") == 1
+    assert len([part for part in command if str(part).startswith("--load-extension=")]) == 1
+    assert len([part for part in command if str(part).startswith("--disable-extensions-except=")]) == 1
+    assert Path([part for part in command if str(part).startswith("--load-extension=")][0].split("=", 1)[1]).is_absolute()
+    assert command[-1] == "about:blank"
+    assert not any("options.html?bootstrap=1" in part for part in command)
     assert not any("labs.google" in part or "aisandbox" in part for part in command)
 
 
@@ -1437,6 +1455,93 @@ def test_bootstrap_chrome_command_forces_disable_skia_graphite_once_and_removes_
     assert "--use-angle" not in command
     assert "--use-gl" not in command
     assert "--skia-graphite-dawn-backend" not in command
+
+
+def test_bootstrap_waits_for_delayed_extension_then_opens_options_via_cdp(tmp_path):
+    registry = make_registry(tmp_path)
+    account = add_account(registry, "FLOW-006")
+    ready_template(registry.profiles_root)
+    cdp = FakeCdp(discover_sequence=[None, None, None, EXPECTED_FLOWKIT_EXTENSION_ID])
+    runtime = FakeRuntime(status={"extension_connected": True, "extension_account_id": "FLOW-006", "account_match": True})
+    bootstrapper = ExtensionBootstrapper(registry, runtime=runtime, cdp=cdp, profiles_root=registry.profiles_root, sleep=lambda _: None)
+
+    result = bootstrapper.bootstrap_account("FLOW-006")
+
+    assert result.result == "extension_bootstrapped"
+    assert cdp.ready_calls == [account.chrome_cdp_port]
+    assert len(cdp.discover_calls) == 4
+    assert len(cdp.opened_urls) == 1
+    assert urlparse(cdp.opened_urls[0][1]).netloc == EXPECTED_FLOWKIT_EXTENSION_ID
+    assert result.details["expected_extension_loaded"] is True
+    assert result.details["bootstrap_options_opened_via_cdp"] is True
+    assert result.details["extension_load_wait_attempts"] == 4
+
+
+def test_bootstrap_extension_load_timeout_does_not_open_options(tmp_path):
+    registry = make_registry(tmp_path)
+    add_account(registry, "FLOW-006")
+    ready_template(registry.profiles_root)
+    cdp = FakeCdp(extension_id=None)
+    runtime = FakeRuntime()
+    bootstrapper = ExtensionBootstrapper(registry, runtime=runtime, cdp=cdp, profiles_root=registry.profiles_root, sleep=lambda _: None)
+
+    result = bootstrapper.bootstrap_account("FLOW-006")
+
+    assert result.result == "extension_load_timeout"
+    assert cdp.opened_urls == []
+    assert result.details["expected_extension_loaded"] is False
+
+
+def test_bootstrap_wrong_extension_id_fails_before_opening_options(tmp_path):
+    registry = make_registry(tmp_path)
+    add_account(registry, "FLOW-006")
+    ready_template(registry.profiles_root)
+    cdp = FakeCdp(extension_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    runtime = FakeRuntime()
+    bootstrapper = ExtensionBootstrapper(registry, runtime=runtime, cdp=cdp, profiles_root=registry.profiles_root, sleep=lambda _: None)
+
+    result = bootstrapper.bootstrap_account("FLOW-006")
+
+    assert result.result == "extension_id_mismatch"
+    assert cdp.opened_urls == []
+    assert result.details["discovered_extension_id"] == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+
+def test_bootstrap_options_open_failure_is_reported(tmp_path):
+    registry = make_registry(tmp_path)
+    add_account(registry, "FLOW-006")
+    ready_template(registry.profiles_root)
+
+    class FailingOpenCdp(FakeCdp):
+        def open_url(self, cdp_port, url):
+            raise CdpError("cdp_open_target_failed", {"stage": "open_bootstrap_options"})
+
+    runtime = FakeRuntime()
+    bootstrapper = ExtensionBootstrapper(registry, runtime=runtime, cdp=FailingOpenCdp(), profiles_root=registry.profiles_root, sleep=lambda _: None)
+
+    result = bootstrapper.bootstrap_account("FLOW-006")
+
+    assert result.result == "cdp_open_target_failed"
+    assert result.details["bootstrap_options_opened_via_cdp"] is False
+
+
+def test_bootstrap_wait_extension_ready_allows_delayed_connection(tmp_path):
+    registry = make_registry(tmp_path)
+    add_account(registry, "FLOW-006")
+    ready_template(registry.profiles_root)
+    runtime = FakeRuntime()
+    runtime.status_sequence = [
+        {"extension_connected": False, "extension_account_id": None, "account_match": False},
+        {"extension_connected": False, "extension_account_id": None, "account_match": False},
+        {"extension_connected": True, "extension_account_id": "FLOW-006", "account_match": True},
+    ]
+    bootstrapper = ExtensionBootstrapper(registry, runtime=runtime, cdp=FakeCdp(), profiles_root=registry.profiles_root, sleep=lambda _: None)
+
+    result = bootstrapper.bootstrap_account("FLOW-006")
+
+    assert result.result == "extension_bootstrapped"
+    assert result.details["extension_ready_wait_attempts"] == 3
+    assert result.details["extension_ready_elapsed_ms"] >= 0
 
 
 def test_bootstrap_chrome_logs_are_account_specific_and_handles_close(tmp_path):
@@ -1524,7 +1629,10 @@ def test_bootstrap_retries_once_for_gpu_chrome_exit_before_cdp_ready(tmp_path):
     assert not any(arg in runtime.launched[1][1] for arg in forbidden_gpu_args)
     assert "--disable-gpu" not in runtime.launched[0][1]
     assert "--disable-gpu" not in runtime.launched[1][1]
-    assert runtime.launched[0][1][-1] != runtime.launched[1][1][-1]
+    assert runtime.launched[0][1][-1] == "about:blank"
+    assert runtime.launched[1][1][-1] == "about:blank"
+    assert len(bootstrapper.cdp.opened_urls) == 1
+    assert "account_id=FLOW-006" in bootstrapper.cdp.opened_urls[0][1]
     assert Path(account.profile_path).exists()
     failed_root = registry.profiles_root / "_failed_bootstrap"
     quarantined = list(failed_root.glob("FLOW-006-*-attempt-1"))
@@ -2058,9 +2166,9 @@ def test_bootstrap_chrome_command_redacts_nonce_and_sensitive_query(tmp_path):
 
     joined = " ".join(redacted)
     assert "SECRET_NONCE" not in joined
-    assert "nonce=%3Credacted%3E" in joined or "nonce=<redacted>" in joined
+    assert "options.html?bootstrap=1" not in joined
     assert "FLOW-006" in joined
-    assert "127.0.0.1" in joined
+    assert "127.0.0.1" not in joined
     assert "flowKey" not in joined
 
 

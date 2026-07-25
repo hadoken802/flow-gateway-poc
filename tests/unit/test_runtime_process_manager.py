@@ -234,7 +234,7 @@ def test_start_worker_only_uses_account_env_and_does_not_launch_chrome(tmp_path,
     assert stored.runtime_ownership_version == 1
 
 
-def make_manager(tmp_path, registry, inspector=None, health=None, cdp=False):
+def make_manager(tmp_path, registry, inspector=None, health=None, cdp=False, health_sequence=None):
     tmp_path.mkdir(parents=True, exist_ok=True)
     chrome = tmp_path / "chrome.exe"
     chrome.write_text("", encoding="utf-8")
@@ -260,7 +260,8 @@ def make_manager(tmp_path, registry, inspector=None, health=None, cdp=False):
         log_dir=tmp_path / "logs" / "runtime",
         ownership_protector=FakeSecretProtector(),
     )
-    manager._worker_health = lambda account: health or {}
+    sequence = list(health_sequence or [])
+    manager._worker_health = lambda account: sequence.pop(0) if sequence else (health or {})
     manager._tcp_reachable = lambda port: cdp
     manager.launched = launched
     return manager
@@ -515,7 +516,7 @@ def test_parent_pid_process_first_failure_closes_handle():
     assert inspector.closed == [123]
 
 
-def test_open_login_uses_registered_profile_and_cdp_without_extension_flags(tmp_path, monkeypatch):
+def test_open_login_uses_registered_profile_cdp_and_extension_flags(tmp_path, monkeypatch):
     registry = make_registry(tmp_path)
     account = add_account(registry)
     manager = make_manager(tmp_path, registry)
@@ -527,8 +528,9 @@ def test_open_login_uses_registered_profile_and_cdp_without_extension_flags(tmp_
     assert result.result == "opened"
     assert f"--user-data-dir={Path(account.profile_path)}" in command
     assert "--remote-debugging-port=9300" in command
-    assert not any("--load-extension" in part for part in command)
-    assert not any("--disable-extensions-except" in part for part in command)
+    assert "--disable-skia-graphite" in command
+    assert len([part for part in command if str(part).startswith("--load-extension=")]) == 1
+    assert len([part for part in command if str(part).startswith("--disable-extensions-except=")]) == 1
     assert registry.get("FLOW-005").chrome_pid == manager.launched[0].pid
 
 
@@ -910,6 +912,50 @@ def test_start_one_starts_worker_then_chrome_and_checks_health(tmp_path, monkeyp
     assert manager.launched[0].env["FLOW_ACCOUNT_ID"] == "FLOW-005"
     assert manager.launched[0].env["AGENT_API_PORT"] == "8101"
     assert "--remote-debugging-port=9300" in manager.launched[1].command
+    assert "--disable-skia-graphite" in manager.launched[1].command
+    assert len([part for part in manager.launched[1].command if str(part).startswith("--load-extension=")]) == 1
+    assert len([part for part in manager.launched[1].command if str(part).startswith("--disable-extensions-except=")]) == 1
+
+
+def test_start_one_waits_for_delayed_extension_connection(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    add_account(registry)
+    inspector = FakeInspector()
+    manager = make_manager(
+        tmp_path,
+        registry,
+        inspector=inspector,
+        health_sequence=[
+            {},
+            {"account_id": "FLOW-005", "extension_connected": False},
+            {"account_id": "FLOW-005", "extension_connected": False},
+            {"account_id": "FLOW-005", "extension_connected": True},
+        ],
+        cdp=True,
+    )
+    monkeypatch.setattr("runtime.process_manager.port_is_listening", lambda port: False)
+    monkeypatch.setattr("runtime.process_manager.time.sleep", lambda _: None)
+
+    result = manager.start_one("FLOW-005")
+
+    assert result.result == "started"
+    assert result.details["startup_extension_wait_attempts"] == 3
+    assert inspector.terminated == []
+
+
+def test_start_one_compensates_only_after_extension_wait_timeout(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    add_account(registry)
+    inspector = FakeInspector()
+    manager = make_manager(tmp_path, registry, inspector=inspector, health={"account_id": "FLOW-005", "extension_connected": False}, cdp=True)
+    monkeypatch.setattr("runtime.process_manager.port_is_listening", lambda port: False)
+    monkeypatch.setattr("runtime.process_manager.time.sleep", lambda _: None)
+
+    result = manager.start_one("FLOW-005")
+
+    assert result.result == "extension_not_connected"
+    assert result.details["startup_extension_wait_attempts"] == 75
+    assert len(inspector.terminated) == 2
 
 
 def test_start_one_reuses_verified_chrome_listener_and_redirects_worker_logs(tmp_path, monkeypatch):

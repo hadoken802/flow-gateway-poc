@@ -443,10 +443,11 @@ class RuntimeManager:
                 self.registry.mark_started(account.account_id, chrome_pid=existing_chrome_pid)
                 self._log(account.account_id, "start-one", {"step": "chrome_reused", "pid": existing_chrome_pid})
             else:
-                chrome_proc = self.popen(self.chrome_command(account), cwd=str(FLOWKIT_DIR))
+                command = self.chrome_command(account)
+                chrome_proc = self.popen(command, cwd=str(FLOWKIT_DIR))
                 self.registry.mark_started(account.account_id, chrome_pid=chrome_proc.pid)
-                self._log(account.account_id, "start-one", {"step": "chrome_started", "pid": chrome_proc.pid, "command": self._safe_command(self.chrome_command(account))})
-            health = self.status(account.account_id)
+                self._log(account.account_id, "start-one", {"step": "chrome_started", "pid": chrome_proc.pid, "command": self._safe_command(command)})
+            health = self._wait_startup_extension_ready(account, getattr(worker_proc, "pid", None), getattr(chrome_proc, "pid", None))
             if health.details.get("account_match"):
                 self._log(account.account_id, "start-one", {"result": "started", "health": self._health_log_fields(health.details)})
                 return RuntimeResult("started", account.account_id, True, details=health.details)
@@ -656,14 +657,35 @@ class RuntimeManager:
 
     def chrome_command(self, account: AccountRecord) -> list[str]:
         chrome = self._find_chrome()
+        extension_dir = str(self.extension_dir.resolve())
         return [
             str(chrome),
             f"--user-data-dir={Path(account.profile_path)}",
             f"--remote-debugging-port={account.chrome_cdp_port}",
             "--no-first-run",
             "--no-default-browser-check",
+            "--disable-skia-graphite",
+            f"--disable-extensions-except={extension_dir}",
+            f"--load-extension={extension_dir}",
             self.flow_url,
         ]
+
+    def _wait_startup_extension_ready(self, account: AccountRecord, worker_pid: int | None, chrome_pid: int | None, attempts: int = 75) -> RuntimeResult:
+        last = self.status(account.account_id)
+        for attempt in range(1, attempts + 1):
+            last.details["startup_extension_wait_attempts"] = attempt
+            if last.details.get("account_match"):
+                return last
+            if (
+                (worker_pid and last.details.get("worker_process_alive") is False and last.details.get("worker_health_reachable") is False)
+                or (chrome_pid and last.details.get("chrome_process_alive") is False and last.details.get("chrome_cdp_reachable") is False)
+            ):
+                return last
+            if attempt >= attempts:
+                return last
+            time.sleep(0.2)
+            last = self.status(account.account_id)
+        return last
 
     def worker_command(self, account: AccountRecord) -> list[str]:
         return [
