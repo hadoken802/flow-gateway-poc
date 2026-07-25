@@ -14,7 +14,7 @@ from runtime.ownership import (
     verify_challenge_response,
 )
 from runtime import worker_entry
-from runtime.process_manager import BOOL, DWORD, HANDLE, INVALID_HANDLE_VALUE, KERNEL32, PROCESSENTRY32W, ProcessInspector, ProcessProbeResult, RuntimeManager, TerminationResult
+from runtime.process_manager import BOOL, DWORD, HANDLE, INVALID_HANDLE_VALUE, KERNEL32, MANAGED_CFT_CHROME, PROCESSENTRY32W, ProcessInspector, ProcessProbeResult, RuntimeManager, TerminationResult
 from runtime.registry import AccountRecord, AccountRegistry
 
 
@@ -234,10 +234,14 @@ def test_start_worker_only_uses_account_env_and_does_not_launch_chrome(tmp_path,
     assert stored.runtime_ownership_version == 1
 
 
-def make_manager(tmp_path, registry, inspector=None, health=None, cdp=False, health_sequence=None):
+def make_manager(tmp_path, registry, inspector=None, health=None, cdp=False, health_sequence=None, chrome_path_marker="default"):
     tmp_path.mkdir(parents=True, exist_ok=True)
     chrome = tmp_path / "chrome.exe"
-    chrome.write_text("", encoding="utf-8")
+    if chrome_path_marker == "default":
+        chrome.write_text("", encoding="utf-8")
+        chrome_path = chrome
+    else:
+        chrome_path = chrome_path_marker
     extension = tmp_path / "extension"
     extension.mkdir(exist_ok=True)
     launched = []
@@ -254,7 +258,7 @@ def make_manager(tmp_path, registry, inspector=None, health=None, cdp=False, hea
         registry=registry,
         inspector=inspector or FakeInspector(),
         popen=fake_popen,
-        chrome_path=chrome,
+        chrome_path=chrome_path,
         extension_dir=extension,
         python_exe=tmp_path / "python.exe",
         log_dir=tmp_path / "logs" / "runtime",
@@ -534,6 +538,42 @@ def test_open_login_uses_registered_profile_cdp_and_extension_flags(tmp_path, mo
     assert registry.get("FLOW-005").chrome_pid == manager.launched[0].pid
 
 
+def test_runtime_manager_does_not_fallback_to_system_chrome_when_cft_missing(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    account = add_account(registry)
+    manager = RuntimeManager(registry=registry, chrome_path=tmp_path / "missing.exe", ownership_protector=FakeSecretProtector())
+
+    result = manager.open_login(account.account_id)
+
+    assert result.result == "cft_browser_not_configured"
+    assert result.details["cft_required"] is True
+
+
+def test_runtime_manager_prefers_env_chrome_executable(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    account = add_account(registry)
+    env_chrome = tmp_path / "cft" / "chrome.exe"
+    env_chrome.parent.mkdir(parents=True)
+    env_chrome.write_text("", encoding="utf-8")
+    monkeypatch.setenv("FLOWKIT_CHROME_EXECUTABLE", str(env_chrome))
+    manager = make_manager(tmp_path / "env", registry, chrome_path_marker=None)
+
+    command = manager.chrome_command(account)
+
+    assert command[0] == str(env_chrome)
+
+
+def test_runtime_manager_uses_managed_cft_when_available(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    account = add_account(registry)
+    monkeypatch.delenv("FLOWKIT_CHROME_EXECUTABLE", raising=False)
+    manager = RuntimeManager(registry=registry, ownership_protector=FakeSecretProtector())
+
+    command = manager.chrome_command(account)
+
+    assert command[0] == str(MANAGED_CFT_CHROME)
+
+
 def test_open_login_preflight_errors(tmp_path):
     registry = make_registry(tmp_path)
     add_account(registry, enabled=False)
@@ -555,7 +595,7 @@ def test_open_login_chrome_missing_and_port_conflict(tmp_path, monkeypatch):
     registry = make_registry(tmp_path)
     add_account(registry)
     manager = RuntimeManager(registry=registry, chrome_path=tmp_path / "missing.exe")
-    assert manager.open_login("FLOW-005").result == "chrome_not_found"
+    assert manager.open_login("FLOW-005").result == "cft_browser_not_configured"
 
     manager = make_manager(tmp_path, registry)
     monkeypatch.setattr("runtime.process_manager.port_is_listening", lambda port: True)

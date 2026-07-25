@@ -68,17 +68,20 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if result.ok or result.result in {"stopped", "already_stopped", "already_running", "opened"} else 1
 
     if args.command == "init-extension-template":
-        result = _run_bootstrap_command(lambda: ExtensionBootstrapper(registry).init_template())
+        manager = RuntimeManager(registry)
+        result = _run_bootstrap_command(lambda: ExtensionBootstrapper(registry, runtime=manager).init_template())
         print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
         return 0 if result.ok else 1
 
     if args.command == "bootstrap-extension":
-        result = _run_bootstrap_command(lambda: ExtensionBootstrapper(registry).bootstrap_account(args.account_id, repair=args.repair), args.account_id)
+        manager = RuntimeManager(registry)
+        result = _run_bootstrap_command(lambda: ExtensionBootstrapper(registry, runtime=manager).bootstrap_account(args.account_id, repair=args.repair), args.account_id)
         print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
         return 0 if result.ok else 1
 
     if args.command == "bootstrap-batch":
-        result = _run_bootstrap_command(lambda: ExtensionBootstrapper(registry).bootstrap_batch(args.account_ids, repair=args.repair))
+        manager = RuntimeManager(registry)
+        result = _run_bootstrap_command(lambda: ExtensionBootstrapper(registry, runtime=manager).bootstrap_batch(args.account_ids, repair=args.repair))
         print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
         return 0 if result.ok else 1
 

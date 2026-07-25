@@ -1262,23 +1262,26 @@ def test_extension_missing_returns_precise_status(tmp_path):
     assert result.details["template_ready"] is True
 
 
-def test_discovered_unpacked_extension_id_is_used_for_bootstrap_url(tmp_path):
+def test_other_background_service_worker_is_ignored_for_flowkit_bootstrap(tmp_path):
     registry = make_registry(tmp_path)
     account = add_account(registry)
     Path(account.profile_path).mkdir(parents=True)
     ready_template(registry.profiles_root)
     runtime_id = "admccjkmockfdflocgggjfgdacdodkdf"
-    cdp = FakeCdp(runtime_id)
+    cdp = FakeCdp(extension_id=None, target_sets=[
+        [{"type": "service_worker", "url": f"chrome-extension://{runtime_id}/background.js"}],
+    ])
     runtime = FakeRuntime(status={"extension_connected": True, "extension_account_id": "FLOW-006", "account_match": True})
     bootstrapper = ExtensionBootstrapper(registry, runtime=runtime, cdp=cdp, profiles_root=registry.profiles_root, sleep=lambda _: None)
 
     result = bootstrapper.bootstrap_account("FLOW-006", repair=True)
 
-    assert result.result == "extension_bootstrapped"
+    assert result.result == "expected_flowkit_extension_not_loaded"
     assert result.details["legacy_expected_extension_id"] == EXPECTED_FLOWKIT_EXTENSION_ID
-    assert result.details["runtime_extension_id"] == runtime_id
+    assert result.details["runtime_extension_id"] is None
     assert result.details["runtime_id_matches_legacy_expected"] is False
-    assert urlparse(cdp.opened_urls[0][1]).netloc == runtime_id
+    assert runtime_id in result.details["ignored_extension_ids"]
+    assert cdp.opened_urls == []
 
 
 def test_extension_missing_with_ready_template_returns_install_required_without_open_url(tmp_path):
@@ -1351,7 +1354,7 @@ def test_reused_chrome_cdp_open_failure_is_structured_without_stopping_existing_
 
     result = bootstrapper.bootstrap_account("FLOW-006", repair=True)
 
-    assert result.result == "extension_load_timeout"
+    assert result.result == "expected_flowkit_extension_not_loaded"
     assert result.details["chrome_started_by_bootstrap"] is False
     assert result.details["worker_started_by_bootstrap"] is True
     assert runtime.stopped == ["FLOW-006"]
@@ -1377,7 +1380,7 @@ def test_reused_chrome_open_failure_does_not_close_existing_chrome(tmp_path):
 
     result = bootstrapper.bootstrap_account("FLOW-006", repair=True)
 
-    assert result.result == "extension_load_timeout"
+    assert result.result == "expected_flowkit_extension_not_loaded"
     assert result.details["chrome_started_by_bootstrap"] is False
     assert runtime.stopped == ["FLOW-006"]
     assert runtime.stopped_pids["chrome_pid"] is None
@@ -1425,7 +1428,7 @@ def test_cli_bootstrap_commands_use_bootstrapper(tmp_path, monkeypatch, capsys):
     calls = []
 
     class FakeBootstrapper:
-        def __init__(self, registry_arg):
+        def __init__(self, registry_arg, *args, **kwargs):
             calls.append(("init", registry_arg))
 
         def init_template(self):
@@ -1454,7 +1457,7 @@ def test_cli_bootstrap_exception_returns_json_without_traceback(tmp_path, monkey
     registry = make_registry(tmp_path)
 
     class FailingBootstrapper:
-        def __init__(self, registry_arg):
+        def __init__(self, registry_arg, *args, **kwargs):
             pass
 
         def bootstrap_account(self, account_id, repair=False):
@@ -1551,7 +1554,7 @@ def test_bootstrap_waits_for_delayed_extension_then_opens_options_via_cdp(tmp_pa
     registry = make_registry(tmp_path)
     account = add_account(registry, "FLOW-006")
     ready_template(registry.profiles_root)
-    runtime_id = "admccjkmockfdflocgggjfgdacdodkdf"
+    runtime_id = EXPECTED_FLOWKIT_EXTENSION_ID
     cdp = FakeCdp(discover_sequence=[None, None, None, runtime_id])
     runtime = FakeRuntime(status={"extension_connected": True, "extension_account_id": "FLOW-006", "account_match": True})
     bootstrapper = ExtensionBootstrapper(registry, runtime=runtime, cdp=cdp, profiles_root=registry.profiles_root, sleep=lambda _: None)
@@ -1567,6 +1570,26 @@ def test_bootstrap_waits_for_delayed_extension_then_opens_options_via_cdp(tmp_pa
     assert result.details["expected_extension_loaded"] is True
     assert result.details["bootstrap_options_opened_via_cdp"] is True
     assert result.details["extension_load_wait_attempts"] == 4
+
+
+def test_bootstrap_ignores_other_extension_and_accepts_expected_flowkit_id(tmp_path):
+    registry = make_registry(tmp_path)
+    add_account(registry, "FLOW-006")
+    ready_template(registry.profiles_root)
+    other_id = "admccjkmockfdflocgggjfgdacdodkdf"
+    cdp = FakeCdp(target_sets=[[
+        {"type": "service_worker", "url": f"chrome-extension://{other_id}/background.js"},
+        {"type": "service_worker", "url": f"chrome-extension://{EXPECTED_FLOWKIT_EXTENSION_ID}/background.js"},
+    ]])
+    runtime = FakeRuntime(status={"extension_connected": True, "extension_account_id": "FLOW-006", "account_match": True})
+    bootstrapper = ExtensionBootstrapper(registry, runtime=runtime, cdp=cdp, profiles_root=registry.profiles_root, sleep=lambda _: None)
+
+    result = bootstrapper.bootstrap_account("FLOW-006")
+
+    assert result.result == "extension_bootstrapped"
+    assert result.details["runtime_extension_id"] == EXPECTED_FLOWKIT_EXTENSION_ID
+    assert other_id in result.details["ignored_extension_ids"]
+    assert urlparse(cdp.opened_urls[0][1]).netloc == EXPECTED_FLOWKIT_EXTENSION_ID
 
 
 def test_bootstrap_extension_load_timeout_does_not_open_options(tmp_path):
@@ -1602,7 +1625,7 @@ def test_bootstrap_rejects_ambiguous_matching_service_workers(tmp_path):
     registry = make_registry(tmp_path)
     add_account(registry, "FLOW-006")
     ready_template(registry.profiles_root)
-    cdp = FakeCdp(target_sets=[[
+    cdp = FakeCdp(extension_id=None, target_sets=[[
         {"type": "service_worker", "url": "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/background.js"},
         {"type": "service_worker", "url": "chrome-extension://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/background.js"},
     ]])
@@ -1611,7 +1634,7 @@ def test_bootstrap_rejects_ambiguous_matching_service_workers(tmp_path):
 
     result = bootstrapper.bootstrap_account("FLOW-006")
 
-    assert result.result == "extension_target_ambiguous"
+    assert result.result == "expected_flowkit_extension_not_loaded"
     assert cdp.opened_urls == []
 
 
@@ -1763,7 +1786,7 @@ def test_bootstrap_retries_once_for_gpu_chrome_exit_before_cdp_ready(tmp_path):
     assert all(item["volatile_cache_cleanup"]["bootstrap_volatile_cache_cleanup_used"] is True for item in cleanup_attempts)
     launch_attempts = [item for item in attempts if "disable_skia_graphite_present" in item]
     assert [item["attempt_number"] for item in launch_attempts] == [1, 2]
-    assert all(item["browser_executable_kind"] == "system_chrome" for item in launch_attempts)
+    assert all(item["browser_executable_kind"] == "chrome_for_testing" for item in launch_attempts)
     assert all(item["disable_skia_graphite_present"] is True for item in launch_attempts)
     assert result.details["bootstrap_disable_skia_graphite"] is True
 

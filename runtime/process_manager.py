@@ -7,6 +7,7 @@ import os
 import socket
 import subprocess
 import time
+import hashlib
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -30,6 +31,8 @@ from .registry import AccountRecord, AccountRegistry
 
 FLOW_URL = "https://labs.google/fx/tools/flow"
 PYTHON_EXE = POC_ROOT / ".venv" / "Scripts" / "python.exe"
+MANAGED_CFT_VERSION = "151.0.7922.47"
+MANAGED_CFT_CHROME = POC_ROOT / "browsers" / "chrome-for-testing" / MANAGED_CFT_VERSION / "chrome-win64" / "chrome.exe"
 TH32CS_SNAPPROCESS = 0x00000002
 PROCESS_TERMINATE = 0x0001
 DWORD = ctypes.c_ulong
@@ -766,7 +769,7 @@ class RuntimeManager:
         if not self.extension_dir.exists():
             return RuntimeResult("failed", account.account_id, False, "extension_not_found", {"path": str(self.extension_dir)})
         if require_chrome and not self._find_chrome():
-            return RuntimeResult("chrome_not_found", account.account_id, False)
+            return RuntimeResult("cft_browser_not_configured", account.account_id, False, details={"cft_required": True, **self.browser_diagnostics()})
         return None
 
     def _port_conflict(self, account: AccountRecord) -> RuntimeResult | None:
@@ -800,12 +803,29 @@ class RuntimeManager:
     def _find_chrome(self) -> Path | None:
         if self.chrome_path:
             return self.chrome_path if self.chrome_path.exists() else None
-        candidates = [
-            Path(os.environ.get("PROGRAMFILES", "")) / "Google" / "Chrome" / "Application" / "chrome.exe",
-            Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Google" / "Chrome" / "Application" / "chrome.exe",
-            Path(os.environ.get("LOCALAPPDATA", "")) / "Google" / "Chrome" / "Application" / "chrome.exe",
-        ]
-        return next((path for path in candidates if path.exists()), None)
+        env_path = os.environ.get("FLOWKIT_CHROME_EXECUTABLE")
+        if env_path:
+            path = Path(env_path)
+            return path if path.is_file() else None
+        return MANAGED_CFT_CHROME if MANAGED_CFT_CHROME.is_file() else None
+
+    def browser_diagnostics(self) -> dict:
+        chrome = self._find_chrome()
+        source = "explicit" if self.chrome_path else ("environment" if os.environ.get("FLOWKIT_CHROME_EXECUTABLE") else "managed_cft")
+        details = {
+            "browser_executable": str(chrome) if chrome else None,
+            "browser_kind": "chrome_for_testing" if chrome else None,
+            "browser_version": None,
+            "browser_sha256": None,
+            "browser_source": source,
+            "cft_required": True,
+        }
+        if chrome and chrome.is_file():
+            try:
+                details["browser_sha256"] = hashlib.sha256(chrome.read_bytes()).hexdigest()
+            except Exception:
+                details["browser_sha256"] = None
+        return details
 
     def _owned_chrome_running(self, account: AccountRecord) -> bool:
         pid = self._verified_chrome_pid(account)
