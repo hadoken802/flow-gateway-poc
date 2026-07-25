@@ -7,6 +7,7 @@ import sys
 from dataclasses import asdict
 
 from .extension_bootstrap import ExtensionBootstrapResult, ExtensionBootstrapper
+from .login_verifier import LoginVerifier
 from .process_manager import RuntimeManager
 from .registry import AccountRegistry, plan_to_dict
 
@@ -23,6 +24,9 @@ def build_parser() -> argparse.ArgumentParser:
     for name in ("open-login", "start-one", "status", "stop-one"):
         parser_one = sub.add_parser(name)
         parser_one.add_argument("account_id")
+
+    verify_login = sub.add_parser("verify-login")
+    verify_login.add_argument("account_id")
 
     sub.add_parser("init-extension-template")
 
@@ -66,6 +70,11 @@ def main(argv: list[str] | None = None) -> int:
         result = getattr(manager, args.command.replace("-", "_"))(args.account_id)
         print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
         return 0 if result.ok or result.result in {"stopped", "already_stopped", "already_running", "opened"} else 1
+
+    if args.command == "verify-login":
+        result = LoginVerifier(registry).verify(args.account_id)
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        return 0 if result.login_verified else 1
 
     if args.command == "init-extension-template":
         manager = RuntimeManager(registry)
