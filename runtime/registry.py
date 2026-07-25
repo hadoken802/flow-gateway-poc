@@ -282,6 +282,23 @@ class AccountRegistry:
             )
             conn.commit()
 
+    def confirm_login_verified(self, account_id: str) -> AccountRecord | None:
+        with self.connect() as conn:
+            conn.execute("BEGIN")
+            conn.execute(
+                """
+                UPDATE flow_account_registry
+                SET status='login_verified',
+                    last_error=NULL,
+                    updated_at=?
+                WHERE account_id=?
+                """,
+                (utc_now(), account_id),
+            )
+            row = conn.execute("SELECT * FROM flow_account_registry WHERE account_id=?", (account_id,)).fetchone()
+            conn.commit()
+        return self._row_to_record(row) if row else None
+
     def mark_started(self, account_id: str, chrome_pid: int | None = None, worker_pid: int | None = None) -> None:
         with self.connect() as conn:
             conn.execute(

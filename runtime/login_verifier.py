@@ -54,6 +54,25 @@ class LoginVerificationResult:
         return asdict(self)
 
 
+@dataclass
+class ConfirmLoginResult:
+    result: str
+    ok: bool
+    account_id: str
+    previous_registration_status: str | None = None
+    registration_status: str | None = None
+    registry_updated: bool = False
+    login_verified: bool = False
+    flow_accessible: bool = False
+    google_logged_in: bool = False
+    extension_ready: bool = False
+    account_match: bool = False
+    reason: str = "unknown"
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
 class CdpReadOnlyClient:
     def list_targets(self, cdp_port: int) -> list[dict] | None:
         try:
@@ -344,3 +363,87 @@ class LoginVerifier:
         if "@" in value or "token" in lowered or "cookie" in lowered:
             return "<redacted>"
         return value
+
+
+class ConfirmLoginService:
+    def __init__(self, registry: AccountRegistry | None = None, verifier: LoginVerifier | None = None):
+        self.registry = registry or AccountRegistry()
+        self.verifier = verifier or LoginVerifier(self.registry)
+
+    def confirm(self, account_id: str) -> ConfirmLoginResult:
+        account = self.registry.get(account_id)
+        if not account:
+            return ConfirmLoginResult(
+                result="account_not_found",
+                ok=False,
+                account_id=account_id,
+                reason="account_not_found",
+            )
+
+        verification = self.verifier.verify(account_id)
+        base = self._result_base(account.account_id, account.status, account.status, verification)
+        if not self._verification_allows_registry_update(verification):
+            result = "login_verification_failed" if account.status == "login_verified" else "login_not_verified"
+            return ConfirmLoginResult(result=result, ok=False, registry_updated=False, **base)
+
+        previous_status = account.status
+        if previous_status == "login_verified":
+            return ConfirmLoginResult(
+                result="already_confirmed",
+                ok=True,
+                previous_registration_status=previous_status,
+                registration_status=previous_status,
+                registry_updated=False,
+                account_id=account.account_id,
+                login_verified=verification.login_verified,
+                flow_accessible=verification.flow_accessible,
+                google_logged_in=verification.google_logged_in,
+                extension_ready=verification.extension_ready,
+                account_match=verification.account_match,
+                reason="verified",
+            )
+
+        updated = self.registry.confirm_login_verified(account.account_id)
+        registration_status = updated.status if updated else previous_status
+        return ConfirmLoginResult(
+            result="confirmed",
+            ok=True,
+            previous_registration_status=previous_status,
+            registration_status=registration_status,
+            registry_updated=True,
+            account_id=account.account_id,
+            login_verified=verification.login_verified,
+            flow_accessible=verification.flow_accessible,
+            google_logged_in=verification.google_logged_in,
+            extension_ready=verification.extension_ready,
+            account_match=verification.account_match,
+            reason="verified",
+        )
+
+    def _result_base(self, account_id: str, previous_status: str, registration_status: str, verification: LoginVerificationResult) -> dict:
+        return {
+            "account_id": account_id,
+            "previous_registration_status": previous_status,
+            "registration_status": registration_status,
+            "login_verified": verification.login_verified,
+            "flow_accessible": verification.flow_accessible,
+            "google_logged_in": verification.google_logged_in,
+            "extension_ready": verification.extension_ready,
+            "account_match": verification.account_match,
+            "reason": verification.reason,
+        }
+
+    def _verification_allows_registry_update(self, verification: LoginVerificationResult) -> bool:
+        return bool(
+            verification.browser_running
+            and verification.worker_running
+            and verification.extension_connected
+            and verification.extension_ready
+            and verification.account_match
+            and verification.cdp_connectable
+            and verification.profile_path_matches_registry
+            and verification.google_logged_in
+            and verification.flow_accessible
+            and not verification.login_redirect_detected
+            and verification.login_verified
+        )

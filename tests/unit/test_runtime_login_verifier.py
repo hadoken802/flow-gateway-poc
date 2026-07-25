@@ -2,7 +2,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-from runtime.login_verifier import LoginVerifier
+from runtime.login_verifier import ConfirmLoginService, LoginVerificationResult, LoginVerifier
 from runtime.process_manager import CommandLineProbeResult, ProcessProbeResult
 from runtime.registry import AccountRecord, AccountRegistry
 
@@ -102,6 +102,37 @@ def flow_target(title="Flow"):
 
 def logged_in_evidence():
     return {"flow_app_marker_detected": True, "account_ui_marker_detected": True, "login_form_marker_detected": False}
+
+
+def verified_login_result(**overrides):
+    data = {
+        "account_id": "FLOW-005",
+        "browser_running": True,
+        "worker_running": True,
+        "extension_connected": True,
+        "extension_ready": True,
+        "account_match": True,
+        "cdp_connectable": True,
+        "profile_path_matches_registry": True,
+        "google_logged_in": True,
+        "flow_accessible": True,
+        "login_redirect_detected": False,
+        "login_verified": True,
+        "reason": "verified",
+    }
+    data.update(overrides)
+    return LoginVerificationResult(**data)
+
+
+class FakeVerifier:
+    def __init__(self, result):
+        self.result = result
+        self.calls = []
+
+    def verify(self, account_id):
+        self.calls.append(account_id)
+        self.result.account_id = account_id
+        return self.result
 
 
 def test_extension_not_connected_returns_false(tmp_path):
@@ -309,6 +340,159 @@ def test_verify_login_does_not_modify_profile_or_registry(tmp_path):
     assert result.login_verified is True
     assert sorted(path.relative_to(profile) for path in profile.rglob("*")) == before_files
     assert _registry_row(registry, "FLOW-005") == before_row
+
+
+def test_confirm_login_account_not_found_does_not_write_registry(tmp_path):
+    registry = make_registry(tmp_path)
+    verifier = FakeVerifier(verified_login_result(account_id="FLOW-999"))
+
+    result = ConfirmLoginService(registry, verifier=verifier).confirm("FLOW-999")
+
+    assert result.result == "account_not_found"
+    assert result.ok is False
+    assert registry.get("FLOW-999") is None
+    assert verifier.calls == []
+
+
+def test_confirm_login_false_does_not_update_status(tmp_path):
+    registry = make_registry(tmp_path)
+    add_account(registry)
+    verifier = FakeVerifier(verified_login_result(login_verified=False, reason="google_login_missing"))
+
+    result = ConfirmLoginService(registry, verifier=verifier).confirm("FLOW-005")
+
+    assert result.result == "login_not_verified"
+    assert result.registry_updated is False
+    assert registry.get("FLOW-005").status == "login_required"
+
+
+def test_confirm_login_extension_not_ready_does_not_update(tmp_path):
+    registry = make_registry(tmp_path)
+    add_account(registry)
+    verifier = FakeVerifier(verified_login_result(extension_connected=False, extension_ready=False, login_verified=False, reason="extension_not_connected"))
+
+    result = ConfirmLoginService(registry, verifier=verifier).confirm("FLOW-005")
+
+    assert result.result == "login_not_verified"
+    assert registry.get("FLOW-005").status == "login_required"
+
+
+def test_confirm_login_account_mismatch_does_not_update(tmp_path):
+    registry = make_registry(tmp_path)
+    add_account(registry)
+    verifier = FakeVerifier(verified_login_result(account_match=False, extension_ready=False, login_verified=False, reason="account_mismatch"))
+
+    result = ConfirmLoginService(registry, verifier=verifier).confirm("FLOW-005")
+
+    assert result.result == "login_not_verified"
+    assert registry.get("FLOW-005").status == "login_required"
+
+
+def test_confirm_login_flow_not_accessible_does_not_update(tmp_path):
+    registry = make_registry(tmp_path)
+    add_account(registry)
+    verifier = FakeVerifier(verified_login_result(flow_accessible=False, google_logged_in=False, login_verified=False, reason="flow_not_accessible"))
+
+    result = ConfirmLoginService(registry, verifier=verifier).confirm("FLOW-005")
+
+    assert result.result == "login_not_verified"
+    assert registry.get("FLOW-005").status == "login_required"
+
+
+def test_confirm_login_google_not_logged_in_does_not_update(tmp_path):
+    registry = make_registry(tmp_path)
+    add_account(registry)
+    verifier = FakeVerifier(verified_login_result(google_logged_in=False, login_verified=False, reason="google_login_missing"))
+
+    result = ConfirmLoginService(registry, verifier=verifier).confirm("FLOW-005")
+
+    assert result.result == "login_not_verified"
+    assert registry.get("FLOW-005").status == "login_required"
+
+
+def test_confirm_login_redirect_detected_does_not_update(tmp_path):
+    registry = make_registry(tmp_path)
+    add_account(registry)
+    verifier = FakeVerifier(verified_login_result(login_redirect_detected=True, login_verified=False, reason="login_redirect_detected"))
+
+    result = ConfirmLoginService(registry, verifier=verifier).confirm("FLOW-005")
+
+    assert result.result == "login_not_verified"
+    assert registry.get("FLOW-005").status == "login_required"
+
+
+def test_confirm_login_success_updates_login_required_to_verified_and_clears_error(tmp_path):
+    registry = make_registry(tmp_path)
+    add_account(registry)
+    registry.update_status("FLOW-005", "login_required", last_error="previous_error")
+    verifier = FakeVerifier(verified_login_result())
+
+    result = ConfirmLoginService(registry, verifier=verifier).confirm("FLOW-005")
+
+    current = registry.get("FLOW-005")
+    assert result.result == "confirmed"
+    assert result.ok is True
+    assert result.previous_registration_status == "login_required"
+    assert result.registration_status == "login_verified"
+    assert result.registry_updated is True
+    assert current.status == "login_verified"
+    assert current.last_error is None
+
+
+def test_confirm_login_already_verified_is_idempotent(tmp_path):
+    registry = make_registry(tmp_path)
+    add_account(registry)
+    registry.update_status("FLOW-005", "login_verified", last_error="kept_for_idempotency")
+    before = _registry_row(registry, "FLOW-005")
+    verifier = FakeVerifier(verified_login_result())
+
+    result = ConfirmLoginService(registry, verifier=verifier).confirm("FLOW-005")
+
+    assert result.result == "already_confirmed"
+    assert result.ok is True
+    assert result.registry_updated is False
+    assert _registry_row(registry, "FLOW-005") == before
+
+
+def test_confirm_login_already_verified_failure_does_not_downgrade(tmp_path):
+    registry = make_registry(tmp_path)
+    add_account(registry)
+    registry.update_status("FLOW-005", "login_verified", last_error=None)
+    verifier = FakeVerifier(verified_login_result(login_verified=False, flow_accessible=False, google_logged_in=False, reason="flow_not_accessible"))
+
+    result = ConfirmLoginService(registry, verifier=verifier).confirm("FLOW-005")
+
+    assert result.result == "login_verification_failed"
+    assert result.ok is False
+    assert result.registry_updated is False
+    assert registry.get("FLOW-005").status == "login_verified"
+
+
+def test_confirm_login_does_not_start_or_stop_processes_or_modify_profile(tmp_path):
+    registry = make_registry(tmp_path)
+    account = add_account(registry)
+    profile = Path(account.profile_path)
+    before_files = sorted(path.relative_to(profile) for path in profile.rglob("*"))
+    verifier = FakeVerifier(verified_login_result())
+
+    result = ConfirmLoginService(registry, verifier=verifier).confirm("FLOW-005")
+
+    assert result.ok is True
+    assert verifier.calls == ["FLOW-005"]
+    assert sorted(path.relative_to(profile) for path in profile.rglob("*")) == before_files
+
+
+def test_confirm_login_output_does_not_include_sensitive_values(tmp_path):
+    registry = make_registry(tmp_path)
+    add_account(registry)
+    verifier = FakeVerifier(verified_login_result(reason="verified"))
+
+    output = json.dumps(ConfirmLoginService(registry, verifier=verifier).confirm("FLOW-005").to_dict())
+
+    assert "Cookie" not in output
+    assert "token" not in output.lower()
+    assert "user@example.com" not in output
+    assert "accounts.google.com/signin" not in output
 
 
 def _registry_row(registry, account_id):
