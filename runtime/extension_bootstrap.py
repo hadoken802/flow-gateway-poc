@@ -536,9 +536,6 @@ class ExtensionBootstrapper:
     def copy_template_to_profile(self, account: AccountRecord) -> ExtensionBootstrapResult:
         if not self.template_ready():
             return ExtensionBootstrapResult("extension_template_not_ready", account.account_id, False, self.template_status())
-        template_gate = self._profile_extension_state_gate(self.template_path)
-        if not template_gate["template_extension_state_ready"]:
-            return ExtensionBootstrapResult("template_extension_state_missing", account.account_id, False, template_gate)
         target = Path(account.profile_path)
         if target.exists():
             return ExtensionBootstrapResult("profile_exists", account.account_id, True, {"profile_path": str(target)})
@@ -614,8 +611,6 @@ class ExtensionBootstrapper:
             **profile_extension_gate,
             **self._bootstrap_url_extension_diagnostics(url, manifest.extension_id),
         }
-        if profile_initialization_mode in {"copied_to_missing_profile", "rebuilt_registered_empty_profile"} and not profile_extension_gate["template_extension_state_ready"]:
-            return ExtensionBootstrapResult("template_extension_state_missing", account.account_id, False, initialization_details)
         if profile_initialization_mode == "rebuilt_registered_empty_profile":
             volatile_cleanup = self._cleanup_bootstrap_volatile_cache(account, initialization_details, attempt=1)
             initialization_details.update(volatile_cleanup["details"])
@@ -1060,14 +1055,8 @@ class ExtensionBootstrapper:
             "expected_extension_id_present_in_preferences": expected_in_preferences,
             **secure_details,
             "expected_extension_local_state_present": local_state_present,
-            "template_extension_state_ready": bool(
-                marker_details["template_marker_valid"]
-                and marker_details["template_marker_extension_id_match"]
-                and secure_details["expected_extension_id_present_in_secure_preferences"]
-                and secure_details["secure_preferences_extension_manifest_present"]
-                and not secure_details["secure_preferences_extension_disabled_or_blocked"]
-                and local_state_present
-            ),
+            "template_extension_state_ready": bool(marker_details["template_marker_valid"] and marker_details["template_marker_extension_id_match"]),
+            "template_base_validation_passed": bool(marker_details["template_marker_valid"] and marker_details["template_marker_extension_id_match"]),
         }
 
     def _file_contains(self, path: Path, text: str) -> bool:
@@ -2045,6 +2034,10 @@ class ExtensionBootstrapper:
         version = data.get("version")
         service_worker = (((data.get("background") or {}).get("service_worker")) or "").strip()
         if not options_page or not version or not service_worker:
+            return None
+        if not (self.extension_dir / str(options_page)).is_file():
+            return None
+        if not (self.extension_dir / str(service_worker)).is_file():
             return None
         return ExtensionIdentity(
             extension_id=EXPECTED_FLOWKIT_EXTENSION_ID,

@@ -292,6 +292,31 @@ def write_manifest(extension_dir, version="0.2.0"):
         json.dumps({"name": "Flow Kit", "version": version, "options_page": "options.html", "background": {"service_worker": "background.js"}}),
         encoding="utf-8",
     )
+    (extension_dir / "options.html").write_text("<html></html>", encoding="utf-8")
+    (extension_dir / "background.js").write_text("console.log('flowkit');", encoding="utf-8")
+
+
+def ready_template_for_extension(root, extension_dir):
+    template = root / TEMPLATE_PROFILE_NAME
+    (template / "Default").mkdir(parents=True)
+    manifest = (extension_dir / "manifest.json").read_bytes()
+    manifest_data = json.loads(manifest.decode("utf-8"))
+    marker = {
+        "template": TEMPLATE_PROFILE_NAME,
+        "ready": True,
+        "extension_id": EXPECTED_FLOWKIT_EXTENSION_ID,
+        "extension_version": manifest_data["version"],
+        "options_page": manifest_data["options_page"],
+        "service_worker": manifest_data["background"]["service_worker"],
+        "extension_dir": str(extension_dir.resolve()),
+        "manifest_sha256": hashlib.sha256(manifest).hexdigest(),
+        "first_launch_verified": True,
+        "persistence_verified": True,
+        "verified_without_load_extension": True,
+        "verified_at": "2026-07-23T00:00:00Z",
+    }
+    (template / TEMPLATE_READY_FILE).write_text(json.dumps(marker), encoding="utf-8")
+    return template
 
 
 def test_template_path_and_missing_template(tmp_path):
@@ -853,40 +878,91 @@ def test_registered_empty_repair_allows_missing_regular_preferences_extension_en
     assert runtime.worker_only_started == ["FLOW-006"]
 
 
-def test_registered_empty_repair_blocks_when_secure_preferences_extension_state_missing(tmp_path):
+def test_registered_empty_repair_allows_missing_secure_preferences_extension_state(tmp_path):
     registry = make_registry(tmp_path)
     account = add_account(registry, "FLOW-006")
     Path(account.profile_path).mkdir(parents=True)
     ready_template(registry.profiles_root)
     template = registry.profiles_root / TEMPLATE_PROFILE_NAME
     (template / "Default" / "Secure Preferences").write_text("{}", encoding="utf-8")
-    runtime = FakeRuntime()
-    bootstrapper = ExtensionBootstrapper(registry, runtime=runtime, cdp=FakeCdp(), profiles_root=registry.profiles_root)
+    runtime = FakeRuntime(status={"extension_connected": True, "extension_account_id": "FLOW-006", "account_match": True})
+    bootstrapper = ExtensionBootstrapper(registry, runtime=runtime, cdp=FakeCdp(), profiles_root=registry.profiles_root, sleep=lambda _: None)
 
     result = bootstrapper.bootstrap_account("FLOW-006", repair=True)
 
-    assert result.result == "template_extension_state_missing"
+    assert result.result == "extension_bootstrapped"
     assert result.details["expected_extension_id_present_in_secure_preferences"] is False
-    assert runtime.launched == []
-    assert runtime.worker_only_started == []
+    assert result.details["secure_preferences_extension_manifest_present"] is False
+    assert runtime.launched
+    assert runtime.worker_only_started == ["FLOW-006"]
 
 
-def test_registered_empty_repair_blocks_when_template_local_extension_state_missing(tmp_path):
+def test_registered_empty_repair_allows_empty_secure_preferences_manifest_diagnostic(tmp_path):
+    registry = make_registry(tmp_path)
+    account = add_account(registry, "FLOW-006")
+    Path(account.profile_path).mkdir(parents=True)
+    ready_template(registry.profiles_root)
+    template = registry.profiles_root / TEMPLATE_PROFILE_NAME
+    data = json.loads((template / "Default" / "Secure Preferences").read_text(encoding="utf-8"))
+    data["extensions"]["settings"][EXPECTED_FLOWKIT_EXTENSION_ID]["manifest"] = {}
+    (template / "Default" / "Secure Preferences").write_text(json.dumps(data), encoding="utf-8")
+    runtime = FakeRuntime(status={"extension_connected": True, "extension_account_id": "FLOW-006", "account_match": True})
+    bootstrapper = ExtensionBootstrapper(registry, runtime=runtime, cdp=FakeCdp(), profiles_root=registry.profiles_root, sleep=lambda _: None)
+
+    result = bootstrapper.bootstrap_account("FLOW-006", repair=True)
+
+    assert result.result == "extension_bootstrapped"
+    assert result.details["secure_preferences_extension_manifest_present"] is True
+    assert result.details["template_base_validation_passed"] is True
+    assert runtime.launched
+
+
+def test_registered_empty_repair_allows_missing_template_local_extension_state(tmp_path):
     registry = make_registry(tmp_path)
     account = add_account(registry, "FLOW-006")
     Path(account.profile_path).mkdir(parents=True)
     ready_template(registry.profiles_root)
     template = registry.profiles_root / TEMPLATE_PROFILE_NAME
     (template / "Default" / "Local Extension Settings" / EXPECTED_FLOWKIT_EXTENSION_ID).rmdir()
-    runtime = FakeRuntime()
-    bootstrapper = ExtensionBootstrapper(registry, runtime=runtime, cdp=FakeCdp(), profiles_root=registry.profiles_root)
+    runtime = FakeRuntime(status={"extension_connected": True, "extension_account_id": "FLOW-006", "account_match": True})
+    bootstrapper = ExtensionBootstrapper(registry, runtime=runtime, cdp=FakeCdp(), profiles_root=registry.profiles_root, sleep=lambda _: None)
 
     result = bootstrapper.bootstrap_account("FLOW-006", repair=True)
 
-    assert result.result == "template_extension_state_missing"
+    assert result.result == "extension_bootstrapped"
     assert result.details["expected_extension_local_state_present"] is False
-    assert runtime.launched == []
-    assert runtime.worker_only_started == []
+    assert runtime.launched
+    assert runtime.worker_only_started == ["FLOW-006"]
+
+
+def test_template_source_files_are_required_for_template_ready(tmp_path):
+    registry = make_registry(tmp_path)
+    account = add_account(registry, "FLOW-006")
+    extension_dir = tmp_path / "extension"
+    write_manifest(extension_dir)
+    ready_template_for_extension(registry.profiles_root, extension_dir)
+
+    for filename in ("manifest.json", "options.html", "background.js"):
+        broken = tmp_path / f"missing-{filename}"
+        broken_registry = make_registry(broken)
+        broken_account = add_account(broken_registry, "FLOW-006")
+        broken_extension = broken / "extension"
+        write_manifest(broken_extension)
+        ready_template_for_extension(broken_registry.profiles_root, broken_extension)
+        (broken_extension / filename).unlink()
+        bootstrapper = ExtensionBootstrapper(broken_registry, runtime=FakeRuntime(), cdp=FakeCdp(), profiles_root=broken_registry.profiles_root, extension_dir=broken_extension)
+
+        result = bootstrapper.copy_template_to_profile(broken_account)
+
+        assert result.result == "extension_template_not_ready"
+
+    marker = registry.profiles_root / TEMPLATE_PROFILE_NAME / TEMPLATE_READY_FILE
+    marker_data = json.loads(marker.read_text(encoding="utf-8"))
+    marker_data["manifest_sha256"] = "0" * 64
+    marker.write_text(json.dumps(marker_data), encoding="utf-8")
+    bootstrapper = ExtensionBootstrapper(registry, runtime=FakeRuntime(), cdp=FakeCdp(), profiles_root=registry.profiles_root, extension_dir=extension_dir)
+
+    assert bootstrapper.copy_template_to_profile(account).result == "extension_template_not_ready"
 
 
 def test_registered_empty_repair_blocks_when_template_marker_missing_or_wrong_id(tmp_path):
