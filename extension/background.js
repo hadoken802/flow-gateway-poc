@@ -405,38 +405,51 @@ function clearKeepaliveTimer() {
   keepaliveTimer = null;
 }
 
+function fallbackToWebSocket(msg) {
+  if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+}
+
 function sendToAgent(msg) {
   // API responses (with msg.id) go via HTTP — immune to WS disconnect
   if (msg.id) {
     const agentHttpUrl = getAgentHttpUrl();
     if (!agentHttpUrl) {
-      if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+      fallbackToWebSocket(msg);
       return;
     }
-    fetch(getAgentHttpUrl() + '/api/ext/callback', {
+    fetch(agentHttpUrl + '/api/ext/callback', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(msg),
-    }).catch(() => {
-      // HTTP failed — fallback to WS
-      if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
-    });
+    }).then(async (response) => {
+      if (!response.ok) {
+        fallbackToWebSocket(msg);
+        return;
+      }
+      let data = null;
+      try {
+        data = await response.json();
+      } catch (_) {
+        fallbackToWebSocket(msg);
+        return;
+      }
+      if (data?.ok !== true) fallbackToWebSocket(msg);
+    }).catch(() => fallbackToWebSocket(msg));
     return;
   }
   // Non-response messages (ping, status) or no secret yet — use WS
-  if (ws?.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(msg));
-  }
+  fallbackToWebSocket(msg);
 }
 
 function getAgentHttpUrl() {
   try {
-    if (!wsUrl) return null;
-    const url = new URL(wsUrl);
-    const protocol = url.protocol === 'wss:' ? 'https:' : 'http:';
-    const mappedPorts = { 'FLOW-001': '8100', 'FLOW-002': '8112', 'FLOW-003': '8113' };
-    const port = mappedPorts[accountId] || (url.port === '9212' ? '8112' : url.port === '9213' ? '8113' : '8100');
-    const httpUrl = `${protocol}//${url.hostname}:${port}`;
+    if (!apiUrl) return null;
+    const url = new URL(apiUrl);
+    const port = Number(url.port);
+    if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || port < 1 || port > 65535) {
+      return null;
+    }
+    const httpUrl = `http://127.0.0.1:${port}`;
     console.log(`[FlowAgent] HTTP callback target ${httpUrl}`);
     return httpUrl;
   } catch {

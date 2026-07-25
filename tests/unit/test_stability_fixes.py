@@ -6,10 +6,22 @@ import pytest
 
 def test_extension_http_callback_does_not_use_ws_port():
     text = Path("extension/background.js").read_text(encoding="utf-8")
-    assert "mappedPorts = { 'FLOW-001': '8100', 'FLOW-002': '8112', 'FLOW-003': '8113' }" in text
+    assert "mappedPorts" not in text
     assert "fetch(wsUrl" not in text
-    assert "fetch(getAgentHttpUrl() + '/api/ext/callback'" in text
-    assert "url.port === '9213' ? '8113'" in text
+    assert "fetch(agentHttpUrl + '/api/ext/callback'" in text
+    assert "url.port === '9213' ? '8113'" not in text
+    assert "new URL(apiUrl)" in text
+    assert "url.hostname !== '127.0.0.1'" in text
+    assert "http://127.0.0.1:${port}" in text
+    assert "fallbackToWebSocket(msg)" in text
+    assert "data?.ok !== true" in text
+
+
+def test_extension_http_callback_targets_flow_024_api_url():
+    text = Path("extension/background.js").read_text(encoding="utf-8")
+    assert "accountId] ||" not in text
+    assert "apiUrl" in text
+    assert "8121" not in text
 
 
 def test_extension_reconnect_uses_single_timer_and_single_socket():

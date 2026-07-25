@@ -13,7 +13,7 @@ from .worker_provider import WorkerConfig, WorkerSnapshot, build_worker_provider
 class GatewayScheduler:
     def __init__(self, settings: GatewaySettings, worker_client=None, worker_provider=None):
         self.settings = settings
-        self.worker_client = worker_client or WorkerClient()
+        self.worker_client = worker_client or WorkerClient(settings.worker_submit_timeout_seconds)
         self.db = None
         self.worker_provider = worker_provider or build_worker_provider(settings)
         self.worker_snapshot = self._load_worker_snapshot()
@@ -113,11 +113,13 @@ class GatewayScheduler:
         for task in await crud.list_tasks(self.db):
             if self.settings.dry_run and task["status"] in {"assigning", "submitted", "processing", "waiting_recovery"}:
                 await crud.update_task_status(self.db, task["task_id"], "queued")
-            elif not self.settings.dry_run and task["status"] in {"assigning", "submitted", "processing", "waiting_recovery", "manual_review"}:
+            elif not self.settings.dry_run and task["status"] in {"assigning", "submitted", "processing", "waiting_recovery"}:
                 if task.get("worker_job_id"):
                     self._real_tasks[task["task_id"]] = asyncio.create_task(self._run_real_task(task["task_id"], task["assigned_account_id"]))
                 else:
                     await crud.update_task_status(self.db, task["task_id"], "queued")
+            elif not self.settings.dry_run and task["status"] == "manual_review" and task.get("worker_job_id"):
+                self._real_tasks[task["task_id"]] = asyncio.create_task(self._run_real_task(task["task_id"], task["assigned_account_id"]))
         await self.db.execute("UPDATE flow_accounts SET current_task_id=NULL WHERE current_task_id IS NOT NULL")
         await self.db.commit()
         await self.refresh_workers()
@@ -133,6 +135,10 @@ class GatewayScheduler:
             await asyncio.sleep(0.05)
 
     async def create_task(self, payload):
+        if not self.settings.dry_run:
+            project_id = payload.get("project_id")
+            if not isinstance(project_id, str) or not project_id.strip():
+                raise ValueError("project_id_required_for_real_task")
         if not self.settings.dry_run and self.settings.canary_only:
             existing = sum(1 for task in await crud.list_tasks(self.db) if task.get("submitted_at") != "dry-run")
             if existing >= self.settings.canary_limit:
@@ -319,6 +325,19 @@ class GatewayScheduler:
         finally:
             self._dry_tasks.pop(task_id, None)
 
+    async def _increment_attempt_count(self, task_id):
+        async with self.assignment_lock:
+            await self.db.execute(
+                """
+                UPDATE flow_tasks
+                SET attempt_count=attempt_count+1,
+                    updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                WHERE task_id=?
+                """,
+                (task_id,),
+            )
+            await self.db.commit()
+
     async def _run_real_task(self, task_id, account_id):
         try:
             task = await crud.get_task(self.db, task_id)
@@ -326,25 +345,61 @@ class GatewayScheduler:
             if not task or not worker:
                 return
             while not task.get("worker_job_id") and not self._stopping:
+                if int(task.get("attempt_count") or 0) >= self.settings.real_submit_max_attempts:
+                    async with self.assignment_lock:
+                        await crud.release_task_for_manual_review(
+                            self.db,
+                            task_id,
+                            account_id,
+                            error_code="real_submit_attempts_exhausted",
+                            error_message="Worker submit attempt limit reached",
+                            remaining_credits=task.get("remaining_credits"),
+                        )
+                    return
+                project_id = task.get("project_id")
+                if not isinstance(project_id, str) or not project_id.strip():
+                    async with self.assignment_lock:
+                        await crud.release_task_for_manual_review(
+                            self.db,
+                            task_id,
+                            account_id,
+                            error_code="project_id_required_for_real_task",
+                            error_message="Real Gateway tasks require a pre-created Flow project_id",
+                            remaining_credits=task.get("remaining_credits"),
+                        )
+                    return
                 payload = {
                     "idempotency_key": task["idempotency_key"],
-                    "project_id": task.get("project_id") or f"gateway-{task_id}",
+                    "project_id": project_id,
                     "image_path": task["image_path"],
                     "prompt": task["prompt"],
                     "duration": task["duration"],
                     "aspect_ratio": task["aspect_ratio"],
                 }
                 try:
+                    await self._increment_attempt_count(task_id)
                     result = await self.worker_client.submit_omni_video(worker, payload)
                 except Exception as exc:
                     async with self.assignment_lock:
-                        await crud.update_task_status(self.db, task_id, "waiting_recovery", error_code=type(exc).__name__, error_message=str(exc)[:500])
-                    await asyncio.sleep(2)
-                    task = await crud.get_task(self.db, task_id)
-                    continue
+                        await crud.release_task_for_manual_review(
+                            self.db,
+                            task_id,
+                            account_id,
+                            error_code=type(exc).__name__[:120],
+                            error_message=str(exc)[:500],
+                            remaining_credits=task.get("remaining_credits"),
+                        )
+                    return
                 worker_job_id = result.get("job_id") or result.get("worker_job_id")
                 if not worker_job_id:
-                    await crud.update_task_status(self.db, task_id, "manual_review", error_code="missing_worker_job_id", error_message=str(result)[:500])
+                    await crud.release_task_for_manual_review(
+                        self.db,
+                        task_id,
+                        account_id,
+                        error_code="missing_worker_job_id",
+                        error_message=str(result)[:500],
+                        remaining_credits=result.get("remaining_credits"),
+                    )
                     return
                 async with self.assignment_lock:
                     await crud.mark_submitted(

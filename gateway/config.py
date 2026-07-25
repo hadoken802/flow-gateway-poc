@@ -32,6 +32,28 @@ def _float_tuple(name: str, default: tuple[float, float, float]) -> tuple[float,
     return (float(parts[0]), float(parts[1]), float(parts[2]))
 
 
+def _positive_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, str(default))
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be a positive integer") from None
+    if value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _positive_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, str(default))
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be a positive number") from None
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive number")
+    return value
+
+
 @dataclass
 class GatewaySettings:
     api_host: str = "127.0.0.1"
@@ -46,6 +68,8 @@ class GatewaySettings:
     worker_source: str = "runtime_registry"
     dry_run_step_seconds: tuple[float, float, float] = (1.0, 2.0, 3.0)
     worker_refresh_interval_seconds: float = 1.0
+    real_submit_max_attempts: int = 1
+    worker_submit_timeout_seconds: float = 300.0
 
     @classmethod
     def from_env(cls) -> "GatewaySettings":
@@ -60,4 +84,6 @@ class GatewaySettings:
             db_path=Path(os.environ.get("GATEWAY_DB_PATH", r"D:\Codex\projects\flow_gateway_poc\data\gateway.db")),
             worker_source=os.environ.get("FLOWKIT_GATEWAY_WORKER_SOURCE", "runtime_registry"),
             dry_run_step_seconds=_float_tuple("DRY_RUN_STEP_SECONDS", (1.0, 2.0, 3.0)),
+            real_submit_max_attempts=_positive_int("REAL_SUBMIT_MAX_ATTEMPTS", 1),
+            worker_submit_timeout_seconds=_positive_float("GATEWAY_WORKER_SUBMIT_TIMEOUT_SECONDS", 300.0),
         )

@@ -3,6 +3,11 @@ import httpx
 
 
 class WorkerClient:
+    def __init__(self, submit_timeout_seconds: float = 300.0):
+        if submit_timeout_seconds <= 0:
+            raise ValueError("submit_timeout_seconds must be positive")
+        self.submit_timeout_seconds = submit_timeout_seconds
+
     async def inspect(self, worker):
         async with httpx.AsyncClient(timeout=5.0) as client:
             health = (await client.get(f"{worker.api_url}/health")).json()
@@ -19,7 +24,7 @@ class WorkerClient:
 
     async def submit_omni_video(self, *_args, **_kwargs):
         worker, payload = _args[0], _args[1]
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=self.submit_timeout_seconds) as client:
             return (await client.post(f"{worker.api_url}/api/test/omni-video", json=payload)).raise_for_status().json()
 
     async def get_omni_video(self, worker, worker_job_id):

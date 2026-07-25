@@ -34,12 +34,15 @@ class FakeRealWorkerClient(FakeWorkerClient):
         self.fail_first_submit = False
         self.output_dir = output_dir
         self.retry_downloads = []
+        self.return_missing_job_id = False
 
     async def submit_omni_video(self, worker, payload):
         self.submits.append((worker.account_id, dict(payload)))
         if self.fail_first_submit:
             self.fail_first_submit = False
             raise TimeoutError("lost response")
+        if self.return_missing_job_id:
+            return {"status": "accepted_without_job", "remaining_credits": self.states[worker.account_id]["credits"]}
         job_id = f"job-{payload['idempotency_key']}"
         video_path = f"D:/out/{job_id}.mp4"
         if self.output_dir:
@@ -262,6 +265,58 @@ async def test_real_mode_posts_to_worker_and_passes_idempotency_key():
 
 
 @pytest.mark.asyncio
+async def test_dry_run_allows_missing_project_id():
+    from gateway.config import GatewaySettings
+
+    states = {"FLOW-001": {"credits": 5}, "FLOW-002": {"credits": 50}, "FLOW-003": {"credits": 50}}
+    settings = GatewaySettings(db_path=local_db("dry_missing_project"), dry_run=True, dry_run_step_seconds=(0.01, 0.01, 0.01))
+    scheduler = make_scheduler(settings, FakeWorkerClient(states))
+    await scheduler.start()
+    task = await scheduler.create_task({"idempotency_key": "dry-no-project", "image_path": "D:/img.png", "prompt": "p", "duration": 10, "aspect_ratio": "9:16"})
+    assert task["project_id"] is None
+    await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_real_mode_rejects_missing_project_id_before_database_write():
+    from gateway.config import GatewaySettings
+
+    states = {"FLOW-001": {"credits": 5}, "FLOW-002": {"credits": 50}, "FLOW-003": {"credits": 50}}
+    settings = GatewaySettings(db_path=local_db("real_missing_project"), dry_run=False)
+    scheduler = make_scheduler(settings, FakeWorkerClient(states))
+    await scheduler.start()
+    with pytest.raises(ValueError, match="project_id_required_for_real_task"):
+        await scheduler.create_task({"idempotency_key": "real-no-project", "image_path": "D:/img.png", "prompt": "p", "duration": 10, "aspect_ratio": "9:16"})
+    assert await scheduler.list_tasks() == []
+    await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_real_mode_missing_worker_job_id_releases_account_for_manual_review():
+    from gateway.config import GatewaySettings
+
+    states = {"FLOW-001": {"credits": 5}, "FLOW-002": {"credits": 50}, "FLOW-003": {"credits": 50}}
+    client = FakeRealWorkerClient(states)
+    client.return_missing_job_id = True
+    settings = GatewaySettings(db_path=local_db("missing_worker_job"), dry_run=False)
+    scheduler = make_scheduler(settings, client)
+    await scheduler.start()
+    await scheduler.create_task({"idempotency_key": "missing-job", "project_id": "project-a", "image_path": "D:/img.png", "prompt": "p", "duration": 10, "aspect_ratio": "9:16", "preferred_account_id": "FLOW-002"})
+    for _ in range(100):
+        task = (await scheduler.list_tasks())[0]
+        if task["status"] == "manual_review":
+            break
+        await asyncio.sleep(0.02)
+    task = (await scheduler.list_tasks())[0]
+    assert task["status"] == "manual_review"
+    assert task["attempt_count"] == 1
+    assert task["worker_job_id"] is None
+    accounts = {a["account_id"]: a for a in await scheduler.list_accounts()}
+    assert accounts["FLOW-002"]["current_task_id"] is None
+    await scheduler.stop()
+
+
+@pytest.mark.asyncio
 async def test_real_mode_does_not_repost_after_worker_job_id_is_saved():
     from gateway.config import GatewaySettings
 
@@ -270,7 +325,7 @@ async def test_real_mode_does_not_repost_after_worker_job_id_is_saved():
     settings = GatewaySettings(db_path=local_db("real_restart"), dry_run=False)
     scheduler = make_scheduler(settings, client)
     await scheduler.start()
-    await scheduler.create_task({"idempotency_key": "real-2", "image_path": "D:/img.png", "prompt": "p", "duration": 10, "aspect_ratio": "9:16", "preferred_account_id": "FLOW-002"})
+    await scheduler.create_task({"idempotency_key": "real-2", "project_id": "project-a", "image_path": "D:/img.png", "prompt": "p", "duration": 10, "aspect_ratio": "9:16", "preferred_account_id": "FLOW-002"})
     for _ in range(50):
         if client.submits:
             break
@@ -306,6 +361,7 @@ async def test_real_mode_retries_download_for_existing_worker_job_without_new_ta
     db = await connect(settings.db_path)
     created = await crud.create_task(db, {
         "idempotency_key": "existing-task",
+        "project_id": "project-a",
         "image_path": "D:/img.png",
         "prompt": "p",
         "duration": 10,
@@ -367,6 +423,7 @@ async def test_real_mode_recovers_manual_review_task_with_existing_worker_job():
     db = await connect(settings.db_path)
     created = await crud.create_task(db, {
         "idempotency_key": "manual-existing-task",
+        "project_id": "project-a",
         "image_path": "D:/img.png",
         "prompt": "p",
         "duration": 10,
@@ -422,14 +479,53 @@ async def test_real_mode_retries_same_idempotency_key_after_lost_http_response()
     settings = GatewaySettings(db_path=local_db("lost_response"), dry_run=False)
     scheduler = make_scheduler(settings, client)
     await scheduler.start()
-    await scheduler.create_task({"idempotency_key": "lost-1", "image_path": "D:/img.png", "prompt": "p", "duration": 10, "aspect_ratio": "9:16", "preferred_account_id": "FLOW-002"})
+    await scheduler.create_task({"idempotency_key": "lost-1", "project_id": "project-a", "image_path": "D:/img.png", "prompt": "p", "duration": 10, "aspect_ratio": "9:16", "preferred_account_id": "FLOW-002"})
     for _ in range(200):
         task = (await scheduler.list_tasks())[0]
         if task["status"] == "completed":
             break
         await asyncio.sleep(0.03)
-    assert [payload["idempotency_key"] for _, payload in client.submits] == ["lost-1", "lost-1"]
-    assert (await scheduler.list_tasks())[0]["worker_job_id"] == "job-lost-1"
+    task = (await scheduler.list_tasks())[0]
+    assert [payload["idempotency_key"] for _, payload in client.submits] == ["lost-1"]
+    assert task["attempt_count"] == 1
+    assert task["status"] == "manual_review"
+    assert task["worker_job_id"] is None
+    accounts = {a["account_id"]: a for a in await scheduler.list_accounts()}
+    assert accounts["FLOW-002"]["current_task_id"] is None
+    await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_manual_review_without_worker_job_id_is_not_requeued_on_restart():
+    from gateway.config import GatewaySettings
+    from gateway import crud
+    from gateway.db import connect
+
+    states = {"FLOW-001": {"credits": 5}, "FLOW-002": {"credits": 50}, "FLOW-003": {"credits": 50}}
+    settings = GatewaySettings(db_path=local_db("manual_review_no_job"), dry_run=False)
+    db = await connect(settings.db_path)
+    created = await crud.create_task(db, {
+        "idempotency_key": "manual-no-job",
+        "project_id": "project-a",
+        "image_path": "D:/img.png",
+        "prompt": "p",
+        "duration": 10,
+        "aspect_ratio": "9:16",
+        "preferred_account_id": "FLOW-002",
+    })
+    await db.execute(
+        "UPDATE flow_tasks SET status='manual_review', assigned_account_id='FLOW-002', attempt_count=1 WHERE task_id=?",
+        (created["task_id"],),
+    )
+    await db.commit()
+    await db.close()
+
+    client = FakeRealWorkerClient(states)
+    scheduler = make_scheduler(settings, client)
+    await scheduler.start()
+    task = (await scheduler.list_tasks())[0]
+    assert task["status"] == "manual_review"
+    assert client.submits == []
     await scheduler.stop()
 
 
@@ -443,11 +539,11 @@ async def test_canary_two_tasks_bind_flow_002_and_flow_003_without_double_accoun
     scheduler = make_scheduler(settings, client)
     await scheduler.start()
     await scheduler.create_tasks([
-        {"idempotency_key": "canary-1", "image_path": "D:/1.png", "prompt": "p1", "duration": 10, "aspect_ratio": "9:16", "preferred_account_id": "FLOW-002"},
-        {"idempotency_key": "canary-2", "image_path": "D:/2.png", "prompt": "p2", "duration": 10, "aspect_ratio": "9:16", "preferred_account_id": "FLOW-003"},
+        {"idempotency_key": "canary-1", "project_id": "project-a", "image_path": "D:/1.png", "prompt": "p1", "duration": 10, "aspect_ratio": "9:16", "preferred_account_id": "FLOW-002"},
+        {"idempotency_key": "canary-2", "project_id": "project-b", "image_path": "D:/2.png", "prompt": "p2", "duration": 10, "aspect_ratio": "9:16", "preferred_account_id": "FLOW-003"},
     ])
     with pytest.raises(ValueError):
-        await scheduler.create_task({"idempotency_key": "canary-3", "image_path": "D:/3.png", "prompt": "p3", "duration": 10, "aspect_ratio": "9:16"})
+        await scheduler.create_task({"idempotency_key": "canary-3", "project_id": "project-c", "image_path": "D:/3.png", "prompt": "p3", "duration": 10, "aspect_ratio": "9:16"})
     for _ in range(100):
         if (await scheduler.pool_status())["completed_count"] == 2:
             break
@@ -458,3 +554,32 @@ async def test_canary_two_tasks_bind_flow_002_and_flow_003_without_double_accoun
     assert len(client.submits) == 2
     assert {account for account, _ in client.submits} == {"FLOW-002", "FLOW-003"}
     await scheduler.stop()
+
+
+def test_gateway_submit_timeout_defaults_and_env_override(monkeypatch):
+    from gateway.config import GatewaySettings
+    from gateway.worker_client import WorkerClient
+
+    monkeypatch.delenv("GATEWAY_WORKER_SUBMIT_TIMEOUT_SECONDS", raising=False)
+    settings = GatewaySettings.from_env()
+    assert settings.worker_submit_timeout_seconds == 300.0
+    assert WorkerClient().submit_timeout_seconds == 300.0
+
+    monkeypatch.setenv("GATEWAY_WORKER_SUBMIT_TIMEOUT_SECONDS", "45")
+    assert GatewaySettings.from_env().worker_submit_timeout_seconds == 45.0
+
+    monkeypatch.setenv("GATEWAY_WORKER_SUBMIT_TIMEOUT_SECONDS", "0")
+    with pytest.raises(ValueError, match="GATEWAY_WORKER_SUBMIT_TIMEOUT_SECONDS"):
+        GatewaySettings.from_env()
+
+
+def test_canary_script_uses_single_run_isolated_database():
+    text = Path("start_gateway_real_canary.bat").read_text(encoding="utf-8")
+    assert "set POOL_MAX_CONCURRENCY=1" in text
+    assert "set CANARY_LIMIT=1" in text
+    assert "set REAL_SUBMIT_MAX_ATTEMPTS=1" in text
+    assert "set GATEWAY_WORKER_SUBMIT_TIMEOUT_SECONDS=300" in text
+    assert "set FLOWKIT_GATEWAY_WORKER_SOURCE=runtime_registry" in text
+    assert "flow024-real-canary-" in text
+    assert "set GATEWAY_DB_PATH=%CANARY_RUN_DIR%\\gateway.db" in text
+    assert "D:\\Codex\\projects\\flow_gateway_poc\\data\\gateway.db" not in text
