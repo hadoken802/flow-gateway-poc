@@ -533,6 +533,9 @@ class ExtensionBootstrapper:
     def copy_template_to_profile(self, account: AccountRecord) -> ExtensionBootstrapResult:
         if not self.template_ready():
             return ExtensionBootstrapResult("extension_template_not_ready", account.account_id, False, self.template_status())
+        template_gate = self._profile_extension_state_gate(self.template_path)
+        if not template_gate["template_extension_state_ready"]:
+            return ExtensionBootstrapResult("template_extension_state_missing", account.account_id, False, template_gate)
         target = Path(account.profile_path)
         if target.exists():
             return ExtensionBootstrapResult("profile_exists", account.account_id, True, {"profile_path": str(target)})
@@ -555,6 +558,7 @@ class ExtensionBootstrapper:
                 "profile_path": str(target),
                 "credential_storage_sanitized": True,
                 "credential_storage_policy_version": CREDENTIAL_STORAGE_POLICY_VERSION,
+                **self._profile_extension_state_gate(target),
             },
         )
 
@@ -567,14 +571,15 @@ class ExtensionBootstrapper:
             return validation
         profile = Path(account.profile_path)
         credential_storage_sanitized = False
-        profile_initialization_mode = "repaired_existing_profile" if repair else None
+        profile_initialization_mode = None
+        safety = None
         if not profile.exists():
             copied = self.copy_template_to_profile(account)
             if not copied.ok:
                 return copied
             credential_storage_sanitized = bool((copied.details or {}).get("credential_storage_sanitized"))
             profile_initialization_mode = "copied_to_missing_profile"
-        elif not repair:
+        else:
             safety = self._profile_rebuild_safety(account)
             if safety["profile_state"] == "registered_empty" and safety["safe_to_rebuild"]:
                 cleanup = self._remove_registered_empty_profile(account, safety)
@@ -585,8 +590,10 @@ class ExtensionBootstrapper:
                     return copied
                 credential_storage_sanitized = bool((copied.details or {}).get("credential_storage_sanitized"))
                 profile_initialization_mode = "rebuilt_registered_empty_profile"
-            elif safety["profile_state"] == "bootstrapped_profile":
+            elif not repair and safety["profile_state"] == "bootstrapped_profile":
                 return ExtensionBootstrapResult("profile_exists", account.account_id, True, {"profile_path": str(profile), **safety})
+            elif repair:
+                profile_initialization_mode = "repaired_existing_profile"
             else:
                 return ExtensionBootstrapResult("profile_partial_requires_manual_review", account.account_id, False, safety)
 
@@ -595,11 +602,17 @@ class ExtensionBootstrapper:
             return ExtensionBootstrapResult("extension_missing", account.account_id, False, {"extension_dir": str(self.extension_dir)})
         nonce = secrets.token_urlsafe(18)
         url = self.bootstrap_url(account, nonce, manifest.extension_id)
+        profile_extension_gate = self._profile_extension_state_gate(profile)
         initialization_details = {
             "profile_initialization_mode": profile_initialization_mode,
+            "registered_empty_safe_to_rebuild": bool((safety or {}).get("profile_state") == "registered_empty" and (safety or {}).get("safe_to_rebuild")),
             "credential_storage_sanitized": credential_storage_sanitized,
             "credential_storage_policy_version": CREDENTIAL_STORAGE_POLICY_VERSION if credential_storage_sanitized else None,
+            **profile_extension_gate,
+            **self._bootstrap_url_extension_diagnostics(url, manifest.extension_id),
         }
+        if profile_initialization_mode in {"copied_to_missing_profile", "rebuilt_registered_empty_profile"} and not profile_extension_gate["template_extension_state_ready"]:
+            return ExtensionBootstrapResult("template_extension_state_missing", account.account_id, False, initialization_details)
         if profile_initialization_mode == "rebuilt_registered_empty_profile":
             volatile_cleanup = self._cleanup_bootstrap_volatile_cache(account, initialization_details, attempt=1)
             initialization_details.update(volatile_cleanup["details"])
@@ -656,6 +669,7 @@ class ExtensionBootstrapper:
                 *list((chrome.details or {}).get("bootstrap_chrome_attempt_diagnostics") or []),
             ],
         }
+        self._annotate_launch_attempt_diagnostics(diagnostics, initialization_details)
         try:
             try:
                 version = self.cdp.wait_ready(
@@ -759,6 +773,7 @@ class ExtensionBootstrapper:
                         *list((chrome.details or {}).get("bootstrap_chrome_attempt_diagnostics") or []),
                     ],
                 })
+                self._annotate_launch_attempt_diagnostics(diagnostics, initialization_details)
                 try:
                     version = self.cdp.wait_ready(
                         account.chrome_cdp_port,
@@ -950,6 +965,27 @@ class ExtensionBootstrapper:
                 item["browser_version"] = browser_version
         diagnostics["bootstrap_chrome_attempt_diagnostics"] = attempts
 
+    def _annotate_launch_attempt_diagnostics(self, diagnostics: dict, initialization_details: dict) -> None:
+        safe_keys = (
+            "profile_initialization_mode",
+            "registered_empty_safe_to_rebuild",
+            "template_marker_present_before_launch",
+            "expected_extension_id",
+            "expected_extension_id_present_in_preferences",
+            "expected_extension_id_present_in_secure_preferences",
+            "expected_extension_local_state_present",
+            "bootstrap_url_extension_id",
+            "bootstrap_url_extension_id_match",
+            "credential_storage_sanitized",
+        )
+        attempts = list(diagnostics.get("bootstrap_chrome_attempt_diagnostics") or [])
+        for item in attempts:
+            if "disable_skia_graphite_present" not in item:
+                continue
+            for key in safe_keys:
+                item[key] = initialization_details.get(key)
+        diagnostics["bootstrap_chrome_attempt_diagnostics"] = attempts
+
     def sanitize_copied_profile(self, profile_path: Path) -> ExtensionBootstrapResult:
         cleaned = []
         for relative in CREDENTIAL_STORAGE_RELATIVE_DIRS:
@@ -962,6 +998,8 @@ class ExtensionBootstrapper:
             if target.exists():
                 try:
                     self._remove_path(target)
+                    if relative == Path("Default") / "Local Extension Settings" / EXPECTED_FLOWKIT_EXTENSION_ID:
+                        target.mkdir(parents=True, exist_ok=True)
                     item["removed"] = True
                 except Exception as error:
                     item["error"] = type(error).__name__
@@ -987,6 +1025,37 @@ class ExtensionBootstrapper:
                 "cleaned": cleaned,
             },
         )
+
+    def _profile_extension_state_gate(self, profile_path: Path) -> dict:
+        profile = Path(profile_path)
+        marker = profile / TEMPLATE_READY_FILE
+        preferences = profile / "Default" / "Preferences"
+        secure_preferences = profile / "Default" / "Secure Preferences"
+        local_state = profile / "Default" / "Local Extension Settings" / EXPECTED_FLOWKIT_EXTENSION_ID
+        expected_in_preferences = self._file_contains(preferences, EXPECTED_FLOWKIT_EXTENSION_ID)
+        expected_in_secure_preferences = self._file_contains(secure_preferences, EXPECTED_FLOWKIT_EXTENSION_ID)
+        local_state_present = local_state.is_dir()
+        return {
+            "template_marker_present_before_launch": marker.is_file(),
+            "expected_extension_id": EXPECTED_FLOWKIT_EXTENSION_ID,
+            "expected_extension_id_present_in_preferences": expected_in_preferences,
+            "expected_extension_id_present_in_secure_preferences": expected_in_secure_preferences,
+            "expected_extension_local_state_present": local_state_present,
+            "template_extension_state_ready": bool(marker.is_file() and expected_in_preferences and expected_in_secure_preferences and local_state_present),
+        }
+
+    def _file_contains(self, path: Path, text: str) -> bool:
+        try:
+            return text in path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return False
+
+    def _bootstrap_url_extension_diagnostics(self, bootstrap_url: str, expected_extension_id: str) -> dict:
+        parsed = urlparse(bootstrap_url)
+        return {
+            "bootstrap_url_extension_id": parsed.netloc,
+            "bootstrap_url_extension_id_match": parsed.scheme == "chrome-extension" and parsed.netloc == expected_extension_id,
+        }
 
     def _profile_rebuild_safety(self, account: AccountRecord) -> dict:
         profile = Path(account.profile_path)
