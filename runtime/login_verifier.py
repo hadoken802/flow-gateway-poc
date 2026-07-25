@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import asyncio
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -19,7 +20,6 @@ LOGIN_TEXT_MARKERS = (
     "choose an account",
     "use another account",
     "session expired",
-    "login",
 )
 
 
@@ -38,6 +38,17 @@ class LoginVerificationResult:
     login_redirect_detected: bool = False
     login_verified: bool = False
     reason: str = "unknown"
+    page_target_count: int = 0
+    flow_target_count: int = 0
+    login_target_count: int = 0
+    selected_flow_target_title: str | None = None
+    selected_flow_target_host: str | None = None
+    selected_flow_target_path: str | None = None
+    stale_login_target_detected: bool = False
+    flow_app_marker_detected: bool = False
+    account_ui_marker_detected: bool = False
+    login_form_marker_detected: bool = False
+    verification_attempts: int = 0
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -59,6 +70,53 @@ class CdpReadOnlyClient:
             return CdpClient().open_url(cdp_port, url)
         except Exception:
             return None
+
+    def flow_page_evidence(self, target: dict) -> dict:
+        websocket_url = target.get("webSocketDebuggerUrl")
+        if not websocket_url:
+            return {}
+        try:
+            return asyncio.run(self._evaluate_flow_page_evidence(str(websocket_url)))
+        except Exception:
+            return {}
+
+    async def _evaluate_flow_page_evidence(self, websocket_url: str) -> dict:
+        import websockets
+
+        expression = r"""
+(() => {
+  const bodyText = (document.body && document.body.innerText || "").toLowerCase();
+  const controls = Array.from(document.querySelectorAll("button,[role='button'],a"))
+    .map((el) => ((el.innerText || "") + " " + (el.getAttribute("aria-label") || "")).trim().toLowerCase());
+  const inputs = Array.from(document.querySelectorAll("input"))
+    .map((el) => `${el.type || ""}:${el.name || ""}:${el.getAttribute("aria-label") || ""}`.toLowerCase());
+  const flowApp = bodyText.includes("new project")
+    || controls.some((value) => value.includes("new project"))
+    || !!document.querySelector("[aria-label*='Google Account'],[aria-label*='Google account'],a[href*='myaccount.google.com']");
+  const accountUi = !!document.querySelector("[aria-label*='Google Account'],[aria-label*='Google account'],a[href*='myaccount.google.com'],img[alt*='profile' i]");
+  const loginForm = bodyText.includes("choose an account")
+    || bodyText.includes("sign in with google")
+    || inputs.some((value) => /email|identifier|password|passwd/.test(value));
+  return {
+    flow_app_marker_detected: flowApp,
+    account_ui_marker_detected: accountUi,
+    login_form_marker_detected: loginForm
+  };
+})()
+"""
+        async with websockets.connect(websocket_url, open_timeout=2) as websocket:
+            await websocket.send(
+                json.dumps(
+                    {
+                        "id": 1,
+                        "method": "Runtime.evaluate",
+                        "params": {"expression": expression, "returnByValue": True},
+                    }
+                )
+            )
+            message = json.loads(await asyncio.wait_for(websocket.recv(), timeout=2))
+        value = (((message.get("result") or {}).get("result") or {}).get("value") or {})
+        return value if isinstance(value, dict) else {}
 
 
 class LoginVerifier:
@@ -84,9 +142,14 @@ class LoginVerifier:
         result = LoginVerificationResult(account_id=account.account_id)
         chrome_probe = self.inspector.probe_process(account.chrome_pid)
         worker_probe = self.inspector.probe_process(account.worker_pid)
-        result.browser_running = chrome_probe.alive is True
+        chrome_cdp_listener_pid = self.inspector.listening_pid(account.chrome_cdp_port)
+        result.browser_running = chrome_probe.alive is True or bool(chrome_cdp_listener_pid)
         result.worker_running = worker_probe.alive is True
-        result.profile_path_matches_registry = self._profile_matches_registry(account.profile_path, account.chrome_pid)
+        result.profile_path_matches_registry = self._profile_matches_registry(
+            account.profile_path,
+            account.chrome_pid,
+            chrome_cdp_listener_pid,
+        )
 
         worker_health = self._worker_health(account.worker_api_port)
         result.extension_connected = bool(worker_health.get("extension_connected"))
@@ -99,12 +162,9 @@ class LoginVerifier:
             result.reason = "cdp_timeout"
             return self._finalize(result)
 
-        self.cdp.open_url(account.chrome_cdp_port, self.flow_url)
-        targets = self._wait_for_flow_or_login(account.chrome_cdp_port, wait_seconds, targets)
-        page_state = self._classify_targets(targets)
-        result.flow_accessible = page_state["flow_accessible"]
-        result.login_redirect_detected = page_state["login_redirect_detected"]
-        result.google_logged_in = result.flow_accessible and not result.login_redirect_detected
+        page_state = self._verify_flow_targets(account.chrome_cdp_port, wait_seconds, targets)
+        for key, value in page_state.items():
+            setattr(result, key, value)
         result.reason = self._reason(result)
         return self._finalize(result)
 
@@ -116,32 +176,121 @@ class LoginVerifier:
             return {}
         return data if isinstance(data, dict) else {}
 
-    def _profile_matches_registry(self, profile_path: str, chrome_pid: int | None) -> bool:
-        probe = self.inspector.command_line_probe(chrome_pid)
-        if probe.status != "available":
-            return False
-        command = self._normalize_path(probe.command_line)
+    def _profile_matches_registry(self, profile_path: str, recorded_pid: int | None, cdp_listener_pid: int | None) -> bool:
         expected = self._normalize_path(str(Path(profile_path)))
-        return expected in command
+        checked: set[int] = set()
+        for chrome_pid in [recorded_pid, cdp_listener_pid]:
+            if not chrome_pid or int(chrome_pid) in checked:
+                continue
+            checked.add(int(chrome_pid))
+            probe = self.inspector.command_line_probe(chrome_pid)
+            if probe.status != "available":
+                continue
+            command = self._normalize_path(probe.command_line)
+            if expected in command:
+                return True
+        if recorded_pid and cdp_listener_pid and int(recorded_pid) == int(cdp_listener_pid):
+            return self.inspector.probe_process(recorded_pid).alive is True
+        return False
 
-    def _wait_for_flow_or_login(self, cdp_port: int, wait_seconds: float, initial_targets: list[dict]) -> list[dict]:
+    def _verify_flow_targets(self, cdp_port: int, wait_seconds: float, initial_targets: list[dict]) -> dict:
         deadline = time.monotonic() + max(0.0, float(wait_seconds))
         targets = initial_targets
+        last_state = self._page_target_summary(targets)
+        verification_attempts = 0
         while time.monotonic() <= deadline:
-            state = self._classify_targets(targets)
-            if state["flow_accessible"] or state["login_redirect_detected"]:
-                return targets
+            state = self._evaluate_flow_targets(targets)
+            verification_attempts += int(state.get("verification_attempts") or 0)
+            state["verification_attempts"] = verification_attempts
+            last_state = state
+            if state["flow_accessible"] and state["google_logged_in"] and not state["login_redirect_detected"]:
+                return state
+            if state["login_redirect_detected"] and state["flow_target_count"] == 0:
+                return state
             if time.monotonic() >= deadline:
                 break
             self.sleep(0.2)
             refreshed = self.cdp.list_targets(cdp_port)
             if refreshed is None:
-                return targets
+                return last_state
             targets = refreshed
-        return targets
+        if last_state["flow_target_count"] > 0 and not last_state["flow_accessible"] and not last_state["login_redirect_detected"]:
+            last_state["reason"] = "flow_page_verification_timeout"
+        return last_state
+
+    def _page_target_summary(self, targets: list[dict]) -> dict:
+        pages = [target for target in targets or [] if target.get("type") == "page"]
+        flow_targets = [target for target in pages if self._is_flow_target(target)]
+        login_targets = [target for target in pages if self._is_login_target(target)]
+        return {
+            "page_target_count": len(pages),
+            "flow_target_count": len(flow_targets),
+            "login_target_count": len(login_targets),
+            "stale_login_target_detected": bool(login_targets),
+            "flow_accessible": False,
+            "google_logged_in": False,
+            "login_redirect_detected": bool(login_targets and not flow_targets),
+            "selected_flow_target_title": None,
+            "selected_flow_target_host": None,
+            "selected_flow_target_path": None,
+            "flow_app_marker_detected": False,
+            "account_ui_marker_detected": False,
+            "login_form_marker_detected": False,
+            "verification_attempts": 0,
+        }
+
+    def _evaluate_flow_targets(self, targets: list[dict]) -> dict:
+        state = self._page_target_summary(targets)
+        flow_targets = [target for target in (targets or []) if target.get("type") == "page" and self._is_flow_target(target)]
+        if not flow_targets:
+            return state
+        for target in flow_targets:
+            state["verification_attempts"] += 1
+            evidence = self.cdp.flow_page_evidence(target)
+            marker = {
+                "flow_app_marker_detected": bool(evidence.get("flow_app_marker_detected")),
+                "account_ui_marker_detected": bool(evidence.get("account_ui_marker_detected")),
+                "login_form_marker_detected": bool(evidence.get("login_form_marker_detected")),
+            }
+            if marker["login_form_marker_detected"] or self._is_login_target(target):
+                marker["login_form_marker_detected"] = True
+                self._select_target(state, target, marker)
+                state["login_redirect_detected"] = True
+                return state
+            if marker["flow_app_marker_detected"] and marker["account_ui_marker_detected"]:
+                self._select_target(state, target, marker)
+                state["flow_accessible"] = True
+                state["google_logged_in"] = True
+                state["login_redirect_detected"] = False
+                return state
+        return state
+
+    def _select_target(self, state: dict, target: dict, marker: dict) -> None:
+        parsed = urlparse(str(target.get("url") or ""))
+        state["selected_flow_target_title"] = self._safe_title(str(target.get("title") or ""))
+        state["selected_flow_target_host"] = parsed.netloc.lower()
+        state["selected_flow_target_path"] = parsed.path
+        state.update(marker)
+
+    def _is_flow_target(self, target: dict) -> bool:
+        parsed = urlparse(str(target.get("url") or ""))
+        return parsed.scheme == "https" and parsed.netloc.lower() == "labs.google" and parsed.path.startswith("/fx/tools/flow")
+
+    def _is_login_target(self, target: dict) -> bool:
+        url = str(target.get("url") or "")
+        title = str(target.get("title") or "")
+        parsed = urlparse(url)
+        host = parsed.netloc.lower()
+        path = parsed.path.lower()
+        text = f"{parsed.scheme}://{host}{path} {title}".lower()
+        if host in LOGIN_HOSTS or "accountchooser" in path or "signin" in path:
+            return True
+        return any(marker in text for marker in LOGIN_TEXT_MARKERS)
 
     def _classify_targets(self, targets: list[dict]) -> dict:
-        flow_accessible = False
+        state = self._evaluate_flow_targets(targets)
+        if state["flow_target_count"]:
+            return {"flow_accessible": state["flow_accessible"], "login_redirect_detected": state["login_redirect_detected"]}
         login_redirect_detected = False
         for target in targets or []:
             url = str(target.get("url") or "")
@@ -149,14 +298,12 @@ class LoginVerifier:
             parsed = urlparse(url)
             host = parsed.netloc.lower()
             path = parsed.path.lower()
-            text = f"{url} {title}".lower()
+            text = f"{parsed.scheme}://{host}{path} {title}".lower()
             if host in LOGIN_HOSTS or "accountchooser" in path or "signin" in path:
                 login_redirect_detected = True
             if any(marker in text for marker in LOGIN_TEXT_MARKERS):
                 login_redirect_detected = True
-            if host in FLOW_HOSTS and "flow" in path and not login_redirect_detected:
-                flow_accessible = True
-        return {"flow_accessible": flow_accessible, "login_redirect_detected": login_redirect_detected}
+        return {"flow_accessible": False, "login_redirect_detected": login_redirect_detected}
 
     def _reason(self, result: LoginVerificationResult) -> str:
         checks = [
@@ -166,6 +313,7 @@ class LoginVerifier:
             ("account_mismatch", result.account_match),
             ("cdp_timeout", result.cdp_connectable),
             ("profile_path_mismatch", result.profile_path_matches_registry),
+            ("flow_page_verification_timeout", result.reason != "flow_page_verification_timeout"),
             ("google_login_missing", result.google_logged_in),
             ("flow_not_accessible", result.flow_accessible),
         ]
@@ -190,3 +338,9 @@ class LoginVerifier:
 
     def _normalize_path(self, value: str) -> str:
         return value.replace("\\", "/").replace('"', "").lower()
+
+    def _safe_title(self, value: str) -> str:
+        lowered = value.lower()
+        if "@" in value or "token" in lowered or "cookie" in lowered:
+            return "<redacted>"
+        return value
