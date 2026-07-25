@@ -7,6 +7,7 @@ import sys
 from dataclasses import asdict
 
 from .extension_bootstrap import ExtensionBootstrapResult, ExtensionBootstrapper
+from .gateway_projection import GatewayProjection
 from .login_verifier import ConfirmLoginService, LoginVerifier
 from .process_manager import RuntimeManager
 from .registry import AccountRegistry, plan_to_dict
@@ -30,6 +31,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     confirm_login = sub.add_parser("confirm-login")
     confirm_login.add_argument("account_id")
+
+    sub.add_parser("gateway-candidates")
+
+    gateway_dry_run = sub.add_parser("gateway-dispatch-dry-run")
+    gateway_dry_run.add_argument("--task-id", default="DRYRUN-001")
 
     sub.add_parser("init-extension-template")
 
@@ -83,6 +89,20 @@ def main(argv: list[str] | None = None) -> int:
         result = ConfirmLoginService(registry).confirm(args.account_id)
         print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
         return 0 if result.ok else 1
+
+    if args.command == "gateway-candidates":
+        result = {
+            "result": "candidates",
+            "ok": True,
+            "candidates": [candidate.to_dict() for candidate in GatewayProjection(registry).candidates()],
+        }
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+
+    if args.command == "gateway-dispatch-dry-run":
+        result = GatewayProjection(registry).dispatch_dry_run(task_id=args.task_id)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0 if result.get("ok") else 1
 
     if args.command == "init-extension-template":
         manager = RuntimeManager(registry)
