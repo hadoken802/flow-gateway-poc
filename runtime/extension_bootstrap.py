@@ -79,6 +79,8 @@ GPU_RETRY_FAILURE_CLASSES = {
     "gpu_cache_sharing_violation",
 }
 VOLATILE_BOOTSTRAP_CACHE_DIR = Path("GPUPersistentCache")
+DISABLE_SKIA_GRAPHITE_ARG = "--disable-skia-graphite"
+ENABLE_SKIA_GRAPHITE_ARG = "--enable-skia-graphite"
 ALLOWED_REGISTERED_EMPTY_DIRS = {
     Path("."),
     Path("Default"),
@@ -446,8 +448,9 @@ class ExtensionBootstrapper:
             f"--remote-debugging-port={account.chrome_cdp_port}",
             "--no-first-run",
             "--no-default-browser-check",
+            DISABLE_SKIA_GRAPHITE_ARG,
         ]
-        command.extend(extra_args or [])
+        command.extend(self._normalized_bootstrap_extra_args(extra_args or []))
         command.append(bootstrap_url)
         return command
 
@@ -646,17 +649,24 @@ class ExtensionBootstrapper:
             "first_attempt_chrome_pid": chrome_pid,
             "first_attempt_stdout_log": (chrome.details or {}).get("stdout_log"),
             "first_attempt_stderr_log": (chrome.details or {}).get("stderr_log"),
-            "bootstrap_chrome_attempt_diagnostics": list(initialization_details.get("bootstrap_chrome_attempt_diagnostics") or []),
+            "bootstrap_disable_skia_graphite": bool((chrome.details or {}).get("bootstrap_disable_skia_graphite")),
+            "disable_skia_graphite_present": bool((chrome.details or {}).get("disable_skia_graphite_present")),
+            "bootstrap_chrome_attempt_diagnostics": [
+                *list(initialization_details.get("bootstrap_chrome_attempt_diagnostics") or []),
+                *list((chrome.details or {}).get("bootstrap_chrome_attempt_diagnostics") or []),
+            ],
         }
         try:
             try:
-                self.cdp.wait_ready(
+                version = self.cdp.wait_ready(
                     account.chrome_cdp_port,
                     sleep=self.sleep,
                     chrome_process=self._bootstrap_chrome_processes.get(int(chrome_pid)) if chrome_pid else None,
                     chrome_pid=chrome_pid,
                 )
                 diagnostics["first_attempt_cdp_ready"] = True
+                diagnostics["browser_version"] = version.get("Browser") if isinstance(version, dict) else None
+                self._set_attempt_browser_version(diagnostics, 1, diagnostics["browser_version"])
             except CdpError as first_error:
                 diagnostics["first_attempt_cdp_ready"] = False
                 diagnostics["first_attempt_exit_code"] = (first_error.details or {}).get("chrome_exit_code")
@@ -742,15 +752,23 @@ class ExtensionBootstrapper:
                     "bootstrap_chrome_command": (chrome.details or {}).get("command"),
                     "bootstrap_chrome_stdout_log": (chrome.details or {}).get("stdout_log"),
                     "bootstrap_chrome_stderr_log": (chrome.details or {}).get("stderr_log"),
+                    "bootstrap_disable_skia_graphite": bool((chrome.details or {}).get("bootstrap_disable_skia_graphite")),
+                    "disable_skia_graphite_present": bool((chrome.details or {}).get("disable_skia_graphite_present")),
+                    "bootstrap_chrome_attempt_diagnostics": [
+                        *list(diagnostics.get("bootstrap_chrome_attempt_diagnostics") or []),
+                        *list((chrome.details or {}).get("bootstrap_chrome_attempt_diagnostics") or []),
+                    ],
                 })
                 try:
-                    self.cdp.wait_ready(
+                    version = self.cdp.wait_ready(
                         account.chrome_cdp_port,
                         sleep=self.sleep,
                         chrome_process=self._bootstrap_chrome_processes.get(int(chrome_pid)) if chrome_pid else None,
                         chrome_pid=chrome_pid,
                     )
                     diagnostics["second_attempt_cdp_ready"] = True
+                    diagnostics["browser_version"] = version.get("Browser") if isinstance(version, dict) else None
+                    self._set_attempt_browser_version(diagnostics, 2, diagnostics["browser_version"])
                 except CdpError as second_error:
                     diagnostics.update(self._collect_dawn_lock_probe_details(chrome_pid))
                     diagnostics["second_attempt_cdp_ready"] = False
@@ -866,6 +884,7 @@ class ExtensionBootstrapper:
         if conflict:
             return conflict
         command = self.bootstrap_chrome_command(account, bootstrap_url, extra_args=extra_args)
+        command_summary = self._bootstrap_command_summary(command)
         stdout_path, stderr_path = self._bootstrap_chrome_log_files(account, attempt=attempt)
         stdout_handle = stdout_path.open("ab")
         stderr_handle = stderr_path.open("ab")
@@ -892,10 +911,44 @@ class ExtensionBootstrapper:
                 "bootstrap_chrome_attempt": attempt,
                 "chrome_spawned_at": self._utc_now(),
                 "command": self._redacted_bootstrap_command(command),
+                **command_summary,
+                "bootstrap_chrome_attempt_diagnostics": [{
+                    "attempt_number": int(attempt),
+                    "browser_executable_kind": "system_chrome",
+                    "chrome_pid": proc.pid,
+                    "disable_skia_graphite_present": command_summary["disable_skia_graphite_present"],
+                }],
                 "stdout_log": str(stdout_path),
                 "stderr_log": str(stderr_path),
             },
         )
+
+    def _normalized_bootstrap_extra_args(self, extra_args: list[str]) -> list[str]:
+        normalized = []
+        for arg in extra_args:
+            text = str(arg)
+            if text == DISABLE_SKIA_GRAPHITE_ARG or text.startswith(f"{DISABLE_SKIA_GRAPHITE_ARG}="):
+                continue
+            if text == ENABLE_SKIA_GRAPHITE_ARG or text.startswith(f"{ENABLE_SKIA_GRAPHITE_ARG}="):
+                continue
+            normalized.append(text)
+        return normalized
+
+    def _bootstrap_command_summary(self, command: list[str]) -> dict:
+        return {
+            "bootstrap_disable_skia_graphite": self._command_contains_arg(command, DISABLE_SKIA_GRAPHITE_ARG),
+            "disable_skia_graphite_present": self._command_contains_arg(command, DISABLE_SKIA_GRAPHITE_ARG),
+        }
+
+    def _command_contains_arg(self, command: list[str], arg_name: str) -> bool:
+        return any(str(part) == arg_name or str(part).startswith(f"{arg_name}=") for part in command)
+
+    def _set_attempt_browser_version(self, diagnostics: dict, attempt: int, browser_version: str | None) -> None:
+        attempts = list(diagnostics.get("bootstrap_chrome_attempt_diagnostics") or [])
+        for item in attempts:
+            if item.get("attempt_number") == int(attempt) and "disable_skia_graphite_present" in item:
+                item["browser_version"] = browser_version
+        diagnostics["bootstrap_chrome_attempt_diagnostics"] = attempts
 
     def sanitize_copied_profile(self, profile_path: Path) -> ExtensionBootstrapResult:
         cleaned = []

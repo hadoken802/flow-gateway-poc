@@ -1197,6 +1197,32 @@ def test_bootstrap_chrome_command_opens_options_not_flow_url(tmp_path):
     assert not any("labs.google" in part or "aisandbox" in part for part in command)
 
 
+def test_bootstrap_chrome_command_forces_disable_skia_graphite_once_and_removes_conflicts(tmp_path):
+    registry = make_registry(tmp_path)
+    account = add_account(registry)
+    bootstrapper = ExtensionBootstrapper(registry, runtime=FakeRuntime(), cdp=FakeCdp(), profiles_root=registry.profiles_root)
+
+    command = bootstrapper.bootstrap_chrome_command(
+        account,
+        f"chrome-extension://{EXPECTED_FLOWKIT_EXTENSION_ID}/options.html?bootstrap=1",
+        extra_args=[
+            "--disable-skia-graphite",
+            "--enable-skia-graphite",
+            "--enable-skia-graphite=true",
+            "--no-sandbox",
+        ],
+    )
+
+    assert command.count("--disable-skia-graphite") == 1
+    assert "--enable-skia-graphite" not in command
+    assert "--enable-skia-graphite=true" not in command
+    assert "--no-sandbox" in command
+    assert "--disable-gpu" not in command
+    assert "--use-angle" not in command
+    assert "--use-gl" not in command
+    assert "--skia-graphite-dawn-backend" not in command
+
+
 def test_bootstrap_chrome_logs_are_account_specific_and_handles_close(tmp_path):
     registry = make_registry(tmp_path)
     account = add_account(registry)
@@ -1275,6 +1301,11 @@ def test_bootstrap_retries_once_for_gpu_chrome_exit_before_cdp_ready(tmp_path):
     assert result.result == "extension_bootstrapped"
     assert runtime.worker_only_started == ["FLOW-006"]
     assert len(runtime.launched) == 2
+    forbidden_gpu_args = {"--disable-gpu", "--use-angle", "--use-gl", "--skia-graphite-dawn-backend"}
+    assert runtime.launched[0][1].count("--disable-skia-graphite") == 1
+    assert runtime.launched[1][1].count("--disable-skia-graphite") == 1
+    assert not any(arg in runtime.launched[0][1] for arg in forbidden_gpu_args)
+    assert not any(arg in runtime.launched[1][1] for arg in forbidden_gpu_args)
     assert "--disable-gpu" not in runtime.launched[0][1]
     assert "--disable-gpu" not in runtime.launched[1][1]
     assert runtime.launched[0][1][-1] != runtime.launched[1][1][-1]
@@ -1298,6 +1329,11 @@ def test_bootstrap_retries_once_for_gpu_chrome_exit_before_cdp_ready(tmp_path):
     cleanup_attempts = [item for item in attempts if "volatile_cache_cleanup" in item]
     assert [item["attempt_number"] for item in cleanup_attempts] == [1, 2]
     assert all(item["volatile_cache_cleanup"]["bootstrap_volatile_cache_cleanup_used"] is True for item in cleanup_attempts)
+    launch_attempts = [item for item in attempts if "disable_skia_graphite_present" in item]
+    assert [item["attempt_number"] for item in launch_attempts] == [1, 2]
+    assert all(item["browser_executable_kind"] == "system_chrome" for item in launch_attempts)
+    assert all(item["disable_skia_graphite_present"] is True for item in launch_attempts)
+    assert result.details["bootstrap_disable_skia_graphite"] is True
 
 
 def test_registered_empty_bootstrap_removes_gpupersistentcache_before_first_chrome(tmp_path):
