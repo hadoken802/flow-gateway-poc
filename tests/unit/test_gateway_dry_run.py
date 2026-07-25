@@ -72,6 +72,13 @@ def local_db(name):
     return path
 
 
+def make_scheduler(settings, worker_client):
+    from gateway.scheduler import GatewayScheduler
+    from gateway.worker_provider import StaticJsonWorkerProvider
+
+    return GatewayScheduler(settings, worker_client=worker_client, worker_provider=StaticJsonWorkerProvider(settings.workers_path))
+
+
 @pytest.mark.asyncio
 async def test_gateway_config_defaults_to_8200(monkeypatch):
     from gateway.config import GatewaySettings
@@ -86,7 +93,6 @@ async def test_gateway_config_defaults_to_8200(monkeypatch):
 @pytest.mark.asyncio
 async def test_three_workers_are_classified_by_credits(monkeypatch):
     from gateway.config import GatewaySettings
-    from gateway.scheduler import GatewayScheduler
 
     settings = GatewaySettings(db_path=local_db("classify"))
     states = {
@@ -94,7 +100,7 @@ async def test_three_workers_are_classified_by_credits(monkeypatch):
         "FLOW-002": {"credits": 50},
         "FLOW-003": {"credits": 50},
     }
-    scheduler = GatewayScheduler(settings, worker_client=FakeWorkerClient(states))
+    scheduler = make_scheduler(settings, FakeWorkerClient(states))
     await scheduler.start()
     accounts = {a["account_id"]: a for a in await scheduler.list_accounts()}
     assert accounts["FLOW-001"]["status"] == "low_credits"
@@ -106,7 +112,6 @@ async def test_three_workers_are_classified_by_credits(monkeypatch):
 @pytest.mark.asyncio
 async def test_five_task_dry_run_respects_concurrency_and_completes(monkeypatch):
     from gateway.config import GatewaySettings
-    from gateway.scheduler import GatewayScheduler
 
     settings = GatewaySettings(db_path=local_db("five_tasks"), dry_run_step_seconds=(0.01, 0.01, 0.01))
     states = {
@@ -114,7 +119,7 @@ async def test_five_task_dry_run_respects_concurrency_and_completes(monkeypatch)
         "FLOW-002": {"credits": 50},
         "FLOW-003": {"credits": 50},
     }
-    scheduler = GatewayScheduler(settings, worker_client=FakeWorkerClient(states))
+    scheduler = make_scheduler(settings, FakeWorkerClient(states))
     await scheduler.start()
     tasks = [
         {"idempotency_key": f"task-{i}", "image_path": f"D:/img-{i}.png", "prompt": f"prompt {i}", "duration": 10, "aspect_ratio": "9:16"}
@@ -145,9 +150,9 @@ async def test_five_task_dry_run_respects_concurrency_and_completes(monkeypatch)
 @pytest.mark.asyncio
 async def test_duplicate_idempotency_key_reuses_original_task():
     from gateway.config import GatewaySettings
-    from gateway.scheduler import GatewayScheduler
 
-    scheduler = GatewayScheduler(GatewaySettings(db_path=local_db("idempotency")), worker_client=FakeWorkerClient({
+    settings = GatewaySettings(db_path=local_db("idempotency"))
+    scheduler = make_scheduler(settings, FakeWorkerClient({
         "FLOW-001": {"credits": 5},
         "FLOW-002": {"credits": 50},
         "FLOW-003": {"credits": 50},
@@ -164,12 +169,11 @@ async def test_duplicate_idempotency_key_reuses_original_task():
 @pytest.mark.asyncio
 async def test_restart_recovers_queued_and_active_tasks():
     from gateway.config import GatewaySettings
-    from gateway.scheduler import GatewayScheduler
 
     db_path = local_db("restart")
     states = {"FLOW-001": {"credits": 5}, "FLOW-002": {"credits": 50}, "FLOW-003": {"credits": 50}}
     settings = GatewaySettings(db_path=db_path, dry_run_step_seconds=(0.05, 0.05, 0.05))
-    scheduler = GatewayScheduler(settings, worker_client=FakeWorkerClient(states))
+    scheduler = make_scheduler(settings, FakeWorkerClient(states))
     await scheduler.start()
     await scheduler.create_tasks([
         {"idempotency_key": f"restart-{i}", "image_path": f"D:/r-{i}.png", "prompt": "p", "duration": 10, "aspect_ratio": "9:16"}
@@ -178,7 +182,7 @@ async def test_restart_recovers_queued_and_active_tasks():
     await asyncio.sleep(0.07)
     await scheduler.stop()
 
-    scheduler2 = GatewayScheduler(settings, worker_client=FakeWorkerClient(states))
+    scheduler2 = make_scheduler(settings, FakeWorkerClient(states))
     await scheduler2.start()
     for _ in range(200):
         if (await scheduler2.pool_status())["completed_count"] == 3:
@@ -191,14 +195,13 @@ async def test_restart_recovers_queued_and_active_tasks():
 @pytest.mark.asyncio
 async def test_worker_offline_and_recovery_keeps_same_task_id():
     from gateway.config import GatewaySettings
-    from gateway.scheduler import GatewayScheduler
-
     states = {
         "FLOW-001": {"credits": 5},
         "FLOW-002": {"credits": 50, "offline": True},
         "FLOW-003": {"credits": 50},
     }
-    scheduler = GatewayScheduler(GatewaySettings(db_path=local_db("offline"), dry_run_step_seconds=(0.01, 0.01, 0.01)), worker_client=FakeWorkerClient(states))
+    settings = GatewaySettings(db_path=local_db("offline"), dry_run_step_seconds=(0.01, 0.01, 0.01))
+    scheduler = make_scheduler(settings, FakeWorkerClient(states))
     await scheduler.start()
     await scheduler.refresh_workers()
     accounts = {a["account_id"]: a for a in await scheduler.list_accounts()}
@@ -223,11 +226,11 @@ async def test_worker_offline_and_recovery_keeps_same_task_id():
 @pytest.mark.asyncio
 async def test_real_mode_posts_to_worker_and_passes_idempotency_key():
     from gateway.config import GatewaySettings
-    from gateway.scheduler import GatewayScheduler
 
     states = {"FLOW-001": {"credits": 5}, "FLOW-002": {"credits": 50}, "FLOW-003": {"credits": 50}}
     client = FakeRealWorkerClient(states, output_dir=Path(".tmp") / "tests" / "real_submit_outputs")
-    scheduler = GatewayScheduler(GatewaySettings(db_path=local_db("real_submit"), dry_run=False), worker_client=client)
+    settings = GatewaySettings(db_path=local_db("real_submit"), dry_run=False)
+    scheduler = make_scheduler(settings, client)
     await scheduler.start()
     await scheduler.create_task({
         "idempotency_key": "real-1",
@@ -261,12 +264,11 @@ async def test_real_mode_posts_to_worker_and_passes_idempotency_key():
 @pytest.mark.asyncio
 async def test_real_mode_does_not_repost_after_worker_job_id_is_saved():
     from gateway.config import GatewaySettings
-    from gateway.scheduler import GatewayScheduler
 
     states = {"FLOW-001": {"credits": 5}, "FLOW-002": {"credits": 50}, "FLOW-003": {"credits": 50}}
     client = FakeRealWorkerClient(states, output_dir=Path(".tmp") / "tests" / "real_restart_outputs")
     settings = GatewaySettings(db_path=local_db("real_restart"), dry_run=False)
-    scheduler = GatewayScheduler(settings, worker_client=client)
+    scheduler = make_scheduler(settings, client)
     await scheduler.start()
     await scheduler.create_task({"idempotency_key": "real-2", "image_path": "D:/img.png", "prompt": "p", "duration": 10, "aspect_ratio": "9:16", "preferred_account_id": "FLOW-002"})
     for _ in range(50):
@@ -277,7 +279,7 @@ async def test_real_mode_does_not_repost_after_worker_job_id_is_saved():
 
     client2 = FakeRealWorkerClient(states, output_dir=Path(".tmp") / "tests" / "real_restart_outputs")
     client2.jobs = dict(client.jobs)
-    scheduler2 = GatewayScheduler(settings, worker_client=client2)
+    scheduler2 = make_scheduler(settings, client2)
     await scheduler2.start()
     for _ in range(100):
         task = (await scheduler2.list_tasks())[0]
@@ -294,7 +296,6 @@ async def test_real_mode_retries_download_for_existing_worker_job_without_new_ta
     from gateway.config import GatewaySettings
     from gateway import crud
     from gateway.db import connect
-    from gateway.scheduler import GatewayScheduler
 
     output_dir = Path(".tmp") / "tests" / "gateway_retry_outputs"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -329,7 +330,7 @@ async def test_real_mode_retries_download_for_existing_worker_job_without_new_ta
         "video_path": str(video_file),
         "remaining_credits": 35,
     }
-    scheduler2 = GatewayScheduler(settings, worker_client=client2)
+    scheduler2 = make_scheduler(settings, client2)
     await scheduler2.start()
     for _ in range(100):
         task = (await scheduler2.list_tasks())[0]
@@ -356,7 +357,6 @@ async def test_real_mode_recovers_manual_review_task_with_existing_worker_job():
     from gateway.config import GatewaySettings
     from gateway import crud
     from gateway.db import connect
-    from gateway.scheduler import GatewayScheduler
 
     output_dir = Path(".tmp") / "tests" / "gateway_manual_review_retry_outputs"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -392,7 +392,7 @@ async def test_real_mode_recovers_manual_review_task_with_existing_worker_job():
         "video_path": str(video_file),
         "remaining_credits": 35,
     }
-    scheduler = GatewayScheduler(settings, worker_client=client)
+    scheduler = make_scheduler(settings, client)
     await scheduler.start()
     for _ in range(100):
         task = (await scheduler.list_tasks())[0]
@@ -415,12 +415,12 @@ async def test_real_mode_recovers_manual_review_task_with_existing_worker_job():
 @pytest.mark.asyncio
 async def test_real_mode_retries_same_idempotency_key_after_lost_http_response():
     from gateway.config import GatewaySettings
-    from gateway.scheduler import GatewayScheduler
 
     states = {"FLOW-001": {"credits": 5}, "FLOW-002": {"credits": 50}, "FLOW-003": {"credits": 50}}
     client = FakeRealWorkerClient(states, output_dir=Path(".tmp") / "tests" / "lost_response_outputs")
     client.fail_first_submit = True
-    scheduler = GatewayScheduler(GatewaySettings(db_path=local_db("lost_response"), dry_run=False), worker_client=client)
+    settings = GatewaySettings(db_path=local_db("lost_response"), dry_run=False)
+    scheduler = make_scheduler(settings, client)
     await scheduler.start()
     await scheduler.create_task({"idempotency_key": "lost-1", "image_path": "D:/img.png", "prompt": "p", "duration": 10, "aspect_ratio": "9:16", "preferred_account_id": "FLOW-002"})
     for _ in range(200):
@@ -436,11 +436,11 @@ async def test_real_mode_retries_same_idempotency_key_after_lost_http_response()
 @pytest.mark.asyncio
 async def test_canary_two_tasks_bind_flow_002_and_flow_003_without_double_account():
     from gateway.config import GatewaySettings
-    from gateway.scheduler import GatewayScheduler
 
     states = {"FLOW-001": {"credits": 5}, "FLOW-002": {"credits": 50}, "FLOW-003": {"credits": 50}}
     client = FakeRealWorkerClient(states, output_dir=Path(".tmp") / "tests" / "canary_outputs")
-    scheduler = GatewayScheduler(GatewaySettings(db_path=local_db("canary"), dry_run=False, canary_only=True, canary_limit=2), worker_client=client)
+    settings = GatewaySettings(db_path=local_db("canary"), dry_run=False, canary_only=True, canary_limit=2)
+    scheduler = make_scheduler(settings, client)
     await scheduler.start()
     await scheduler.create_tasks([
         {"idempotency_key": "canary-1", "image_path": "D:/1.png", "prompt": "p1", "duration": 10, "aspect_ratio": "9:16", "preferred_account_id": "FLOW-002"},

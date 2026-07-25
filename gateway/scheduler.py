@@ -1,7 +1,5 @@
 """Dry-run Gateway scheduler."""
 import asyncio
-import json
-from dataclasses import dataclass
 from pathlib import Path
 
 from . import crud
@@ -9,21 +7,17 @@ from .config import GatewaySettings
 from .db import connect
 from .models import ACTIVE_TASK_STATUSES
 from .worker_client import WorkerClient
-
-
-@dataclass
-class WorkerConfig:
-    account_id: str
-    api_url: str
-    enabled: bool = True
+from .worker_provider import WorkerConfig, WorkerSnapshot, build_worker_provider
 
 
 class GatewayScheduler:
-    def __init__(self, settings: GatewaySettings, worker_client=None):
+    def __init__(self, settings: GatewaySettings, worker_client=None, worker_provider=None):
         self.settings = settings
         self.worker_client = worker_client or WorkerClient()
         self.db = None
-        self.workers = self._load_workers()
+        self.worker_provider = worker_provider or build_worker_provider(settings)
+        self.worker_snapshot = self._load_worker_snapshot()
+        self.workers = self.worker_snapshot.workers
         self.account_locks = {worker.account_id: asyncio.Lock() for worker in self.workers}
         self.assignment_lock = asyncio.Lock()
         self._runner_task = None
@@ -33,9 +27,17 @@ class GatewayScheduler:
         self.assignment_history: list[tuple[str, str]] = []
         self._last_worker_refresh = 0.0
 
-    def _load_workers(self):
-        data = json.loads(Path(self.settings.workers_path).read_text(encoding="utf-8"))
-        return [WorkerConfig(**item) for item in data]
+    def _load_worker_snapshot(self) -> WorkerSnapshot:
+        try:
+            return self.worker_provider.load_workers()
+        except Exception as exc:
+            raise RuntimeError("runtime_worker_provider_unavailable") from exc
+
+    def refresh_worker_snapshot(self) -> WorkerSnapshot:
+        self.worker_snapshot = self._load_worker_snapshot()
+        self.workers = self.worker_snapshot.workers
+        self.account_locks = {worker.account_id: self.account_locks.get(worker.account_id, asyncio.Lock()) for worker in self.workers}
+        return self.worker_snapshot
 
     async def start(self):
         self._stopping = False
@@ -67,6 +69,7 @@ class GatewayScheduler:
 
     async def refresh_workers(self):
         async with self.assignment_lock:
+            self.refresh_worker_snapshot()
             for worker in self.workers:
                 if not worker.enabled:
                     await crud.upsert_account(self.db, worker, status="offline", credits=None)
@@ -176,24 +179,118 @@ class GatewayScheduler:
         if status["active_count"] >= self.settings.max_concurrency:
             return
         accounts = await crud.list_accounts(self.db)
-        for account in accounts:
+        while status["active_count"] < self.settings.max_concurrency:
+            next_task = self._next_schedulable_task(await crud.list_tasks(self.db))
+            if not next_task:
+                return
+            selected = self.select_worker(next_task, self.worker_snapshot, account_states=accounts)
+            if not selected.get("ok"):
+                return
+            account_id = selected["selected_account_id"]
+            account = next((item for item in accounts if item["account_id"] == account_id), None)
+            if not account:
+                return
             if status["active_count"] >= self.settings.max_concurrency:
                 return
-            if account["status"] != "ready" or account.get("current_task_id"):
-                continue
-            lock = self.account_locks.get(account["account_id"])
+            lock = self.account_locks.get(account_id)
             if not lock:
-                continue
+                return
             async with lock:
-                task = await crud.assign_next_task(self.db, account["account_id"], self.settings.omni_10s_credit_cost)
+                task = await crud.assign_next_task(self.db, account_id, self.settings.omni_10s_credit_cost)
                 if not task:
-                    continue
-                self.assignment_history.append((task["task_id"], account["account_id"]))
+                    return
+                self.assignment_history.append((task["task_id"], account_id))
+                account["status"] = "busy"
+                account["current_task_id"] = task["task_id"]
                 status["active_count"] += 1
                 if self.settings.dry_run:
-                    self._dry_tasks[task["task_id"]] = asyncio.create_task(self._run_dry_task(task["task_id"], account["account_id"]))
+                    self._dry_tasks[task["task_id"]] = asyncio.create_task(self._run_dry_task(task["task_id"], account_id))
                 else:
-                    self._real_tasks[task["task_id"]] = asyncio.create_task(self._run_real_task(task["task_id"], account["account_id"]))
+                    self._real_tasks[task["task_id"]] = asyncio.create_task(self._run_real_task(task["task_id"], account_id))
+
+    def select_worker(self, task: dict, worker_snapshot: WorkerSnapshot | None = None, account_states: list[dict] | None = None) -> dict:
+        snapshot = worker_snapshot or self.worker_snapshot
+        states = {account["account_id"]: account for account in account_states or []}
+        preferred_account_id = task.get("preferred_account_id")
+        eligible = []
+        for worker in snapshot.workers:
+            if preferred_account_id and worker.account_id != preferred_account_id:
+                continue
+            account = states.get(worker.account_id)
+            if account and (account.get("status") != "ready" or account.get("current_task_id")):
+                continue
+            eligible.append(worker)
+        eligible.sort(key=lambda worker: worker.account_id)
+        if not eligible:
+            return {
+                "result": "no_eligible_worker",
+                "ok": False,
+                "selection_reason": "no eligible runtime worker",
+                **snapshot.diagnostics(),
+            }
+        selected = eligible[0]
+        return {
+            "result": "worker_selected",
+            "ok": True,
+            "selected_account_id": selected.account_id,
+            "selected_runtime_instance_id": selected.runtime_instance_id,
+            "selected_worker_api_endpoint": selected.api_url,
+            "selection_reason": "first eligible account by account_id",
+            "selection_function": "GatewayScheduler.select_worker",
+            **snapshot.diagnostics(),
+        }
+
+    def _next_schedulable_task(self, tasks: list[dict]) -> dict | None:
+        for task in tasks:
+            if task.get("status") == "queued":
+                return task
+        return None
+
+    def dispatch_dry_run(self, task_id: str = "DRYRUN-001") -> dict:
+        snapshot = self.refresh_worker_snapshot()
+        selection = self.select_worker({"task_id": task_id, "required_capability": "flow"}, snapshot)
+        if not selection.get("ok"):
+            return {
+                **selection,
+                "task_id": task_id,
+                "task_type": "flow_video",
+                "required_capability": "flow",
+                "estimated_cost": "unknown",
+                "no_payload": True,
+                "scheduler_path_used": True,
+                "side_effects": False,
+                "would_acquire_lease": False,
+            }
+        worker = self._worker_by_account(selection["selected_account_id"])
+        current = self.worker_provider.load_workers()
+        latest = next((item for item in current.workers if item.account_id == worker.account_id), None)
+        if latest and latest.runtime_instance_id != worker.runtime_instance_id:
+            return {
+                "result": "stale_runtime_instance",
+                "ok": False,
+                "task_id": task_id,
+                "selected_account_id": worker.account_id,
+                "selected_runtime_instance_id": worker.runtime_instance_id,
+                "current_runtime_instance_id": latest.runtime_instance_id,
+                "scheduler_path_used": True,
+                "selection_function": "GatewayScheduler.select_worker",
+                "side_effects": False,
+                "would_acquire_lease": False,
+                **snapshot.diagnostics(),
+            }
+        return {
+            "result": "dry_run_selected",
+            "ok": True,
+            "task_id": task_id,
+            "task_type": "flow_video",
+            "required_capability": "flow",
+            "estimated_cost": "unknown",
+            "no_payload": True,
+            "scheduler_path_used": True,
+            **{key: value for key, value in selection.items() if key not in {"result", "ok"}},
+            "would_acquire_lease": True,
+            "side_effects": False,
+        }
 
     async def _run_dry_task(self, task_id, account_id):
         try:

@@ -100,7 +100,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "gateway-dispatch-dry-run":
-        result = GatewayProjection(registry).dispatch_dry_run(task_id=args.task_id)
+        from gateway.config import GatewaySettings
+        from gateway.scheduler import GatewayScheduler
+        from gateway.worker_provider import RuntimeRegistryWorkerProvider
+
+        result = GatewayScheduler(
+            GatewaySettings(worker_source="runtime_registry"),
+            worker_provider=RuntimeRegistryWorkerProvider(registry),
+        ).dispatch_dry_run(task_id=args.task_id)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result.get("ok") else 1
 

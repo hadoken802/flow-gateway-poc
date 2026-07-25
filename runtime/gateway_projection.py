@@ -10,14 +10,6 @@ from .process_manager import ProcessInspector
 from .registry import AccountRegistry
 
 
-DRY_RUN_TASK = {
-    "task_id": "DRYRUN-001",
-    "task_type": "flow_video",
-    "required_capability": "flow",
-    "estimated_cost": "unknown",
-    "no_payload": True,
-}
-
 EXCLUSION_ORDER = [
     "disabled",
     "registration_not_verified",
@@ -71,38 +63,6 @@ class GatewayProjection:
 
     def candidates(self) -> list[GatewayCandidate]:
         return [self._candidate_for(account) for account in self.registry.list_accounts()]
-
-    def dispatch_dry_run(self, task_id: str = "DRYRUN-001") -> dict:
-        candidates = self.candidates()
-        eligible = [candidate for candidate in candidates if candidate.eligible and not candidate.current_task_id]
-        eligible.sort(key=lambda candidate: candidate.account_id)
-        if not eligible:
-            return {
-                "result": "no_eligible_worker",
-                "ok": False,
-                "task_id": task_id,
-                **{key: value for key, value in DRY_RUN_TASK.items() if key != "task_id"},
-                "candidate_count": len(candidates),
-                "eligible_count": 0,
-                "selection_reason": "no eligible runtime worker",
-                "side_effects": False,
-                "would_acquire_lease": False,
-            }
-        selected = eligible[0]
-        return {
-            "result": "dry_run_selected",
-            "ok": True,
-            "task_id": task_id,
-            **{key: value for key, value in DRY_RUN_TASK.items() if key != "task_id"},
-            "selected_account_id": selected.account_id,
-            "selected_runtime_instance_id": selected.runtime_instance_id,
-            "selected_worker_api_endpoint": selected.worker_api_endpoint,
-            "candidate_count": len(candidates),
-            "eligible_count": len(eligible),
-            "selection_reason": "first eligible account by account_id",
-            "side_effects": False,
-            "would_acquire_lease": True,
-        }
 
     def _candidate_for(self, account) -> GatewayCandidate:
         details = self.status_provider.status(account)

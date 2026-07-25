@@ -156,46 +156,6 @@ def test_runtime_registry_is_the_only_identity_source(tmp_path):
     assert runtime.calls == ["FLOW-024"]
 
 
-def test_dry_run_selects_only_eligible_account_and_has_no_side_effects(tmp_path):
-    statuses = {
-        "FLOW-022": ready_details(runtime_status="stopped", runtime_healthy=False),
-        "FLOW-023": ready_details(extension_connected=False, account_match=False),
-        "FLOW-024": ready_details(),
-    }
-    accounts = [
-        {"account_id": "FLOW-022", "status": "login_verified"},
-        {"account_id": "FLOW-023", "status": "login_required"},
-        {"account_id": "FLOW-024", "status": "login_verified"},
-    ]
-    projection, registry, runtime = candidates_for(tmp_path, statuses, accounts)
-    before = [account for account in registry.list_accounts()]
-    result = projection.dispatch_dry_run()
-    assert result["result"] == "dry_run_selected"
-    assert result["selected_account_id"] == "FLOW-024"
-    assert result["candidate_count"] == 3
-    assert result["eligible_count"] == 1
-    assert result["side_effects"] is False
-    assert result["would_acquire_lease"] is True
-    assert runtime.submit_calls == 0
-    assert runtime.queue_writes == 0
-    assert [account for account in registry.list_accounts()] == before
-
-
-def test_multiple_eligible_accounts_use_account_id_order(tmp_path):
-    statuses = {"FLOW-025": ready_details(), "FLOW-024": ready_details()}
-    accounts = [{"account_id": "FLOW-025"}, {"account_id": "FLOW-024"}]
-    projection, _, _ = candidates_for(tmp_path, statuses, accounts)
-    assert projection.dispatch_dry_run()["selected_account_id"] == "FLOW-024"
-
-
-def test_no_eligible_worker_returns_no_eligible_worker(tmp_path):
-    projection, _, _ = candidates_for(tmp_path, {"FLOW-024": ready_details(runtime_status="stopped")}, [{"account_id": "FLOW-024"}])
-    result = projection.dispatch_dry_run()
-    assert result["result"] == "no_eligible_worker"
-    assert result["ok"] is False
-    assert result["side_effects"] is False
-
-
 def test_runtime_instance_id_is_required_to_prevent_stale_worker_selection(tmp_path):
     projection, _, _ = candidates_for(tmp_path, {"FLOW-024": ready_details(runtime_instance_id=None)}, [{"account_id": "FLOW-024"}])
     candidate = projection.candidates()[0]
@@ -207,7 +167,6 @@ def test_safe_output_contains_no_sensitive_material(tmp_path):
     projection, _, _ = candidates_for(tmp_path, {"FLOW-024": ready_details()}, [{"account_id": "FLOW-024"}])
     payload = json.dumps({
         "candidates": [candidate.to_dict() for candidate in projection.candidates()],
-        "dry_run": projection.dispatch_dry_run(),
     })
     lowered = payload.lower()
     assert "cookie" not in lowered

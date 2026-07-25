@@ -43,6 +43,7 @@ class GatewaySettings:
     omni_10s_credit_cost: int = 15
     db_path: Path = Path(r"D:\Codex\projects\flow_gateway_poc\data\gateway.db")
     workers_path: Path = Path(__file__).parent / "workers.json"
+    worker_source: str = "runtime_registry"
     dry_run_step_seconds: tuple[float, float, float] = (1.0, 2.0, 3.0)
     worker_refresh_interval_seconds: float = 1.0
 
@@ -57,5 +58,6 @@ class GatewaySettings:
             canary_limit=int(os.environ.get("CANARY_LIMIT", "2")),
             omni_10s_credit_cost=int(os.environ.get("OMNI_10S_CREDIT_COST", "15")),
             db_path=Path(os.environ.get("GATEWAY_DB_PATH", r"D:\Codex\projects\flow_gateway_poc\data\gateway.db")),
+            worker_source=os.environ.get("FLOWKIT_GATEWAY_WORKER_SOURCE", "runtime_registry"),
             dry_run_step_seconds=_float_tuple("DRY_RUN_STEP_SECONDS", (1.0, 2.0, 3.0)),
         )
