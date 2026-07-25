@@ -1,8 +1,12 @@
 import pytest
+import tempfile
+import uuid
 from pathlib import Path
 
 from agent.db import crud
 from agent.db.schema import close_db, init_db
+
+RUN_ROOT = Path(tempfile.gettempdir()) / "flowkit-omni-tests" / uuid.uuid4().hex
 
 
 @pytest.mark.asyncio
@@ -10,7 +14,7 @@ async def test_omni_test_job_persists_independently(monkeypatch):
     import agent.config as config
     import agent.db.schema as schema
 
-    temp_dir = Path(".tmp") / "tests" / "omni_jobs_db"
+    temp_dir = RUN_ROOT / "omni_jobs_db"
     temp_dir.mkdir(parents=True, exist_ok=True)
     db_path = temp_dir / "flow_agent.db"
     for suffix in ("", "-wal", "-shm"):
@@ -50,7 +54,7 @@ async def test_omni_test_job_idempotency_key_reuses_original_job(monkeypatch):
     import agent.config as config
     import agent.db.schema as schema
 
-    temp_dir = Path(".tmp") / "tests" / "omni_jobs_idempotency"
+    temp_dir = RUN_ROOT / "omni_jobs_idempotency"
     temp_dir.mkdir(parents=True, exist_ok=True)
     db_path = temp_dir / "flow_agent.db"
     for suffix in ("", "-wal", "-shm"):

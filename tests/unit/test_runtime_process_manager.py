@@ -206,7 +206,15 @@ def test_start_worker_only_uses_account_env_and_does_not_launch_chrome(tmp_path,
         launched.append(proc)
         return proc
 
-    manager = RuntimeManager(registry, inspector=inspector, popen=fake_popen, chrome_path=tmp_path / "chrome.exe", extension_dir=extension_dir, ownership_protector=FakeSecretProtector())
+    manager = RuntimeManager(
+        registry,
+        inspector=inspector,
+        popen=fake_popen,
+        chrome_path=tmp_path / "chrome.exe",
+        extension_dir=extension_dir,
+        ownership_protector=FakeSecretProtector(),
+        log_dir=tmp_path / "logs" / "runtime",
+    )
     monkeypatch.setattr("runtime.process_manager.port_is_listening", lambda port: False)
 
     result = manager.start_worker_only("FLOW-005")

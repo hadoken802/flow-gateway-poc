@@ -1,7 +1,11 @@
 import asyncio
+import tempfile
+import uuid
 from pathlib import Path
 
 import pytest
+
+RUN_ROOT = Path(tempfile.gettempdir()) / "flowkit-gateway-tests" / uuid.uuid4().hex
 
 
 class FakeWorkerClient:
@@ -68,7 +72,7 @@ class FakeRealWorkerClient(FakeWorkerClient):
 
 
 def local_db(name):
-    path = Path(".tmp") / "tests" / name / "gateway.db"
+    path = RUN_ROOT / name / "gateway.db"
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         path.unlink()
@@ -231,7 +235,7 @@ async def test_real_mode_posts_to_worker_and_passes_idempotency_key():
     from gateway.config import GatewaySettings
 
     states = {"FLOW-001": {"credits": 5}, "FLOW-002": {"credits": 50}, "FLOW-003": {"credits": 50}}
-    client = FakeRealWorkerClient(states, output_dir=Path(".tmp") / "tests" / "real_submit_outputs")
+    client = FakeRealWorkerClient(states, output_dir=RUN_ROOT / "real_submit_outputs")
     settings = GatewaySettings(db_path=local_db("real_submit"), dry_run=False)
     scheduler = make_scheduler(settings, client)
     await scheduler.start()
@@ -260,6 +264,8 @@ async def test_real_mode_posts_to_worker_and_passes_idempotency_key():
     task = (await scheduler.list_tasks())[0]
     assert task["worker_job_id"] == "job-real-1"
     assert task["assigned_account_id"] == "FLOW-002"
+    assert task["error_code"] is None
+    assert task["error_message"] is None
     assert task["video_path"].endswith("job-real-1.mp4")
     await scheduler.stop()
 
@@ -321,7 +327,7 @@ async def test_real_mode_does_not_repost_after_worker_job_id_is_saved():
     from gateway.config import GatewaySettings
 
     states = {"FLOW-001": {"credits": 5}, "FLOW-002": {"credits": 50}, "FLOW-003": {"credits": 50}}
-    client = FakeRealWorkerClient(states, output_dir=Path(".tmp") / "tests" / "real_restart_outputs")
+    client = FakeRealWorkerClient(states, output_dir=RUN_ROOT / "real_restart_outputs")
     settings = GatewaySettings(db_path=local_db("real_restart"), dry_run=False)
     scheduler = make_scheduler(settings, client)
     await scheduler.start()
@@ -332,7 +338,7 @@ async def test_real_mode_does_not_repost_after_worker_job_id_is_saved():
         await asyncio.sleep(0.02)
     await scheduler.stop()
 
-    client2 = FakeRealWorkerClient(states, output_dir=Path(".tmp") / "tests" / "real_restart_outputs")
+    client2 = FakeRealWorkerClient(states, output_dir=RUN_ROOT / "real_restart_outputs")
     client2.jobs = dict(client.jobs)
     scheduler2 = make_scheduler(settings, client2)
     await scheduler2.start()
@@ -352,7 +358,7 @@ async def test_real_mode_retries_download_for_existing_worker_job_without_new_ta
     from gateway import crud
     from gateway.db import connect
 
-    output_dir = Path(".tmp") / "tests" / "gateway_retry_outputs"
+    output_dir = RUN_ROOT / "gateway_retry_outputs"
     output_dir.mkdir(parents=True, exist_ok=True)
     video_file = output_dir / "job-existing.mp4"
     video_file.write_bytes(b"\x00\x00\x00\x18ftypmp42")
@@ -414,7 +420,7 @@ async def test_real_mode_recovers_manual_review_task_with_existing_worker_job():
     from gateway import crud
     from gateway.db import connect
 
-    output_dir = Path(".tmp") / "tests" / "gateway_manual_review_retry_outputs"
+    output_dir = RUN_ROOT / "gateway_manual_review_retry_outputs"
     output_dir.mkdir(parents=True, exist_ok=True)
     video_file = output_dir / "job-manual.mp4"
     video_file.write_bytes(b"\x00\x00\x00\x18ftypmp42")
@@ -474,7 +480,7 @@ async def test_real_mode_retries_same_idempotency_key_after_lost_http_response()
     from gateway.config import GatewaySettings
 
     states = {"FLOW-001": {"credits": 5}, "FLOW-002": {"credits": 50}, "FLOW-003": {"credits": 50}}
-    client = FakeRealWorkerClient(states, output_dir=Path(".tmp") / "tests" / "lost_response_outputs")
+    client = FakeRealWorkerClient(states, output_dir=RUN_ROOT / "lost_response_outputs")
     client.fail_first_submit = True
     settings = GatewaySettings(db_path=local_db("lost_response"), dry_run=False)
     scheduler = make_scheduler(settings, client)
@@ -534,7 +540,7 @@ async def test_canary_two_tasks_bind_flow_002_and_flow_003_without_double_accoun
     from gateway.config import GatewaySettings
 
     states = {"FLOW-001": {"credits": 5}, "FLOW-002": {"credits": 50}, "FLOW-003": {"credits": 50}}
-    client = FakeRealWorkerClient(states, output_dir=Path(".tmp") / "tests" / "canary_outputs")
+    client = FakeRealWorkerClient(states, output_dir=RUN_ROOT / "canary_outputs")
     settings = GatewaySettings(db_path=local_db("canary"), dry_run=False, canary_only=True, canary_limit=2)
     scheduler = make_scheduler(settings, client)
     await scheduler.start()

@@ -207,7 +207,8 @@ async def complete_real_task(db, task_id, account_id, video_path, remaining_cred
         await db.execute(
             """
             UPDATE flow_tasks
-            SET status='completed', video_path=?, remaining_credits=?, completed_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+            SET status='completed', video_path=?, remaining_credits=?, error_code=NULL, error_message=NULL,
+                completed_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
                 updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
             WHERE task_id=?
             """,
