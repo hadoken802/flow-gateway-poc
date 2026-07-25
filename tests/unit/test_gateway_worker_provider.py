@@ -1,4 +1,6 @@
 import json
+import asyncio
+import time
 
 import pytest
 
@@ -185,3 +187,73 @@ def test_provider_output_contains_no_sensitive_material():
     assert "secret" not in lowered
     assert "nonce" not in lowered
     assert "@" not in payload
+
+
+@pytest.mark.asyncio
+async def test_async_worker_snapshot_refresh_does_not_block_event_loop():
+    class SlowProvider(FakeProvider):
+        def load_workers(self):
+            self.calls += 1
+            if self.calls == 1:
+                return snapshot([])
+            time.sleep(0.2)
+            return snapshot([WorkerConfig("FLOW-024", "http://127.0.0.1:8121", True, "runtime-24")])
+
+    scheduler = GatewayScheduler(GatewaySettings(), worker_provider=SlowProvider([snapshot([])]))
+    refresh = asyncio.create_task(scheduler.async_refresh_worker_snapshot())
+    started = time.perf_counter()
+    await asyncio.sleep(0.02)
+    elapsed = time.perf_counter() - started
+    await refresh
+    assert elapsed < 0.1
+    assert scheduler.workers[0].account_id == "FLOW-024"
+
+
+@pytest.mark.asyncio
+async def test_async_worker_snapshot_refresh_allows_only_one_provider_scan():
+    class SlowProvider(FakeProvider):
+        def __init__(self):
+            super().__init__([snapshot([])])
+            self.active = 0
+            self.max_active = 0
+
+        def load_workers(self):
+            self.calls += 1
+            if self.calls == 1:
+                return snapshot([])
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            try:
+                time.sleep(0.1)
+                return snapshot([WorkerConfig("FLOW-024", "http://127.0.0.1:8121", True, f"runtime-{self.calls}")])
+            finally:
+                self.active -= 1
+
+    provider = SlowProvider()
+    scheduler = GatewayScheduler(GatewaySettings(), worker_provider=provider)
+    await asyncio.gather(scheduler.async_refresh_worker_snapshot(), scheduler.async_refresh_worker_snapshot())
+    assert provider.max_active == 1
+    assert provider.calls == 3
+
+
+@pytest.mark.asyncio
+async def test_run_loop_records_refresh_time_after_scan_finishes():
+    scheduler = GatewayScheduler(GatewaySettings(worker_refresh_interval_seconds=10.0), worker_provider=FakeProvider([snapshot([])]))
+    finished_at = 0.0
+
+    async def slow_refresh():
+        nonlocal finished_at
+        await asyncio.sleep(0.05)
+        finished_at = asyncio.get_running_loop().time()
+
+    async def no_schedule():
+        return None
+
+    scheduler.refresh_workers = slow_refresh
+    scheduler.schedule_once = no_schedule
+    scheduler._last_worker_refresh = 0.0
+    task = asyncio.create_task(scheduler._run_loop())
+    await asyncio.sleep(0.09)
+    scheduler._stopping = True
+    await task
+    assert scheduler._last_worker_refresh >= finished_at

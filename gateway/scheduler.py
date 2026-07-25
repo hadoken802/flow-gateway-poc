@@ -26,6 +26,7 @@ class GatewayScheduler:
         self._stopping = False
         self.assignment_history: list[tuple[str, str]] = []
         self._last_worker_refresh = 0.0
+        self._worker_refresh_lock = asyncio.Lock()
 
     def _load_worker_snapshot(self) -> WorkerSnapshot:
         try:
@@ -34,10 +35,19 @@ class GatewayScheduler:
             raise RuntimeError("runtime_worker_provider_unavailable") from exc
 
     def refresh_worker_snapshot(self) -> WorkerSnapshot:
-        self.worker_snapshot = self._load_worker_snapshot()
-        self.workers = self.worker_snapshot.workers
-        self.account_locks = {worker.account_id: self.account_locks.get(worker.account_id, asyncio.Lock()) for worker in self.workers}
+        self._apply_worker_snapshot(self._load_worker_snapshot())
         return self.worker_snapshot
+
+    async def async_refresh_worker_snapshot(self) -> WorkerSnapshot:
+        async with self._worker_refresh_lock:
+            snapshot = await asyncio.to_thread(self._load_worker_snapshot)
+            self._apply_worker_snapshot(snapshot)
+            return self.worker_snapshot
+
+    def _apply_worker_snapshot(self, snapshot: WorkerSnapshot) -> None:
+        self.worker_snapshot = snapshot
+        self.workers = snapshot.workers
+        self.account_locks = {worker.account_id: self.account_locks.get(worker.account_id, asyncio.Lock()) for worker in self.workers}
 
     async def start(self):
         self._stopping = False
@@ -69,7 +79,7 @@ class GatewayScheduler:
 
     async def refresh_workers(self):
         async with self.assignment_lock:
-            self.refresh_worker_snapshot()
+            await self.async_refresh_worker_snapshot()
             for worker in self.workers:
                 if not worker.enabled:
                     await crud.upsert_account(self.db, worker, status="offline", credits=None)
@@ -129,8 +139,10 @@ class GatewayScheduler:
         while not self._stopping:
             now = asyncio.get_running_loop().time()
             if now - self._last_worker_refresh >= self.settings.worker_refresh_interval_seconds:
-                self._last_worker_refresh = now
-                await self.refresh_workers()
+                try:
+                    await self.refresh_workers()
+                finally:
+                    self._last_worker_refresh = asyncio.get_running_loop().time()
             await self.schedule_once()
             await asyncio.sleep(0.05)
 

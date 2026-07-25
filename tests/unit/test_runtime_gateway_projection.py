@@ -76,11 +76,13 @@ def candidates_for(tmp_path, statuses, accounts):
 
 
 def test_login_required_account_cannot_enter_candidate_pool(tmp_path):
-    projection, _, _ = candidates_for(tmp_path, {"FLOW-024": ready_details()}, [{"status": "login_required"}])
+    projection, _, runtime = candidates_for(tmp_path, {"FLOW-024": ready_details()}, [{"status": "login_required"}])
     candidate = projection.candidates()[0]
     assert candidate.eligible is False
     assert candidate.gateway_status == "login_required"
-    assert candidate.exclusion_reasons == ["registration_not_verified"]
+    assert "registration_not_verified" in candidate.exclusion_reasons
+    assert "runtime_not_running" in candidate.exclusion_reasons
+    assert runtime.calls == []
 
 
 def test_stopped_unhealthy_extension_mismatch_ownership_and_disabled_are_excluded(tmp_path):
@@ -108,6 +110,7 @@ def test_stopped_unhealthy_extension_mismatch_ownership_and_disabled_are_exclude
     assert "account_mismatch" in by_id["FLOW-004"].exclusion_reasons
     assert "ownership_not_verified" in by_id["FLOW-005"].exclusion_reasons
     assert by_id["FLOW-006"].exclusion_reasons[0] == "disabled"
+    assert "FLOW-006" not in projection.status_provider.calls
 
 
 def test_all_conditions_met_projects_ready(tmp_path):
@@ -154,6 +157,36 @@ def test_runtime_registry_is_the_only_identity_source(tmp_path):
     projection, _, runtime = candidates_for(tmp_path, {"FLOW-024": ready_details()}, [{"account_id": "FLOW-024"}])
     assert [candidate.account_id for candidate in projection.candidates()] == ["FLOW-024"]
     assert runtime.calls == ["FLOW-024"]
+
+
+def test_disabled_account_does_not_call_runtime_status_provider(tmp_path):
+    projection, _, runtime = candidates_for(tmp_path, {"FLOW-024": ready_details()}, [{"account_id": "FLOW-024", "enabled": False}])
+    candidate = projection.candidates()[0]
+    assert candidate.eligible is False
+    assert candidate.gateway_status == "disabled"
+    assert runtime.calls == []
+
+
+def test_twenty_two_accounts_probe_only_login_verified_enabled_account(tmp_path):
+    registry = make_registry(tmp_path)
+    statuses = {"FLOW-024": ready_details()}
+    for idx in list(range(1, 20)) + [22, 23, 24]:
+        account_id = f"FLOW-{idx:03d}"
+        add_account(
+            registry,
+            account_id=account_id,
+            status="login_verified" if account_id == "FLOW-024" else "login_required",
+            enabled=True,
+        )
+    runtime = FakeRuntime(statuses)
+    candidates = GatewayProjection(registry, runtime).candidates()
+    by_id = {candidate.account_id: candidate for candidate in candidates}
+    assert len(candidates) == 22
+    assert runtime.calls == ["FLOW-024"]
+    assert by_id["FLOW-024"].gateway_status == "ready"
+    assert by_id["FLOW-024"].eligible is True
+    assert by_id["FLOW-022"].eligible is False
+    assert by_id["FLOW-023"].eligible is False
 
 
 def test_runtime_instance_id_is_required_to_prevent_stale_worker_selection(tmp_path):

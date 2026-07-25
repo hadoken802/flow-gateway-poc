@@ -65,7 +65,10 @@ class GatewayProjection:
         return [self._candidate_for(account) for account in self.registry.list_accounts()]
 
     def _candidate_for(self, account) -> GatewayCandidate:
-        details = self.status_provider.status(account)
+        if not account.enabled or account.status != "login_verified":
+            details = self._unprobed_details(account)
+        else:
+            details = self.status_provider.status(account)
         extension_connected = bool(details.get("extension_connected"))
         account_match = bool(details.get("account_match"))
         extension_ready = bool(extension_connected and account_match)
@@ -113,6 +116,22 @@ class GatewayProjection:
             worker_ws_endpoint=f"ws://127.0.0.1:{int(account.extension_ws_port)}",
             current_task_id=None,
         )
+
+    def _unprobed_details(self, account) -> dict:
+        return {
+            "runtime_status": "stopped",
+            "runtime_healthy": False,
+            "chrome_process_alive": False,
+            "worker_process_alive": False,
+            "worker_health_reachable": False,
+            "extension_connected": False,
+            "account_match": False,
+            "chrome_ownership_verified": False,
+            "worker_ownership_verified": False,
+            "worker_ownership_verified_at": account.worker_ownership_verified_at,
+            "runtime_instance_id": account.runtime_instance_id,
+            "stop_safe": False,
+        }
 
     def _gateway_status(self, enabled: bool, registration_status: str, details: dict, eligible: bool, reasons: list[str]) -> str:
         if not enabled:
