@@ -70,6 +70,7 @@ class GatewaySettings:
     worker_refresh_interval_seconds: float = 1.0
     real_submit_max_attempts: int = 1
     worker_submit_timeout_seconds: float = 300.0
+    allowed_account_ids: tuple[str, ...] = ()
 
     @classmethod
     def from_env(cls) -> "GatewaySettings":
@@ -86,4 +87,17 @@ class GatewaySettings:
             dry_run_step_seconds=_float_tuple("DRY_RUN_STEP_SECONDS", (1.0, 2.0, 3.0)),
             real_submit_max_attempts=_positive_int("REAL_SUBMIT_MAX_ATTEMPTS", 1),
             worker_submit_timeout_seconds=_positive_float("GATEWAY_WORKER_SUBMIT_TIMEOUT_SECONDS", 300.0),
+            allowed_account_ids=_account_ids("GATEWAY_ALLOWED_ACCOUNT_IDS"),
         )
+
+
+def _account_ids(name: str) -> tuple[str, ...]:
+    raw = os.environ.get(name, "")
+    seen = set()
+    result = []
+    for item in raw.split(","):
+        account_id = item.strip()
+        if account_id and account_id not in seen:
+            seen.add(account_id)
+            result.append(account_id)
+    return tuple(result)

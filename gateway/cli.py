@@ -48,6 +48,8 @@ def main(argv: list[str] | None = None) -> int:
     batch.add_argument("--timeout-seconds", type=int, default=1200)
     batch.add_argument("--gateway-port", type=int)
     batch.add_argument("--test-mode", action="store_true")
+    batch.add_argument("--account-ids")
+    batch.add_argument("--preflight-only", action="store_true")
     reconcile = subparsers.add_parser("reconcile-existing-run")
     reconcile.add_argument("--run-dir", required=True)
     reconcile.add_argument("--output-run-dir")

@@ -312,6 +312,8 @@ class GatewayScheduler:
         preferred_account_id = task.get("preferred_account_id")
         eligible = []
         for worker in snapshot.workers:
+            if self.settings.allowed_account_ids and worker.account_id not in self.settings.allowed_account_ids:
+                continue
             if preferred_account_id and worker.account_id != preferred_account_id:
                 continue
             account = states.get(worker.account_id)

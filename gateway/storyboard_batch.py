@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any
 
 from . import cli
+from .worker_client import WorkerClient
+from .worker_provider import RuntimeRegistryWorkerProvider
 
 
 SUPPORTED_MIME_TYPES = {"image/png", "image/jpeg", "image/webp"}
@@ -39,18 +41,25 @@ def run_storyboard_batch(args: argparse.Namespace) -> dict[str, Any]:
     port = int(args.gateway_port) if getattr(args, "gateway_port", None) else cli._find_free_local_port()
     try:
         shots = load_manifest(Path(args.manifest))
+        account_ids = parse_account_ids(getattr(args, "account_ids", None))
         concurrency = _validate_concurrency(int(getattr(args, "concurrency", 3)))
         timeout_seconds = int(getattr(args, "timeout_seconds", 1200))
         if timeout_seconds <= 0:
             raise StoryboardBatchError("input_validation_failed", "timeout-seconds must be positive")
         run_dir = cli._create_run_dir(Path(args.output_dir) if getattr(args, "output_dir", None) else cli.DEFAULT_RUN_ROOT)
+        preflight = run_preflight(shots, account_ids, run_dir)
+        if getattr(args, "preflight_only", False):
+            return preflight
+        if account_ids and not preflight.get("ok"):
+            return preflight
         db_path = run_dir / "gateway.db"
         log_path = run_dir / "gateway.log"
-        gateway_process = _start_gateway_for_batch(port, db_path, log_path, concurrency, bool(getattr(args, "test_mode", False)))
+        gateway_process = _start_gateway_for_batch(port, db_path, log_path, concurrency, bool(getattr(args, "test_mode", False)), account_ids)
         cli._wait_for_gateway(port)
         tasks = _post_tasks(port, shots)
         final_tasks = _wait_for_tasks(port, tasks, timeout_seconds)
         result = _result(run_dir, port, gateway_process.pid if gateway_process else None, shots, final_tasks)
+        result.update(_account_summary(preflight))
         result["gateway_stopped"] = _stop_gateway(gateway_process)
         gateway_process = None
         _write_result(run_dir, result)
@@ -113,7 +122,128 @@ def _validate_concurrency(value: int) -> int:
     return value
 
 
-def _start_gateway_for_batch(port: int, db_path: Path, log_path: Path, concurrency: int, test_mode: bool):
+def parse_account_ids(value: str | None) -> list[str]:
+    seen = set()
+    result = []
+    for item in (value or "").split(","):
+        account_id = item.strip()
+        if account_id and account_id not in seen:
+            seen.add(account_id)
+            result.append(account_id)
+    return result
+
+
+def run_preflight(shots: list[StoryboardShot], account_ids: list[str], run_dir: Path) -> dict[str, Any]:
+    provider = RuntimeRegistryWorkerProvider()
+    snapshot = provider.load_workers()
+    workers = {worker.account_id: worker for worker in snapshot.workers}
+    candidates = {candidate["account_id"]: candidate for candidate in snapshot.candidates}
+    client = WorkerClient()
+    requested = list(account_ids)
+    target_ids = requested or sorted(workers)
+    accounts = []
+    eligible = []
+    excluded: dict[str, list[str]] = {}
+    required_credits = 15
+    missing = [account_id for account_id in requested if account_id not in candidates]
+    for account_id in target_ids:
+        candidate = candidates.get(account_id, {"account_id": account_id, "exclusion_reasons": ["account_not_found"]})
+        worker = workers.get(account_id)
+        reasons = list(candidate.get("exclusion_reasons") or [])
+        credits = None
+        credits_http_status = None
+        if not worker:
+            reasons.append("not_ready_worker")
+        else:
+            try:
+                info = _run_async(client.inspect(worker))
+                credits_http_status = 200
+                credits = info.get("credits")
+                if info.get("status") == "offline":
+                    reasons.append("worker_offline")
+                if not info.get("extension_connected"):
+                    reasons.append("extension_not_connected")
+                if not info.get("flow_key_present"):
+                    reasons.append("flow_key_missing")
+            except Exception as exc:
+                credits_http_status = None
+                reasons.append(type(exc).__name__)
+        enough = isinstance(credits, int) and credits >= required_credits
+        if not enough:
+            reasons.append("insufficient_credits")
+        if candidate.get("current_task_id"):
+            reasons.append("account_busy")
+        deduped = []
+        for reason in reasons:
+            if reason not in deduped:
+                deduped.append(reason)
+        eligible_for_batch = not deduped and bool(worker)
+        if eligible_for_batch:
+            eligible.append(account_id)
+        else:
+            excluded[account_id] = deduped
+        accounts.append({
+            "account_id": account_id,
+            "worker_api_endpoint": candidate.get("worker_api_endpoint") or (worker.api_url if worker else None),
+            "runtime_instance_id": candidate.get("runtime_instance_id") or (worker.runtime_instance_id if worker else None),
+            "registration_status": candidate.get("registration_status"),
+            "runtime_status": candidate.get("runtime_status"),
+            "runtime_healthy": bool(candidate.get("runtime_healthy")),
+            "extension_ready": bool(candidate.get("extension_ready")),
+            "account_match": bool(candidate.get("account_match")),
+            "ownership_verified": bool(candidate.get("ownership_verified")),
+            "worker_health_reachable": bool(candidate.get("worker_health_reachable")),
+            "credits_http_status": credits_http_status,
+            "credits": credits,
+            "required_credits": required_credits,
+            "enough_credits": enough,
+            "current_task_id": candidate.get("current_task_id"),
+            "eligible_for_batch": eligible_for_batch,
+            "exclusion_reasons": deduped,
+        })
+    if requested and "FLOW-024" in candidates and "FLOW-024" not in requested:
+        excluded["FLOW-024"] = ["excluded_by_allowlist"]
+        accounts.append({
+            "account_id": "FLOW-024",
+            "excluded_by_allowlist": True,
+            "eligible_for_batch": False,
+            "exclusion_reasons": ["excluded_by_allowlist"],
+        })
+    ok = not missing and (not requested or set(eligible) == set(requested))
+    result = {
+        "ok": ok,
+        "result": "preflight_passed" if ok else "preflight_failed",
+        "run_dir": str(run_dir),
+        "shot_count": len(shots),
+        "requested_account_ids": requested,
+        "eligible_account_ids": eligible,
+        "excluded_account_ids": list(excluded),
+        "excluded_reasons": excluded,
+        "accounts": accounts,
+        "gateway_started": False,
+        "project_create_call_count": 0,
+        "worker_submit_call_count": 0,
+    }
+    (run_dir / "preflight-result.json").write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+    return result
+
+
+def _run_async(coro):
+    import asyncio
+
+    return asyncio.run(coro)
+
+
+def _account_summary(preflight: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "requested_account_ids": preflight.get("requested_account_ids", []),
+        "eligible_account_ids": preflight.get("eligible_account_ids", []),
+        "excluded_account_ids": preflight.get("excluded_account_ids", []),
+        "excluded_reasons": preflight.get("excluded_reasons", {}),
+    }
+
+
+def _start_gateway_for_batch(port: int, db_path: Path, log_path: Path, concurrency: int, test_mode: bool, account_ids: list[str] | None = None):
     import os
     import subprocess
     import sys
@@ -130,6 +260,7 @@ def _start_gateway_for_batch(port: int, db_path: Path, log_path: Path, concurren
         "FLOWKIT_GATEWAY_WORKER_SOURCE": "runtime_registry",
         "GATEWAY_DB_PATH": str(db_path),
         "GATEWAY_LAUNCHER_PID": str(os.getpid()),
+        "GATEWAY_ALLOWED_ACCOUNT_IDS": ",".join(account_ids or []),
     })
     stdout = log_path.open("ab")
     return subprocess.Popen(

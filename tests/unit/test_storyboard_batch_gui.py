@@ -55,13 +55,21 @@ def test_storyboard_batch_starts_one_gateway_and_writes_one_database(tmp_path, m
         def terminate(self): pass
         def wait(self, timeout=None): return 0
 
-    def start(port, db_path, log_path, concurrency, test_mode):
+    def start(port, db_path, log_path, concurrency, test_mode, account_ids=None):
         calls.setdefault("starts", 0)
         calls["starts"] += 1
         calls["db_path"] = db_path
         calls["concurrency"] = concurrency
+        calls["account_ids"] = account_ids
         return Proc()
 
+    monkeypatch.setattr(storyboard_batch, "run_preflight", lambda shots, account_ids, run_dir: {
+        "ok": True,
+        "requested_account_ids": [],
+        "eligible_account_ids": [],
+        "excluded_account_ids": [],
+        "excluded_reasons": {},
+    })
     monkeypatch.setattr(storyboard_batch, "_start_gateway_for_batch", start)
     monkeypatch.setattr(storyboard_batch.cli, "_wait_for_gateway", lambda port: None)
     monkeypatch.setattr(storyboard_batch, "_post_tasks", lambda port, shots: [{"task_id": "task-1"}])
@@ -78,13 +86,443 @@ def test_storyboard_batch_starts_one_gateway_and_writes_one_database(tmp_path, m
     assert calls["starts"] == 1
     assert calls["db_path"] == Path(result["run_dir"]) / "gateway.db"
     assert calls["concurrency"] == 3
+    assert calls["account_ids"] == []
     assert (Path(result["run_dir"]) / "batch-result.json").exists()
+
+
+def test_storyboard_batch_parse_account_ids_dedupes_stably():
+    from gateway.storyboard_batch import parse_account_ids
+
+    assert parse_account_ids("FLOW-025,FLOW-026,FLOW-025, FLOW-027 ") == ["FLOW-025", "FLOW-026", "FLOW-027"]
+
+
+def test_storyboard_preflight_only_does_not_start_gateway_or_post_tasks(tmp_path, monkeypatch):
+    from gateway import storyboard_batch
+    from gateway.worker_provider import WorkerConfig, WorkerSnapshot
+
+    image = png(tmp_path / "a.png")
+    path = manifest(tmp_path, [{"shot_id": "001", "image": str(image.resolve()), "prompt": "p", "duration": 10, "aspect_ratio": "9:16"}])
+
+    class Provider:
+        def load_workers(self):
+            workers = [
+                WorkerConfig("FLOW-025", "http://worker-25", True, "runtime-25"),
+                WorkerConfig("FLOW-026", "http://worker-26", True, "runtime-26"),
+                WorkerConfig("FLOW-027", "http://worker-27", True, "runtime-27"),
+            ]
+            candidates = [
+                {
+                    "account_id": worker.account_id,
+                    "eligible": True,
+                    "registration_status": "login_verified",
+                    "runtime_status": "running",
+                    "runtime_healthy": True,
+                    "extension_ready": True,
+                    "account_match": True,
+                    "ownership_verified": True,
+                    "worker_health_reachable": True,
+                    "worker_api_endpoint": worker.api_url,
+                    "runtime_instance_id": worker.runtime_instance_id,
+                    "current_task_id": None,
+                    "exclusion_reasons": [],
+                }
+                for worker in workers
+            ]
+            candidates.append({"account_id": "FLOW-024", "eligible": True, "exclusion_reasons": []})
+            return WorkerSnapshot(workers, candidates, "runtime_registry", "Fake", "now")
+
+    class Client:
+        async def inspect(self, worker):
+            return {"status": "ok", "credits": 35, "extension_connected": True, "flow_key_present": True}
+
+    monkeypatch.setattr(storyboard_batch, "RuntimeRegistryWorkerProvider", lambda: Provider())
+    monkeypatch.setattr(storyboard_batch, "WorkerClient", lambda: Client())
+    monkeypatch.setattr(storyboard_batch, "_start_gateway_for_batch", lambda *_args: (_ for _ in ()).throw(AssertionError("must not start gateway")))
+    monkeypatch.setattr(storyboard_batch, "_post_tasks", lambda *_args: (_ for _ in ()).throw(AssertionError("must not create gateway tasks")))
+
+    result = storyboard_batch.run_storyboard_batch(argparse.Namespace(
+        manifest=str(path.resolve()),
+        concurrency=3,
+        output_dir=str(tmp_path),
+        timeout_seconds=1200,
+        gateway_port=8888,
+        test_mode=False,
+        account_ids="FLOW-025,FLOW-026,FLOW-025,FLOW-027",
+        preflight_only=True,
+    ))
+
+    assert result["ok"] is True
+    assert result["requested_account_ids"] == ["FLOW-025", "FLOW-026", "FLOW-027"]
+    assert set(result["eligible_account_ids"]) == {"FLOW-025", "FLOW-026", "FLOW-027"}
+    assert result["excluded_reasons"]["FLOW-024"] == ["excluded_by_allowlist"]
+    assert result["gateway_started"] is False
+    assert result["project_create_call_count"] == 0
+    assert result["worker_submit_call_count"] == 0
+    assert (Path(result["run_dir"]) / "preflight-result.json").exists()
+
+
+def test_storyboard_preflight_blocks_low_credit_account_before_gateway_tasks(tmp_path, monkeypatch):
+    from gateway import storyboard_batch
+    from gateway.worker_provider import WorkerConfig, WorkerSnapshot
+
+    image = png(tmp_path / "a.png")
+    path = manifest(tmp_path, [{"shot_id": "001", "image": str(image.resolve()), "prompt": "p", "duration": 10, "aspect_ratio": "9:16"}])
+
+    class Provider:
+        def load_workers(self):
+            workers = [
+                WorkerConfig("FLOW-025", "http://worker-25", True, "runtime-25"),
+                WorkerConfig("FLOW-026", "http://worker-26", True, "runtime-26"),
+                WorkerConfig("FLOW-027", "http://worker-27", True, "runtime-27"),
+            ]
+            candidates = [{"account_id": worker.account_id, "eligible": True, "worker_api_endpoint": worker.api_url, "runtime_instance_id": worker.runtime_instance_id, "current_task_id": None, "exclusion_reasons": []} for worker in workers]
+            return WorkerSnapshot(workers, candidates, "runtime_registry", "Fake", "now")
+
+    class Client:
+        async def inspect(self, worker):
+            return {"status": "ok", "credits": 5 if worker.account_id == "FLOW-027" else 35, "extension_connected": True, "flow_key_present": True}
+
+    monkeypatch.setattr(storyboard_batch, "RuntimeRegistryWorkerProvider", lambda: Provider())
+    monkeypatch.setattr(storyboard_batch, "WorkerClient", lambda: Client())
+    monkeypatch.setattr(storyboard_batch, "_start_gateway_for_batch", lambda *_args: (_ for _ in ()).throw(AssertionError("must not start gateway")))
+    monkeypatch.setattr(storyboard_batch, "_post_tasks", lambda *_args: (_ for _ in ()).throw(AssertionError("must not create gateway tasks")))
+
+    result = storyboard_batch.run_storyboard_batch(argparse.Namespace(
+        manifest=str(path.resolve()),
+        concurrency=3,
+        output_dir=str(tmp_path),
+        timeout_seconds=1200,
+        gateway_port=8888,
+        test_mode=False,
+        account_ids="FLOW-025,FLOW-026,FLOW-027",
+        preflight_only=False,
+    ))
+
+    assert result["ok"] is False
+    assert result["excluded_reasons"]["FLOW-027"] == ["insufficient_credits"]
+    assert result["project_create_call_count"] == 0
+    assert result["worker_submit_call_count"] == 0
+
+
+def test_storyboard_preflight_blocks_missing_and_credit_request_failed_accounts(tmp_path, monkeypatch):
+    from gateway import storyboard_batch
+    from gateway.worker_provider import WorkerConfig, WorkerSnapshot
+
+    image = png(tmp_path / "a.png")
+    shots = storyboard_batch.load_manifest(manifest(tmp_path, [{"shot_id": "001", "image": str(image.resolve()), "prompt": "p", "duration": 10, "aspect_ratio": "9:16"}]).resolve())
+
+    class Provider:
+        def load_workers(self):
+            worker = WorkerConfig("FLOW-025", "http://worker-25", True, "runtime-25")
+            candidate = {
+                "account_id": "FLOW-025",
+                "eligible": True,
+                "worker_api_endpoint": worker.api_url,
+                "runtime_instance_id": worker.runtime_instance_id,
+                "current_task_id": None,
+                "exclusion_reasons": [],
+            }
+            return WorkerSnapshot([worker], [candidate], "runtime_registry", "Fake", "now")
+
+    class Client:
+        async def inspect(self, worker):
+            raise TimeoutError("credits unavailable")
+
+    monkeypatch.setattr(storyboard_batch, "RuntimeRegistryWorkerProvider", lambda: Provider())
+    monkeypatch.setattr(storyboard_batch, "WorkerClient", lambda: Client())
+
+    result = storyboard_batch.run_preflight(shots, ["FLOW-025", "FLOW-027"], tmp_path)
+
+    assert result["ok"] is False
+    assert "TimeoutError" in result["excluded_reasons"]["FLOW-025"]
+    assert "account_not_found" in result["excluded_reasons"]["FLOW-027"]
+    assert "not_ready_worker" in result["excluded_reasons"]["FLOW-027"]
+    assert result["accounts"][0]["credits_http_status"] is None
+
+
+def test_storyboard_preflight_blocks_busy_account_without_changing_current_task(tmp_path, monkeypatch):
+    from gateway import storyboard_batch
+    from gateway.worker_provider import WorkerConfig, WorkerSnapshot
+
+    image = png(tmp_path / "a.png")
+    shots = storyboard_batch.load_manifest(manifest(tmp_path, [{"shot_id": "001", "image": str(image.resolve()), "prompt": "p", "duration": 10, "aspect_ratio": "9:16"}]).resolve())
+
+    class Provider:
+        def load_workers(self):
+            worker = WorkerConfig("FLOW-025", "http://worker-25", True, "runtime-25")
+            candidate = {
+                "account_id": "FLOW-025",
+                "eligible": True,
+                "worker_api_endpoint": worker.api_url,
+                "runtime_instance_id": worker.runtime_instance_id,
+                "current_task_id": "task-existing",
+                "exclusion_reasons": [],
+            }
+            return WorkerSnapshot([worker], [candidate], "runtime_registry", "Fake", "now")
+
+    class Client:
+        async def inspect(self, worker):
+            return {"status": "ok", "credits": 35, "extension_connected": True, "flow_key_present": True}
+
+    monkeypatch.setattr(storyboard_batch, "RuntimeRegistryWorkerProvider", lambda: Provider())
+    monkeypatch.setattr(storyboard_batch, "WorkerClient", lambda: Client())
+
+    result = storyboard_batch.run_preflight(shots, ["FLOW-025"], tmp_path)
+
+    account = result["accounts"][0]
+    assert result["ok"] is False
+    assert account["current_task_id"] == "task-existing"
+    assert "account_busy" in account["exclusion_reasons"]
+
+
+def test_storyboard_batch_without_allowlist_keeps_existing_path_compatible(tmp_path, monkeypatch):
+    from gateway import storyboard_batch
+
+    image = png(tmp_path / "a.png")
+    path = manifest(tmp_path, [{"shot_id": "001", "image": str(image.resolve()), "prompt": "p", "duration": 10, "aspect_ratio": "9:16"}])
+    calls = {}
+    video = tmp_path / "out.mp4"
+    video.write_bytes(b"\x00\x00\x00\x18ftypmp42")
+
+    class Proc:
+        pid = 123
+        def poll(self): return None
+        def terminate(self): pass
+        def wait(self, timeout=None): return 0
+
+    def start(port, db_path, log_path, concurrency, test_mode, account_ids=None):
+        calls["account_ids"] = account_ids
+        return Proc()
+
+    monkeypatch.setattr(storyboard_batch, "run_preflight", lambda shots, account_ids, run_dir: {
+        "ok": True,
+        "requested_account_ids": [],
+        "eligible_account_ids": [],
+        "excluded_account_ids": [],
+        "excluded_reasons": {},
+    })
+    monkeypatch.setattr(storyboard_batch, "_start_gateway_for_batch", start)
+    monkeypatch.setattr(storyboard_batch.cli, "_wait_for_gateway", lambda port: None)
+    monkeypatch.setattr(storyboard_batch, "_post_tasks", lambda port, shots: [{"task_id": "task-1"}])
+    monkeypatch.setattr(storyboard_batch, "_wait_for_tasks", lambda port, tasks, timeout: [{
+        "task_id": "task-1", "project_id": "project-1", "assigned_account_id": "FLOW-025",
+        "assigned_runtime_instance_id": "runtime-25", "worker_job_id": "job-1", "attempt_count": 1,
+        "status": "completed", "error_code": None, "error_message": None, "video_path": str(video),
+    }])
+    monkeypatch.setattr(storyboard_batch, "_stop_gateway", lambda proc: True)
+
+    result = storyboard_batch.run_storyboard_batch(argparse.Namespace(
+        manifest=str(path.resolve()),
+        concurrency=3,
+        output_dir=str(tmp_path),
+        timeout_seconds=1200,
+        gateway_port=8888,
+        test_mode=True,
+        account_ids=None,
+        preflight_only=False,
+    ))
+
+    assert result["ok"] is True
+    assert calls["account_ids"] == []
 
 
 def test_storyboard_gui_import_does_not_start_mainloop():
     import gateway.storyboard_gui as gui
 
     assert hasattr(gui, "StoryboardGui")
+
+
+class FakeVar:
+    def __init__(self, value):
+        self.value = value
+
+    def get(self):
+        return self.value
+
+    def set(self, value):
+        self.value = value
+
+
+class FakeButton:
+    def __init__(self):
+        self.state = None
+
+    def configure(self, state):
+        self.state = state
+
+
+class FakeTree:
+    def __init__(self, selection=()):
+        self._selection = selection
+
+    def selection(self):
+        return self._selection
+
+
+def make_gui_shell(tmp_path, runner=None):
+    from gateway.storyboard_gui import StoryboardGui
+
+    gui = object.__new__(StoryboardGui)
+    gui.batch_runner = runner or (lambda args: {"ok": True, "tasks": []})
+    gui.shots = []
+    gui.account_rows = {}
+    gui.selected_account_ids = set()
+    gui.batch_thread = None
+    gui.preflight_thread = None
+    gui.last_result = None
+    gui.start_button = FakeButton()
+    gui.preflight_button = FakeButton()
+    gui.concurrency = FakeVar(3)
+    gui.timeout_seconds = FakeVar(1200)
+    gui.output_dir = FakeVar(str(tmp_path))
+    gui.auto_scroll = FakeVar(False)
+    gui._render_accounts = lambda: None
+    gui._render_shots = lambda: None
+    gui._log = lambda text: None
+    gui.after = lambda _delay, func: func()
+    return gui
+
+
+def test_storyboard_gui_selected_accounts_are_passed_to_batch(tmp_path):
+    from gateway.storyboard_gui import StoryboardGui
+
+    image = png(tmp_path / "a.png")
+    calls = []
+    gui = make_gui_shell(tmp_path, lambda args: calls.append(args) or {"ok": False, "accounts": []})
+    gui.account_rows = {account_id: {"account_id": account_id} for account_id in ["FLOW-024", "FLOW-025", "FLOW-026", "FLOW-027"]}
+    gui.selected_account_ids = {"FLOW-025", "FLOW-026", "FLOW-027"}
+    gui.shots = [{"shot_id": "001", "image": str(image), "prompt": "p", "duration": 10, "aspect_ratio": "9:16"}]
+
+    args = StoryboardGui._build_batch_args(gui, preflight_only=False)
+
+    assert args.account_ids == "FLOW-025,FLOW-026,FLOW-027"
+    assert "FLOW-024" not in args.account_ids
+    assert args.preflight_only is False
+
+
+def test_storyboard_gui_preflight_uses_same_batch_service_without_gateway(tmp_path):
+    from gateway.storyboard_gui import StoryboardGui
+
+    image = png(tmp_path / "a.png")
+    calls = []
+    gui = make_gui_shell(tmp_path, lambda args: calls.append(args) or {
+        "ok": True,
+        "result": "preflight_passed",
+        "gateway_started": False,
+        "project_create_call_count": 0,
+        "worker_submit_call_count": 0,
+        "accounts": [
+            {"account_id": "FLOW-025", "credits": 35, "credits_http_status": 200, "eligible_for_batch": True},
+            {"account_id": "FLOW-026", "credits": 35, "credits_http_status": 200, "eligible_for_batch": True},
+            {"account_id": "FLOW-027", "credits": 50, "credits_http_status": 200, "eligible_for_batch": True},
+            {"account_id": "FLOW-024", "excluded_by_allowlist": True, "eligible_for_batch": False},
+        ],
+    })
+    gui.account_rows = {account_id: {"account_id": account_id} for account_id in ["FLOW-024", "FLOW-025", "FLOW-026", "FLOW-027"]}
+    gui.selected_account_ids = {"FLOW-025", "FLOW-026", "FLOW-027"}
+    gui.shots = [{"shot_id": "001", "image": str(image), "prompt": "p", "duration": 10, "aspect_ratio": "9:16"}]
+
+    args = StoryboardGui._build_batch_args(gui, preflight_only=True)
+    result = gui.batch_runner(args)
+    StoryboardGui._preflight_done(gui, result)
+
+    assert calls[0].preflight_only is True
+    assert calls[0].account_ids == "FLOW-025,FLOW-026,FLOW-027"
+    assert result["gateway_started"] is False
+    assert result["project_create_call_count"] == 0
+    assert result["worker_submit_call_count"] == 0
+    assert gui.account_rows["FLOW-025"]["credits"] == 35
+    assert gui.account_rows["FLOW-027"]["credits_http_status"] == 200
+
+
+def test_storyboard_gui_start_batch_rechecks_preflight_through_batch_service(tmp_path):
+    from gateway.storyboard_gui import StoryboardGui
+
+    image = png(tmp_path / "a.png")
+    calls = []
+    gui = make_gui_shell(tmp_path, lambda args: calls.append(args) or {
+        "ok": False,
+        "result": "preflight_failed",
+        "project_create_call_count": 0,
+        "worker_submit_call_count": 0,
+        "accounts": [{"account_id": "FLOW-027", "credits": 5, "eligible_for_batch": False, "exclusion_reasons": ["insufficient_credits"]}],
+    })
+    gui.account_rows = {account_id: {"account_id": account_id} for account_id in ["FLOW-025", "FLOW-026", "FLOW-027"]}
+    gui.selected_account_ids = {"FLOW-025", "FLOW-026", "FLOW-027"}
+    gui.shots = [{"shot_id": "001", "image": str(image), "prompt": "p", "duration": 10, "aspect_ratio": "9:16"}]
+
+    # Exercise the same argument path used by start_batch without starting a real Tk thread.
+    args = StoryboardGui._build_batch_args(gui, preflight_only=False)
+    result = gui.batch_runner(args)
+
+    assert calls[0].preflight_only is False
+    assert calls[0].account_ids == "FLOW-025,FLOW-026,FLOW-027"
+    assert result["project_create_call_count"] == 0
+    assert result["worker_submit_call_count"] == 0
+
+
+def test_storyboard_gui_does_not_start_duplicate_batch(tmp_path):
+    from gateway.storyboard_gui import StoryboardGui
+
+    class LiveThread:
+        def is_alive(self):
+            return True
+
+    calls = []
+    gui = make_gui_shell(tmp_path, lambda args: calls.append(args) or {"ok": True})
+    gui.batch_thread = LiveThread()
+    StoryboardGui.start_batch(gui)
+
+    assert calls == []
+
+
+def test_storyboard_gui_loads_batch_result_without_submit(tmp_path):
+    from gateway.storyboard_gui import StoryboardGui
+
+    video = tmp_path / "out.mp4"
+    video.write_bytes(b"\x00\x00\x00\x18ftypmp42")
+    result_path = tmp_path / "batch-result-reconciled.json"
+    result_path.write_text(json.dumps({
+        "ok": True,
+        "tasks": [
+            {
+                "shot_id": "001",
+                "status": "completed",
+                "assigned_account_id": "FLOW-025",
+                "project_id": "project-1",
+                "worker_job_id": "job-1",
+                "video_path": str(video),
+                "error_code": None,
+            }
+        ],
+    }), encoding="utf-8")
+    calls = []
+    gui = make_gui_shell(tmp_path, lambda args: calls.append(args) or {"ok": True})
+
+    loaded = StoryboardGui.load_batch_result_file(gui, result_path)
+
+    assert loaded["ok"] is True
+    assert calls == []
+    assert gui.shots[0]["video_path"] == str(video)
+    assert gui.shots[0]["assigned_account_id"] == "FLOW-025"
+
+
+def test_storyboard_gui_selected_video_path_from_loaded_result(tmp_path):
+    from gateway.storyboard_gui import StoryboardGui
+
+    video = tmp_path / "out.mp4"
+    gui = make_gui_shell(tmp_path)
+    gui.shots = [{"shot_id": "001", "video_path": str(video)}]
+    gui.shot_tree = FakeTree(("0",))
+
+    assert StoryboardGui.selected_video_path(gui) == str(video)
+
+
+def test_storyboard_gui_has_no_fake_pause_button():
+    text = Path("gateway/storyboard_gui.py").read_text(encoding="utf-8")
+
+    assert "pause_not_implemented" not in text
+    assert "暂停继续领取新任务" not in text
 
 
 def test_gateway_instance_lock_rejects_live_existing_lock(tmp_path, monkeypatch):

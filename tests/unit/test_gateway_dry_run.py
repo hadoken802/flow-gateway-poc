@@ -204,6 +204,39 @@ async def test_three_ready_accounts_assign_three_tasks_and_leave_fourth_queued()
 
 
 @pytest.mark.asyncio
+async def test_scheduler_account_allowlist_excludes_ready_account_outside_list():
+    from gateway.config import GatewaySettings
+
+    workers = RUN_ROOT / "allowlisted_workers.json"
+    write_workers(workers, ["FLOW-024", "FLOW-025", "FLOW-026", "FLOW-027"])
+    states = {account_id: {"credits": 50} for account_id in ["FLOW-024", "FLOW-025", "FLOW-026", "FLOW-027"]}
+    settings = GatewaySettings(
+        db_path=local_db("allowlist_three_tasks"),
+        workers_path=workers,
+        max_concurrency=3,
+        allowed_account_ids=("FLOW-025", "FLOW-026", "FLOW-027"),
+        dry_run_step_seconds=(0.2, 0.2, 0.2),
+    )
+    scheduler = make_scheduler(settings, FakeWorkerClient(states))
+    await scheduler.start()
+    await scheduler.create_tasks([
+        {"idempotency_key": f"allow-{i}", "image_path": f"D:/img-{i}.png", "prompt": "p", "duration": 10, "aspect_ratio": "9:16"}
+        for i in range(3)
+    ])
+    for _ in range(50):
+        tasks = await scheduler.list_tasks()
+        active = [task for task in tasks if task["status"] in {"assigning", "submitted", "processing"}]
+        if len(active) == 3:
+            break
+        await asyncio.sleep(0.02)
+    tasks = await scheduler.list_tasks()
+    active = [task for task in tasks if task["status"] in {"assigning", "submitted", "processing"}]
+    assert {task["assigned_account_id"] for task in active} == {"FLOW-025", "FLOW-026", "FLOW-027"}
+    assert "FLOW-024" not in {task["assigned_account_id"] for task in active}
+    await scheduler.stop()
+
+
+@pytest.mark.asyncio
 async def test_stale_runtime_instance_enters_manual_review_without_submit():
     from gateway.config import GatewaySettings
     from gateway.worker_provider import WorkerConfig, WorkerSnapshot

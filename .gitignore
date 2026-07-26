@@ -24,6 +24,8 @@ GEMINI.md
 tmp_multi_storyboard_input/
 tmp_multi_storyboard_runs/
 tmp_multi_storyboard_reconcile/
+tmp_multi_storyboard_preflight/
+tmp_multi_storyboard_gui/
 
 # Browser-generated extension metadata
 extension/_metadata/

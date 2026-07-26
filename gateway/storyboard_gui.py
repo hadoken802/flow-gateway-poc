@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import threading
 from pathlib import Path
 from tkinter import filedialog, messagebox
@@ -16,6 +17,10 @@ from runtime.window_manager import WindowManager
 from .storyboard_batch import run_storyboard_batch
 
 
+DEFAULT_ACCOUNT_IDS = {"FLOW-025", "FLOW-026", "FLOW-027"}
+REQUIRED_CREDITS = 15
+
+
 class StoryboardGui(tk.Tk):
     def __init__(self, batch_runner=run_storyboard_batch):
         super().__init__()
@@ -23,37 +28,70 @@ class StoryboardGui(tk.Tk):
         self.geometry("1200x760")
         self.batch_runner = batch_runner
         self.shots: list[dict] = []
+        self.account_rows: dict[str, dict] = {}
+        self.selected_account_ids: set[str] = set(DEFAULT_ACCOUNT_IDS)
         self.batch_thread: threading.Thread | None = None
+        self.preflight_thread: threading.Thread | None = None
         self.last_result: dict | None = None
+        self.start_button: ttk.Button | None = None
+        self.preflight_button: ttk.Button | None = None
         self._build()
         self.refresh_accounts()
 
     def _build(self) -> None:
         root = ttk.Frame(self, padding=8)
         root.pack(fill="both", expand=True)
-        top = ttk.PanedWindow(root, orient="vertical")
-        top.pack(fill="both", expand=True)
+        panes = ttk.PanedWindow(root, orient="vertical")
+        panes.pack(fill="both", expand=True)
 
-        account_frame = ttk.LabelFrame(top, text="账号状态")
-        top.add(account_frame, weight=1)
-        self.account_tree = ttk.Treeview(account_frame, columns=("registration_status", "runtime_status", "eligible", "credits", "current_task_id", "last_error"), show="tree headings", height=5)
+        account_frame = ttk.LabelFrame(panes, text="账号状态")
+        panes.add(account_frame, weight=1)
+        account_columns = (
+            "selected_for_batch",
+            "registration_status",
+            "runtime_status",
+            "eligible",
+            "credits",
+            "current_task_id",
+            "exclusion_reasons",
+        )
+        self.account_tree = ttk.Treeview(account_frame, columns=account_columns, show="tree headings", height=6)
         self.account_tree.heading("#0", text="account_id")
-        for col in self.account_tree["columns"]:
+        self.account_tree.column("#0", width=100)
+        for col in account_columns:
             self.account_tree.heading(col, text=col)
-            self.account_tree.column(col, width=130)
+            self.account_tree.column(col, width=135)
         self.account_tree.pack(side="left", fill="both", expand=True)
+        self.account_tree.bind("<Double-1>", lambda _event: self.toggle_selected_account())
+
         account_buttons = ttk.Frame(account_frame)
         account_buttons.pack(side="right", fill="y")
         ttk.Button(account_buttons, text="刷新账号", command=self.refresh_accounts).pack(fill="x")
+        ttk.Button(account_buttons, text="切换参与", command=self.toggle_selected_account).pack(fill="x")
+        self.preflight_button = ttk.Button(account_buttons, text="检查账号与额度", command=self.check_preflight)
+        self.preflight_button.pack(fill="x")
         ttk.Button(account_buttons, text="打开所选账号Flow窗口", command=self.open_selected_flow).pack(fill="x")
         ttk.Button(account_buttons, text="启动所选账号", command=self.start_selected_account).pack(fill="x")
         ttk.Button(account_buttons, text="停止所选账号", command=self.stop_selected_account).pack(fill="x")
 
-        shot_frame = ttk.LabelFrame(top, text="分镜任务")
-        top.add(shot_frame, weight=4)
-        columns = ("image_path", "prompt", "duration", "aspect_ratio", "status", "assigned_account_id", "project_id", "worker_job_id", "progress", "video_path", "error_code")
+        shot_frame = ttk.LabelFrame(panes, text="分镜任务")
+        panes.add(shot_frame, weight=4)
+        columns = (
+            "image_path",
+            "prompt",
+            "duration",
+            "aspect_ratio",
+            "status",
+            "assigned_account_id",
+            "project_id",
+            "worker_job_id",
+            "progress",
+            "video_path",
+            "error_code",
+        )
         self.shot_tree = ttk.Treeview(shot_frame, columns=columns, show="tree headings")
         self.shot_tree.heading("#0", text="shot_id")
+        self.shot_tree.column("#0", width=80)
         for col in columns:
             self.shot_tree.heading(col, text=col)
             self.shot_tree.column(col, width=120)
@@ -67,10 +105,10 @@ class StoryboardGui(tk.Tk):
             ("清空", self.clear_shots),
             ("从JSON导入", self.import_json),
             ("导出JSON", self.export_json),
+            ("加载批次结果", self.load_batch_result),
             ("上移", lambda: self.move_shot(-1)),
             ("下移", lambda: self.move_shot(1)),
             ("开始制作", self.start_batch),
-            ("暂停继续领取新任务", self.pause_not_implemented),
             ("打开输出目录", self.open_output_dir),
             ("打开所选视频", self.open_selected_video),
         ):
@@ -98,16 +136,57 @@ class StoryboardGui(tk.Tk):
         self.log.pack(fill="x")
 
     def refresh_accounts(self) -> None:
-        self.account_tree.delete(*self.account_tree.get_children())
+        self.account_rows = {}
         for candidate in GatewayProjection().candidates():
             data = candidate.to_dict()
-            self.account_tree.insert("", "end", iid=data["account_id"], text=data["account_id"], values=(
-                data.get("registration_status"), data.get("runtime_status"), data.get("eligible"), "", data.get("current_task_id"), data.get("exclusion_reasons"),
+            account_id = data["account_id"]
+            self.account_rows[account_id] = {
+                "account_id": account_id,
+                "registration_status": data.get("registration_status"),
+                "runtime_status": data.get("runtime_status"),
+                "eligible": data.get("eligible"),
+                "credits": data.get("credits"),
+                "current_task_id": data.get("current_task_id"),
+                "exclusion_reasons": data.get("exclusion_reasons"),
+            }
+            if account_id in DEFAULT_ACCOUNT_IDS:
+                self.selected_account_ids.add(account_id)
+            elif account_id == "FLOW-024":
+                self.selected_account_ids.discard(account_id)
+        self._render_accounts()
+
+    def _render_accounts(self) -> None:
+        self.account_tree.delete(*self.account_tree.get_children())
+        for account_id in sorted(self.account_rows):
+            row = self.account_rows[account_id]
+            self.account_tree.insert("", "end", iid=account_id, text=account_id, values=(
+                "yes" if account_id in self.selected_account_ids else "no",
+                row.get("registration_status"),
+                row.get("runtime_status"),
+                row.get("eligible"),
+                row.get("credits"),
+                row.get("current_task_id"),
+                row.get("exclusion_reasons"),
             ))
 
     def selected_account(self) -> str | None:
         selection = self.account_tree.selection()
         return selection[0] if selection else None
+
+    def get_batch_account_ids(self) -> list[str]:
+        order = [account_id for account_id in sorted(self.account_rows) if account_id in self.selected_account_ids]
+        extras = sorted(self.selected_account_ids.difference(self.account_rows))
+        return order + extras
+
+    def toggle_selected_account(self) -> None:
+        account_id = self.selected_account()
+        if not account_id:
+            return
+        if account_id in self.selected_account_ids:
+            self.selected_account_ids.remove(account_id)
+        else:
+            self.selected_account_ids.add(account_id)
+        self._render_accounts()
 
     def open_selected_flow(self) -> None:
         account_id = self.selected_account()
@@ -169,43 +248,114 @@ class StoryboardGui(tk.Tk):
         if path:
             Path(path).write_text(json.dumps(self.shots, indent=2, ensure_ascii=False), encoding="utf-8")
 
+    def load_batch_result(self) -> None:
+        path = filedialog.askopenfilename(filetypes=[("Batch result", "batch-result*.json"), ("JSON", "*.json")])
+        if path:
+            self.load_batch_result_file(Path(path))
+
+    def load_batch_result_file(self, path: Path) -> dict:
+        result = json.loads(path.read_text(encoding="utf-8"))
+        self.last_result = result
+        self._apply_result_tasks(result)
+        self._log(f"loaded result ok={result.get('ok')} path={path}")
+        return result
+
+    def check_preflight(self) -> None:
+        if self.preflight_thread and self.preflight_thread.is_alive():
+            return
+        if not self.shots:
+            messagebox.showerror("错误", "请先添加或导入分镜")
+            return
+        self._set_button_state(self.preflight_button, "disabled")
+        args = self._build_batch_args(preflight_only=True)
+
+        def work():
+            result = self.batch_runner(args)
+            self.after(0, lambda: self._preflight_done(result))
+
+        self.preflight_thread = threading.Thread(target=work, daemon=True)
+        self.preflight_thread.start()
+        self._log("preflight started")
+
+    def _preflight_done(self, result: dict) -> None:
+        self._set_button_state(self.preflight_button, "normal")
+        self.last_result = result
+        self._apply_preflight_accounts(result)
+        self._log(f"preflight result={result.get('result')} ok={result.get('ok')}")
+
     def start_batch(self) -> None:
         if self.batch_thread and self.batch_thread.is_alive():
             return
         if not self.shots:
-            messagebox.showerror("错误", "请先添加分镜")
+            messagebox.showerror("错误", "请先添加或导入分镜")
             return
-        self.start_button.configure(state="disabled")
-        manifest = Path(self.output_dir.get() or ".").resolve() / "storyboard-manifest.json"
-        manifest.parent.mkdir(parents=True, exist_ok=True)
-        manifest.write_text(json.dumps(self.shots, indent=2, ensure_ascii=False), encoding="utf-8")
-        args = argparse.Namespace(
+        if not self.get_batch_account_ids():
+            messagebox.showerror("错误", "请选择至少一个账号")
+            return
+        self._set_button_state(self.start_button, "disabled")
+        args = self._build_batch_args(preflight_only=False)
+
+        def work():
+            result = self.batch_runner(args)
+            self.after(0, lambda: self._batch_done(result))
+
+        self.batch_thread = threading.Thread(target=work, daemon=True)
+        self.batch_thread.start()
+        self._log(f"batch started accounts={','.join(self.get_batch_account_ids())}")
+
+    def _batch_done(self, result: dict) -> None:
+        self.last_result = result
+        self._set_button_state(self.start_button, "normal")
+        self._apply_preflight_accounts(result)
+        self._apply_result_tasks(result)
+        self._log(f"batch done ok={result.get('ok')} result={result.get('result')}")
+
+    def _build_batch_args(self, preflight_only: bool) -> argparse.Namespace:
+        manifest = self._write_manifest()
+        return argparse.Namespace(
             manifest=str(manifest),
             concurrency=int(self.concurrency.get()),
             output_dir=self.output_dir.get() or None,
             timeout_seconds=int(self.timeout_seconds.get()),
             gateway_port=None,
             test_mode=False,
+            account_ids=",".join(self.get_batch_account_ids()),
+            preflight_only=preflight_only,
         )
-        def work():
-            result = self.batch_runner(args)
-            self.after(0, lambda: self._batch_done(result))
-        self.batch_thread = threading.Thread(target=work, daemon=True)
-        self.batch_thread.start()
-        self._log("batch started")
 
-    def _batch_done(self, result: dict) -> None:
-        self.last_result = result
-        self.start_button.configure(state="normal")
-        for row in result.get("tasks", []):
-            for shot in self.shots:
-                if shot.get("shot_id") == row.get("shot_id"):
-                    shot.update(row)
+    def _write_manifest(self) -> Path:
+        base = Path(self.output_dir.get()).resolve() if self.output_dir.get() else Path("tmp_multi_storyboard_gui").resolve()
+        base.mkdir(parents=True, exist_ok=True)
+        manifest = base / "storyboard-manifest.json"
+        manifest.write_text(json.dumps(self.shots, indent=2, ensure_ascii=False), encoding="utf-8")
+        return manifest
+
+    def _apply_preflight_accounts(self, result: dict) -> None:
+        for account in result.get("accounts", []):
+            account_id = account.get("account_id")
+            if account_id:
+                self.account_rows[account_id] = {**self.account_rows.get(account_id, {}), **account}
+        self._render_accounts()
+
+    def _apply_result_tasks(self, result: dict) -> None:
+        rows = result.get("tasks", [])
+        if not rows:
+            return
+        by_id = {str(shot.get("shot_id")): shot for shot in self.shots}
+        for row in rows:
+            shot_id = str(row.get("shot_id") or "")
+            if shot_id in by_id:
+                by_id[shot_id].update(row)
+            else:
+                self.shots.append({
+                    "shot_id": shot_id,
+                    "image": row.get("image") or row.get("image_path") or "",
+                    "prompt": row.get("prompt") or "",
+                    "duration": row.get("duration") or 10,
+                    "aspect_ratio": row.get("aspect_ratio") or "9:16",
+                    **row,
+                })
         self._render_shots()
-        self._log(f"batch done ok={result.get('ok')}")
-
-    def pause_not_implemented(self) -> None:
-        self._log("pause requested; queued pickup pause is handled by batch service in a future control endpoint")
 
     def choose_output_dir(self) -> None:
         path = filedialog.askdirectory()
@@ -216,14 +366,18 @@ class StoryboardGui(tk.Tk):
         path = self.last_result.get("run_dir") if self.last_result else self.output_dir.get()
         if path:
             Path(path).mkdir(parents=True, exist_ok=True)
-            import os
             os.startfile(path)
 
     def open_selected_video(self) -> None:
+        path = self.selected_video_path()
+        if path:
+            os.startfile(path)
+
+    def selected_video_path(self) -> str | None:
         index = self._selected_shot_index()
-        if index is not None and self.shots[index].get("video_path"):
-            import os
-            os.startfile(self.shots[index]["video_path"])
+        if index is not None:
+            return self.shots[index].get("video_path")
+        return None
 
     def _shot_dialog(self, current: dict | None = None) -> dict | None:
         dialog = tk.Toplevel(self)
@@ -246,10 +400,18 @@ class StoryboardGui(tk.Tk):
         prompt.pack(fill="both", expand=True)
         ttk.Label(dialog, text="时长固定10秒").pack(fill="x")
         ttk.Combobox(dialog, textvariable=aspect, values=("9:16", "16:9"), state="readonly").pack(fill="x")
+
         def ok():
             nonlocal result
-            result = {"shot_id": shot_id.get().strip(), "image": image.get().strip(), "prompt": prompt.get("1.0", "end").strip(), "duration": 10, "aspect_ratio": aspect.get()}
+            result = {
+                "shot_id": shot_id.get().strip(),
+                "image": image.get().strip(),
+                "prompt": prompt.get("1.0", "end").strip(),
+                "duration": 10,
+                "aspect_ratio": aspect.get(),
+            }
             dialog.destroy()
+
         ttk.Button(dialog, text="确定", command=ok).pack()
         dialog.wait_window()
         return result
@@ -263,9 +425,17 @@ class StoryboardGui(tk.Tk):
         for index, shot in enumerate(self.shots):
             prompt = (shot.get("prompt") or "")[:40]
             self.shot_tree.insert("", "end", iid=str(index), text=shot.get("shot_id"), values=(
-                shot.get("image") or shot.get("image_path"), prompt, shot.get("duration"), shot.get("aspect_ratio"),
-                shot.get("status"), shot.get("assigned_account_id"), shot.get("project_id"), shot.get("worker_job_id"),
-                shot.get("progress"), shot.get("video_path"), shot.get("error_code"),
+                shot.get("image") or shot.get("image_path"),
+                prompt,
+                shot.get("duration"),
+                shot.get("aspect_ratio"),
+                shot.get("status"),
+                shot.get("assigned_account_id"),
+                shot.get("project_id"),
+                shot.get("worker_job_id"),
+                shot.get("progress"),
+                shot.get("video_path"),
+                shot.get("error_code"),
             ))
 
     def _threaded(self, name: str, func) -> None:
@@ -275,7 +445,12 @@ class StoryboardGui(tk.Tk):
                 self.after(0, lambda: self._log(f"{name} ok {self._safe(result)}"))
             except Exception as exc:
                 self.after(0, lambda: self._log(f"{name} failed {self._safe(exc)}"))
+
         threading.Thread(target=work, daemon=True).start()
+
+    def _set_button_state(self, button, state: str) -> None:
+        if button is not None:
+            button.configure(state=state)
 
     def _log(self, text: str) -> None:
         self.log.configure(state="normal")
