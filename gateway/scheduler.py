@@ -31,10 +31,21 @@ class GatewayScheduler:
         self.assignment_history: list[tuple[str, str]] = []
         self._last_worker_refresh = 0.0
         self._worker_refresh_lock = asyncio.Lock()
+        self.startup_stage: str | None = None
 
     def _load_worker_snapshot(self) -> WorkerSnapshot:
         try:
-            return self.worker_provider.load_workers()
+            snapshot = self.worker_provider.load_workers()
+            if self.settings.allowed_account_ids:
+                allowed = set(self.settings.allowed_account_ids)
+                return WorkerSnapshot(
+                    workers=[worker for worker in snapshot.workers if worker.account_id in allowed],
+                    candidates=snapshot.candidates,
+                    worker_source=snapshot.worker_source,
+                    provider_kind=snapshot.provider_kind,
+                    registry_snapshot_time=snapshot.registry_snapshot_time,
+                )
+            return snapshot
         except Exception as exc:
             raise RuntimeError("runtime_worker_provider_unavailable") from exc
 
@@ -55,12 +66,27 @@ class GatewayScheduler:
 
     async def start(self):
         self._stopping = False
+        self.startup_stage = "database_connect"
+        self._audit("database_connect_started", database_path=str(self.settings.db_path))
         self.db = await connect(self.settings.db_path)
+        self._audit("database_connect_completed", database_path=str(self.settings.db_path))
+        self.startup_stage = "upsert_accounts"
+        self._audit("accounts_upsert_started", account_count=len(self.workers))
         for worker in self.workers:
             await crud.upsert_account(self.db, worker)
+        self._audit("accounts_upsert_completed", account_count=len(self.workers))
+        self.startup_stage = "refresh_workers"
+        self._audit("refresh_workers_started")
         await self.refresh_workers()
+        self._audit("refresh_workers_completed")
+        self.startup_stage = "recover_tasks"
+        self._audit("recover_tasks_started")
         await self.recover_tasks()
+        self._audit("recover_tasks_completed")
+        self.startup_stage = "scheduler_loop_start"
         self._runner_task = asyncio.create_task(self._run_loop())
+        self._audit("scheduler_loop_started")
+        self.startup_stage = "completed"
 
     async def stop(self):
         self._stopping = True
@@ -125,6 +151,8 @@ class GatewayScheduler:
 
     async def recover_tasks(self):
         tasks = await crud.list_tasks(self.db)
+        if not tasks:
+            return
         if self.settings.dry_run:
             for task in tasks:
                 if task["status"] in {"assigning", "submitted", "processing", "waiting_recovery"}:
@@ -615,7 +643,17 @@ class GatewayScheduler:
 
     def _audit(self, event, **fields):
         safe = {"event": event, **fields}
-        logger.info("gateway_audit %s", json.dumps(safe, sort_keys=True))
+        logger.info("gateway_audit %s", self.safe_json(safe))
+
+    def safe_json(self, payload: dict) -> str:
+        safe = {}
+        for key, value in payload.items():
+            text = str(value).lower()
+            if any(blocked in text for blocked in ("cookie", "token", "authorization", "secret", "nonce")):
+                safe[key] = "[redacted]"
+            else:
+                safe[key] = value
+        return json.dumps(safe, sort_keys=True)
 
     async def _bound_ready_worker(self, task_id, account_id):
         task = await crud.get_task(self.db, task_id)

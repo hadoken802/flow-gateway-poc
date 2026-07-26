@@ -71,7 +71,7 @@ def test_storyboard_batch_starts_one_gateway_and_writes_one_database(tmp_path, m
         "excluded_reasons": {},
     })
     monkeypatch.setattr(storyboard_batch, "_start_gateway_for_batch", start)
-    monkeypatch.setattr(storyboard_batch.cli, "_wait_for_gateway", lambda port: None)
+    monkeypatch.setattr(storyboard_batch.cli, "_wait_for_gateway", lambda *args, **kwargs: None)
     monkeypatch.setattr(storyboard_batch, "_post_tasks", lambda port, shots: [{"task_id": "task-1"}])
     monkeypatch.setattr(storyboard_batch, "_wait_for_tasks", lambda port, tasks, timeout: [{
         "task_id": "task-1", "project_id": "project-1", "assigned_account_id": "FLOW-024",
@@ -302,7 +302,7 @@ def test_storyboard_batch_without_allowlist_keeps_existing_path_compatible(tmp_p
         "excluded_reasons": {},
     })
     monkeypatch.setattr(storyboard_batch, "_start_gateway_for_batch", start)
-    monkeypatch.setattr(storyboard_batch.cli, "_wait_for_gateway", lambda port: None)
+    monkeypatch.setattr(storyboard_batch.cli, "_wait_for_gateway", lambda *args, **kwargs: None)
     monkeypatch.setattr(storyboard_batch, "_post_tasks", lambda port, shots: [{"task_id": "task-1"}])
     monkeypatch.setattr(storyboard_batch, "_wait_for_tasks", lambda port, tasks, timeout: [{
         "task_id": "task-1", "project_id": "project-1", "assigned_account_id": "FLOW-025",
@@ -523,6 +523,113 @@ def test_storyboard_gui_has_no_fake_pause_button():
 
     assert "pause_not_implemented" not in text
     assert "暂停继续领取新任务" not in text
+
+
+def test_storyboard_batch_gateway_start_failure_writes_safe_result(tmp_path, monkeypatch):
+    from gateway import storyboard_batch
+
+    image = png(tmp_path / "a.png")
+    path = manifest(tmp_path, [{"shot_id": "001", "image": str(image.resolve()), "prompt": "p", "duration": 10, "aspect_ratio": "9:16"}])
+
+    class Proc:
+        pid = 321
+        def __init__(self):
+            self.code = None
+        def poll(self):
+            return self.code
+        def terminate(self):
+            self.code = -15
+        def wait(self, timeout=None):
+            return self.code
+
+    monkeypatch.setattr(storyboard_batch, "run_preflight", lambda shots, account_ids, run_dir: {
+        "ok": True,
+        "requested_account_ids": ["FLOW-025"],
+        "eligible_account_ids": ["FLOW-025"],
+        "excluded_account_ids": [],
+        "excluded_reasons": {},
+    })
+    monkeypatch.setattr(storyboard_batch, "_start_gateway_for_batch", lambda *args, **kwargs: Proc())
+    monkeypatch.setattr(storyboard_batch.cli, "_wait_for_gateway", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("Gateway /health did not become ready")))
+
+    result = storyboard_batch.run_storyboard_batch(argparse.Namespace(
+        manifest=str(path.resolve()),
+        concurrency=1,
+        output_dir=str(tmp_path),
+        timeout_seconds=1200,
+        gateway_port=8888,
+        test_mode=False,
+        account_ids="FLOW-025",
+        preflight_only=False,
+    ))
+
+    assert result["ok"] is False
+    assert result["stage"] == "gateway_startup"
+    assert result["error_code"] == "gateway_start_failed"
+    assert result["flow_task_count"] == 0
+    assert result["project_create_call_count"] == 0
+    assert result["worker_submit_call_count"] == 0
+    assert (Path(result["run_dir"]) / "batch-result.json").exists()
+
+
+def test_storyboard_gui_catches_batch_exception_and_restores_button(tmp_path, monkeypatch):
+    from gateway.storyboard_gui import StoryboardGui
+
+    image = png(tmp_path / "a.png")
+    gui = make_gui_shell(tmp_path, lambda args: (_ for _ in ()).throw(RuntimeError("Gateway /health did not become ready")))
+    gui.account_rows = {"FLOW-025": {"account_id": "FLOW-025"}}
+    gui.selected_account_ids = {"FLOW-025"}
+    gui.shots = [{"shot_id": "001", "image": str(image), "prompt": "p", "duration": 10, "aspect_ratio": "9:16"}]
+    messages = []
+    monkeypatch.setattr("gateway.storyboard_gui.messagebox.showerror", lambda title, body: messages.append((title, body)))
+
+    StoryboardGui.start_batch(gui)
+    gui.batch_thread.join(timeout=5)
+
+    assert gui.start_button.state == "normal"
+    assert gui.last_result["error_code"] == "gateway_start_failed"
+    assert gui.shots[0]["shot_id"] == "001"
+    assert gui.selected_account_ids == {"FLOW-025"}
+    assert messages
+
+
+def test_gateway_startup_smoke_result_is_zero_task(tmp_path, monkeypatch):
+    from gateway import cli
+
+    class Proc:
+        pid = 456
+        def __init__(self):
+            self.code = None
+        def poll(self):
+            return self.code
+        def terminate(self):
+            self.code = 0
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr("gateway.storyboard_batch.run_preflight", lambda shots, account_ids, run_dir: {
+        "accounts": [
+            {"account_id": "FLOW-025", "credits": 35, "current_task_id": None},
+            {"account_id": "FLOW-026", "credits": 35, "current_task_id": None},
+            {"account_id": "FLOW-027", "credits": 50, "current_task_id": None},
+        ]
+    })
+    monkeypatch.setattr("gateway.storyboard_batch._start_gateway_for_batch", lambda *args, **kwargs: Proc())
+    monkeypatch.setattr(cli, "_wait_for_gateway", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cli, "_get_json", lambda *args, **kwargs: {"status": "ok", "api_port": 9999})
+
+    result = cli.gateway_startup_smoke(argparse.Namespace(
+        account_ids="FLOW-025,FLOW-026,FLOW-027",
+        output_dir=str(tmp_path),
+        timeout_seconds=60,
+    ))
+
+    assert result["ok"] is True
+    assert result["flow_task_count"] == 0
+    assert result["project_create_call_count"] == 0
+    assert result["worker_submit_call_count"] == 0
+    assert result["current_task_ids"] == {"FLOW-025": None, "FLOW-026": None, "FLOW-027": None}
+    assert (Path(result["run_dir"]) / "gateway-startup-smoke-result.json").exists()
 
 
 def test_gateway_instance_lock_rejects_live_existing_lock(tmp_path, monkeypatch):

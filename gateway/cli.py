@@ -53,6 +53,10 @@ def main(argv: list[str] | None = None) -> int:
     reconcile = subparsers.add_parser("reconcile-existing-run")
     reconcile.add_argument("--run-dir", required=True)
     reconcile.add_argument("--output-run-dir")
+    smoke = subparsers.add_parser("gateway-startup-smoke")
+    smoke.add_argument("--account-ids", required=True)
+    smoke.add_argument("--output-dir", required=True)
+    smoke.add_argument("--timeout-seconds", type=int, default=60)
     args = parser.parse_args(argv)
 
     if args.command == "run-video-once":
@@ -69,7 +73,78 @@ def main(argv: list[str] | None = None) -> int:
         result = reconcile_existing_run(args)
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0 if result.get("ok") else 1
+    if args.command == "gateway-startup-smoke":
+        result = gateway_startup_smoke(args)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0 if result.get("ok") else 1
     return 2
+
+
+def gateway_startup_smoke(args) -> dict[str, Any]:
+    from .storyboard_batch import _cleanup_lock, _flow_task_count, _start_gateway_for_batch, parse_account_ids, run_preflight
+
+    account_ids = parse_account_ids(args.account_ids)
+    run_dir = _create_run_dir(Path(args.output_dir))
+    db_path = run_dir / "gateway.db"
+    log_path = run_dir / "gateway.log"
+    port = _find_free_local_port()
+    credits_before = run_preflight([], account_ids, run_dir)
+    process = None
+    health_payload: dict[str, Any] | None = None
+    health_http_status = None
+    lock_payload: dict[str, Any] = {}
+    shutdown_completed = False
+    try:
+        process = _start_gateway_for_batch(port, db_path, log_path, concurrency=max(1, min(3, len(account_ids) or 1)), test_mode=False, account_ids=account_ids)
+        _wait_for_gateway(port, timeout_seconds=int(args.timeout_seconds))
+        health_payload = _get_json(port, "/health", timeout=10)
+        health_http_status = 200
+        lock_path = db_path.with_suffix(db_path.suffix + ".lock")
+        if lock_path.exists():
+            lock_payload = json.loads(lock_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        health_payload = {"error": str(exc)[:500]}
+    finally:
+        if process is not None:
+            shutdown_completed = _stop_gateway(process)
+            _cleanup_lock(db_path)
+    credits_after = run_preflight([], account_ids, run_dir)
+    current_task_ids = {
+        account["account_id"]: account.get("current_task_id")
+        for account in credits_after.get("accounts", [])
+        if account.get("account_id") in account_ids
+    }
+    result = {
+        "ok": health_http_status == 200 and _flow_task_count(db_path) == 0 and shutdown_completed,
+        "run_dir": str(run_dir),
+        "python_executable": sys.executable,
+        "launcher_pid": os.getpid(),
+        "server_pid": lock_payload.get("server_pid"),
+        "gateway_port": port,
+        "database_path": str(db_path),
+        "health_http_status": health_http_status,
+        "health_payload": health_payload,
+        "startup_completed": health_http_status == 200,
+        "shutdown_completed": shutdown_completed,
+        "flow_task_count": _flow_task_count(db_path),
+        "project_create_call_count": 0,
+        "worker_submit_call_count": 0,
+        "current_task_ids": current_task_ids,
+        "credits_before": _credits_by_account(credits_before),
+        "credits_after": _credits_by_account(credits_after),
+        "gateway_exit_code": process.poll() if process is not None else None,
+        "lock_cleaned": not db_path.with_suffix(db_path.suffix + ".lock").exists(),
+    }
+    (run_dir / "gateway-startup-smoke-result.json").write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+    return result
+
+
+def _credits_by_account(preflight: dict[str, Any]) -> dict[str, int | None]:
+    return {
+        account["account_id"]: account.get("credits")
+        for account in preflight.get("accounts", [])
+        if account.get("account_id")
+    }
 
 
 def run_video_once(args) -> dict[str, Any]:

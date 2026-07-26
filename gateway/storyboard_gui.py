@@ -296,7 +296,17 @@ class StoryboardGui(tk.Tk):
         args = self._build_batch_args(preflight_only=False)
 
         def work():
-            result = self.batch_runner(args)
+            try:
+                result = self.batch_runner(args)
+            except Exception as exc:
+                result = {
+                    "ok": False,
+                    "result": "gateway_start_failed",
+                    "stage": "gateway_startup",
+                    "error_code": "gateway_start_failed",
+                    "error_message": self._safe(exc),
+                    "run_dir": str(Path(args.output_dir or ".").resolve()),
+                }
             self.after(0, lambda: self._batch_done(result))
 
         self.batch_thread = threading.Thread(target=work, daemon=True)
@@ -308,7 +318,12 @@ class StoryboardGui(tk.Tk):
         self._set_button_state(self.start_button, "normal")
         self._apply_preflight_accounts(result)
         self._apply_result_tasks(result)
-        self._log(f"batch done ok={result.get('ok')} result={result.get('result')}")
+        self._log(f"batch done ok={result.get('ok')} result={result.get('result')} stage={result.get('stage')} error_code={result.get('error_code')} run_dir={result.get('run_dir')}")
+        if not result.get("ok"):
+            messagebox.showerror(
+                "Gateway启动失败",
+                f"stage={result.get('stage')}\nerror_code={result.get('error_code')}\nerror_message={self._safe(result.get('error_message'))}\nrun_dir={result.get('run_dir')}",
+            )
 
     def _build_batch_args(self, preflight_only: bool) -> argparse.Namespace:
         manifest = self._write_manifest()

@@ -117,6 +117,31 @@ async def test_gateway_config_defaults_to_8200(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_scheduler_start_records_startup_stages(caplog):
+    from gateway.config import GatewaySettings
+
+    caplog.set_level("INFO", logger="gateway.scheduler")
+    settings = GatewaySettings(db_path=local_db("startup_logs"), dry_run_step_seconds=(0.01, 0.01, 0.01))
+    scheduler = make_scheduler(settings, FakeWorkerClient({
+        "FLOW-001": {"credits": 5},
+        "FLOW-002": {"credits": 50},
+        "FLOW-003": {"credits": 50},
+    }))
+    await scheduler.start()
+    await scheduler.stop()
+    text = caplog.text
+    assert "database_connect_started" in text
+    assert "database_connect_completed" in text
+    assert "accounts_upsert_started" in text
+    assert "accounts_upsert_completed" in text
+    assert "refresh_workers_started" in text
+    assert "refresh_workers_completed" in text
+    assert "recover_tasks_started" in text
+    assert "recover_tasks_completed" in text
+    assert "scheduler_loop_started" in text
+
+
+@pytest.mark.asyncio
 async def test_three_workers_are_classified_by_credits(monkeypatch):
     from gateway.config import GatewaySettings
 
@@ -233,6 +258,8 @@ async def test_scheduler_account_allowlist_excludes_ready_account_outside_list()
     active = [task for task in tasks if task["status"] in {"assigning", "submitted", "processing"}]
     assert {task["assigned_account_id"] for task in active} == {"FLOW-025", "FLOW-026", "FLOW-027"}
     assert "FLOW-024" not in {task["assigned_account_id"] for task in active}
+    accounts = {account["account_id"]: account for account in await scheduler.list_accounts()}
+    assert "FLOW-024" not in accounts
     await scheduler.stop()
 
 

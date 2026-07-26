@@ -1,5 +1,8 @@
 """Central Gateway dry-run API."""
 from contextlib import asynccontextmanager
+import asyncio
+import logging
+import sys
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
@@ -8,6 +11,9 @@ from .config import GatewaySettings
 from .instance_lock import GatewayInstanceLock, GatewayInstanceLockError
 from .scheduler import GatewayScheduler
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s", force=True)
+logger = logging.getLogger(__name__)
+
 settings = GatewaySettings.from_env()
 scheduler = GatewayScheduler(settings)
 instance_lock = GatewayInstanceLock(settings.db_path, settings.api_port)
@@ -15,13 +21,24 @@ instance_lock = GatewayInstanceLock(settings.db_path, settings.api_port)
 
 @asynccontextmanager
 async def lifespan(_app):
+    lock_payload = None
+    logger.info("gateway_audit %s", scheduler.safe_json({"event": "app_startup_begin"}))
     try:
+        logger.info("gateway_audit %s", scheduler.safe_json({"event": "instance_lock_acquire_started", "database_path": str(settings.db_path), "gateway_port": settings.api_port}))
         lock_payload = instance_lock.acquire()
-        scheduler._audit("gateway_instance_lock_acquired", **lock_payload)
+        scheduler._audit("instance_lock_acquired", **lock_payload)
     except GatewayInstanceLockError as exc:
         scheduler._audit("gateway_instance_lock_rejected", database_path=str(settings.db_path), gateway_port=settings.api_port)
+        scheduler._audit("app_startup_failed", stage="instance_lock", exception_type=type(exc).__name__, error_message=str(exc))
         raise RuntimeError(str(exc)) from exc
-    await scheduler.start()
+    try:
+        await asyncio.wait_for(scheduler.start(), timeout=settings.startup_timeout_seconds)
+        scheduler._audit("app_startup_completed")
+    except Exception as exc:
+        scheduler._audit("app_startup_failed", stage=scheduler.startup_stage or "scheduler_start", exception_type=type(exc).__name__, error_message=str(exc)[:500])
+        if lock_payload:
+            instance_lock.release()
+        raise
     try:
         yield
     finally:
@@ -78,4 +95,10 @@ async def create_tasks(payload: dict):
 
 
 if __name__ == "__main__":
-    uvicorn.run("gateway.main:app", host=settings.api_host, port=settings.api_port, reload=False)
+    logger.info("gateway_audit %s", scheduler.safe_json({
+        "event": "gateway_server_entry",
+        "python_executable": sys.executable,
+        "gateway_port": settings.api_port,
+        "database_path": str(settings.db_path),
+    }))
+    uvicorn.run(app, host=settings.api_host, port=settings.api_port, reload=False)

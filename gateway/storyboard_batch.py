@@ -5,6 +5,7 @@ import argparse
 import json
 import mimetypes
 import os
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,7 +56,17 @@ def run_storyboard_batch(args: argparse.Namespace) -> dict[str, Any]:
         db_path = run_dir / "gateway.db"
         log_path = run_dir / "gateway.log"
         gateway_process = _start_gateway_for_batch(port, db_path, log_path, concurrency, bool(getattr(args, "test_mode", False)), account_ids)
-        cli._wait_for_gateway(port)
+        try:
+            cli._wait_for_gateway(port, timeout_seconds=int(getattr(args, "gateway_startup_timeout_seconds", 60)))
+        except Exception as exc:
+            result = _gateway_start_failed_result(run_dir, port, gateway_process, db_path, exc)
+            result.update(_account_summary(preflight))
+            result["gateway_stopped"] = _stop_gateway(gateway_process)
+            result["gateway_exit_code"] = gateway_process.poll()
+            gateway_process = None
+            _cleanup_lock(db_path)
+            _write_result(run_dir, result)
+            return result
         tasks = _post_tasks(port, shots)
         final_tasks = _wait_for_tasks(port, tasks, timeout_seconds)
         result = _result(run_dir, port, gateway_process.pid if gateway_process else None, shots, final_tasks)
@@ -68,6 +79,20 @@ def run_storyboard_batch(args: argparse.Namespace) -> dict[str, Any]:
         result = {
             "ok": False,
             "stage": exc.stage,
+            "error_message": _safe(str(exc)),
+            "run_dir": str(run_dir) if run_dir else None,
+            "gateway_port": port,
+            "gateway_stopped": False,
+        }
+        if run_dir:
+            _write_result(run_dir, result)
+        return result
+    except Exception as exc:
+        result = {
+            "ok": False,
+            "result": "gateway_start_failed",
+            "stage": "gateway_startup",
+            "error_code": "gateway_start_failed",
             "error_message": _safe(str(exc)),
             "run_dir": str(run_dir) if run_dir else None,
             "gateway_port": port,
@@ -261,8 +286,19 @@ def _start_gateway_for_batch(port: int, db_path: Path, log_path: Path, concurren
         "GATEWAY_DB_PATH": str(db_path),
         "GATEWAY_LAUNCHER_PID": str(os.getpid()),
         "GATEWAY_ALLOWED_ACCOUNT_IDS": ",".join(account_ids or []),
+        "GATEWAY_STARTUP_TIMEOUT_SECONDS": "60",
     })
     stdout = log_path.open("ab")
+    _append_launcher_event(log_path, {
+        "event": "gateway_launcher_started",
+        "launcher_pid": os.getpid(),
+        "python_executable": sys.executable,
+        "command": [sys.executable, "-m", "gateway.main"],
+        "cwd": str(Path(__file__).resolve().parents[1]),
+        "gateway_port": port,
+        "database_path": str(db_path),
+        "allowed_account_ids": account_ids or [],
+    })
     return subprocess.Popen(
         [sys.executable, "-m", "gateway.main"],
         cwd=str(Path(__file__).resolve().parents[1]),
@@ -271,6 +307,49 @@ def _start_gateway_for_batch(port: int, db_path: Path, log_path: Path, concurren
         stderr=subprocess.STDOUT,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
+
+
+def _append_launcher_event(log_path: Path, payload: dict[str, Any]) -> None:
+    with log_path.open("ab") as fh:
+        fh.write(("gateway_audit " + json.dumps(payload, sort_keys=True) + "\n").encode("utf-8"))
+
+
+def _gateway_start_failed_result(run_dir: Path, port: int, process, db_path: Path, exc: Exception) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "result": "gateway_start_failed",
+        "stage": "gateway_startup",
+        "error_code": "gateway_start_failed",
+        "error_message": _safe(str(exc)),
+        "run_dir": str(run_dir),
+        "gateway_port": port,
+        "gateway_pid": process.pid if process else None,
+        "database_path": str(db_path),
+        "flow_task_count": _flow_task_count(db_path),
+        "project_create_call_count": 0,
+        "worker_submit_call_count": 0,
+    }
+
+
+def _flow_task_count(db_path: Path) -> int:
+    if not db_path.exists():
+        return 0
+    import sqlite3
+
+    with sqlite3.connect(db_path) as db:
+        try:
+            return int(db.execute("SELECT count(*) FROM flow_tasks").fetchone()[0])
+        except sqlite3.Error:
+            return 0
+
+
+def _cleanup_lock(db_path: Path) -> None:
+    lock_path = db_path.with_suffix(db_path.suffix + ".lock")
+    try:
+        if lock_path.exists():
+            lock_path.unlink()
+    except OSError:
+        pass
 
 
 def _post_tasks(port: int, shots: list[StoryboardShot]) -> list[dict[str, Any]]:
