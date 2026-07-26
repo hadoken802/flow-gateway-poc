@@ -27,10 +27,13 @@ CREATE TABLE IF NOT EXISTS flow_tasks (
     aspect_ratio TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'queued',
     assigned_account_id TEXT,
+    assigned_runtime_instance_id TEXT,
     worker_job_id TEXT,
     remaining_credits INTEGER,
     preferred_account_id TEXT,
     attempt_count INTEGER NOT NULL DEFAULT 0,
+    project_created_by_gateway INTEGER NOT NULL DEFAULT 0,
+    project_created_at TEXT,
     error_code TEXT,
     error_message TEXT,
     video_path TEXT,
@@ -62,8 +65,11 @@ async def _migrate(db):
     columns = {row[1] for row in await cursor.fetchall()}
     additions = {
         "project_id": "TEXT",
+        "assigned_runtime_instance_id": "TEXT",
         "remaining_credits": "INTEGER",
         "preferred_account_id": "TEXT",
+        "project_created_by_gateway": "INTEGER NOT NULL DEFAULT 0",
+        "project_created_at": "TEXT",
     }
     for name, ddl in additions.items():
         if name not in columns:

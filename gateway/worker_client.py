@@ -27,6 +27,10 @@ class WorkerClient:
         async with httpx.AsyncClient(timeout=self.submit_timeout_seconds) as client:
             return (await client.post(f"{worker.api_url}/api/test/omni-video", json=payload)).raise_for_status().json()
 
+    async def create_project(self, worker, payload):
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            return (await client.post(f"{worker.api_url}/api/projects", json=payload)).raise_for_status().json()
+
     async def get_omni_video(self, worker, worker_job_id):
         async with httpx.AsyncClient(timeout=10.0) as client:
             return (await client.get(f"{worker.api_url}/api/test/omni-video/{worker_job_id}")).raise_for_status().json()

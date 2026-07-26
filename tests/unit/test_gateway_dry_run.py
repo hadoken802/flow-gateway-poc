@@ -1,4 +1,5 @@
 import asyncio
+import json
 import tempfile
 import uuid
 from pathlib import Path
@@ -39,6 +40,15 @@ class FakeRealWorkerClient(FakeWorkerClient):
         self.output_dir = output_dir
         self.retry_downloads = []
         self.return_missing_job_id = False
+        self.projects = []
+        self.fail_project_create = False
+        self.gets = []
+
+    async def create_project(self, worker, payload):
+        self.projects.append((worker.account_id, dict(payload)))
+        if self.fail_project_create:
+            raise TimeoutError("project create failed")
+        return {"id": f"project-{worker.account_id}-{len(self.projects)}"}
 
     async def submit_omni_video(self, worker, payload):
         self.submits.append((worker.account_id, dict(payload)))
@@ -63,6 +73,7 @@ class FakeRealWorkerClient(FakeWorkerClient):
         return self.jobs[job_id]
 
     async def get_omni_video(self, worker, worker_job_id):
+        self.gets.append((worker.account_id, worker_job_id))
         return self.jobs[worker_job_id]
 
     async def retry_omni_video_download(self, worker, worker_job_id):
@@ -84,6 +95,14 @@ def make_scheduler(settings, worker_client):
     from gateway.worker_provider import StaticJsonWorkerProvider
 
     return GatewayScheduler(settings, worker_client=worker_client, worker_provider=StaticJsonWorkerProvider(settings.workers_path))
+
+
+def write_workers(path, account_ids):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps([
+        {"account_id": account_id, "api_url": f"http://127.0.0.1:{8100 + idx}", "enabled": True, "runtime_instance_id": f"runtime-{account_id}"}
+        for idx, account_id in enumerate(account_ids)
+    ]), encoding="utf-8")
 
 
 @pytest.mark.asyncio
@@ -151,6 +170,81 @@ async def test_five_task_dry_run_respects_concurrency_and_completes(monkeypatch)
     accounts = {a["account_id"]: a for a in await scheduler.list_accounts()}
     assert accounts["FLOW-001"]["credits"] == 5
     assert FakeWorkerClient.generate_calls == 0
+    await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_three_ready_accounts_assign_three_tasks_and_leave_fourth_queued():
+    from gateway.config import GatewaySettings
+
+    workers = RUN_ROOT / "three_ready_workers.json"
+    write_workers(workers, ["FLOW-024", "FLOW-025", "FLOW-026"])
+    states = {account_id: {"credits": 50} for account_id in ["FLOW-024", "FLOW-025", "FLOW-026"]}
+    settings = GatewaySettings(db_path=local_db("three_ready_four_tasks"), workers_path=workers, max_concurrency=3, dry_run_step_seconds=(0.2, 0.2, 0.2))
+    scheduler = make_scheduler(settings, FakeWorkerClient(states))
+    await scheduler.start()
+    await scheduler.create_tasks([
+        {"idempotency_key": f"multi-{i}", "image_path": f"D:/img-{i}.png", "prompt": "p", "duration": 10, "aspect_ratio": "9:16"}
+        for i in range(4)
+    ])
+    for _ in range(50):
+        tasks = await scheduler.list_tasks()
+        active = [task for task in tasks if task["status"] in {"assigning", "submitted", "processing"}]
+        queued = [task for task in tasks if task["status"] == "queued"]
+        if len(active) == 3 and len(queued) == 1:
+            break
+        await asyncio.sleep(0.02)
+    tasks = await scheduler.list_tasks()
+    active = [task for task in tasks if task["status"] in {"assigning", "submitted", "processing"}]
+    queued = [task for task in tasks if task["status"] == "queued"]
+    assert {task["assigned_account_id"] for task in active} == {"FLOW-024", "FLOW-025", "FLOW-026"}
+    assert len(queued) == 1
+    assert all(task["assigned_runtime_instance_id"] for task in active)
+    await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_stale_runtime_instance_enters_manual_review_without_submit():
+    from gateway.config import GatewaySettings
+    from gateway.worker_provider import WorkerConfig, WorkerSnapshot
+
+    first = WorkerSnapshot([WorkerConfig("FLOW-024", "http://127.0.0.1:8124", True, "runtime-old")], [], "runtime_registry", "Fake", "now")
+    second = WorkerSnapshot([WorkerConfig("FLOW-024", "http://127.0.0.1:8124", True, "runtime-new")], [], "runtime_registry", "Fake", "now")
+
+    class ChangingProvider:
+        def __init__(self):
+            self.calls = 0
+        def load_workers(self):
+            self.calls += 1
+            return first
+
+    states = {"FLOW-024": {"credits": 50}}
+    class SlowProjectClient(FakeRealWorkerClient):
+        async def create_project(self, worker, payload):
+            result = await super().create_project(worker, payload)
+            await asyncio.sleep(0.1)
+            return result
+
+    client = SlowProjectClient(states, output_dir=RUN_ROOT / "stale_outputs")
+    settings = GatewaySettings(db_path=local_db("stale_runtime"), dry_run=False)
+    from gateway.scheduler import GatewayScheduler
+    scheduler = GatewayScheduler(settings, worker_client=client, worker_provider=ChangingProvider())
+    await scheduler.start()
+    await scheduler.create_task({"idempotency_key": "stale", "image_path": "D:/img.png", "prompt": "p", "duration": 10, "aspect_ratio": "9:16"})
+    for _ in range(50):
+        if client.projects:
+            break
+        await asyncio.sleep(0.01)
+    scheduler._apply_worker_snapshot(second)
+    for _ in range(100):
+        task = (await scheduler.list_tasks())[0]
+        if task["status"] == "manual_review":
+            break
+        await asyncio.sleep(0.02)
+    task = (await scheduler.list_tasks())[0]
+    assert task["error_code"] == "stale_runtime_instance"
+    assert len(client.projects) == 1
+    assert client.submits == []
     await scheduler.stop()
 
 
@@ -284,17 +378,174 @@ async def test_dry_run_allows_missing_project_id():
 
 
 @pytest.mark.asyncio
-async def test_real_mode_rejects_missing_project_id_before_database_write():
+async def test_real_mode_creates_project_with_selected_worker_when_project_id_missing():
     from gateway.config import GatewaySettings
 
     states = {"FLOW-001": {"credits": 5}, "FLOW-002": {"credits": 50}, "FLOW-003": {"credits": 50}}
     settings = GatewaySettings(db_path=local_db("real_missing_project"), dry_run=False)
-    scheduler = make_scheduler(settings, FakeWorkerClient(states))
+    client = FakeRealWorkerClient(states, output_dir=RUN_ROOT / "created_project_outputs")
+    scheduler = make_scheduler(settings, client)
     await scheduler.start()
-    with pytest.raises(ValueError, match="project_id_required_for_real_task"):
-        await scheduler.create_task({"idempotency_key": "real-no-project", "image_path": "D:/img.png", "prompt": "p", "duration": 10, "aspect_ratio": "9:16"})
-    assert await scheduler.list_tasks() == []
+    await scheduler.create_task({"idempotency_key": "real-no-project", "image_path": "D:/img.png", "prompt": "p", "duration": 10, "aspect_ratio": "9:16", "preferred_account_id": "FLOW-002"})
+    for _ in range(100):
+        task = (await scheduler.list_tasks())[0]
+        if task["status"] == "completed":
+            break
+        await asyncio.sleep(0.02)
+    task = (await scheduler.list_tasks())[0]
+    assert client.projects[0][0] == "FLOW-002"
+    assert client.submits[0][0] == "FLOW-002"
+    assert task["project_id"] == "project-FLOW-002-1"
+    assert task["project_created_by_gateway"] == 1
+    assert task["assigned_account_id"] == "FLOW-002"
+    assert "assigned_runtime_instance_id" in task
     await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_real_mode_project_create_failure_releases_account_without_submit():
+    from gateway.config import GatewaySettings
+
+    states = {"FLOW-001": {"credits": 5}, "FLOW-002": {"credits": 50}, "FLOW-003": {"credits": 50}}
+    client = FakeRealWorkerClient(states)
+    client.fail_project_create = True
+    settings = GatewaySettings(db_path=local_db("project_create_failure"), dry_run=False)
+    scheduler = make_scheduler(settings, client)
+    await scheduler.start()
+    await scheduler.create_task({"idempotency_key": "project-fail", "image_path": "D:/img.png", "prompt": "p", "duration": 10, "aspect_ratio": "9:16", "preferred_account_id": "FLOW-002"})
+    for _ in range(100):
+        task = (await scheduler.list_tasks())[0]
+        if task["status"] == "manual_review":
+            break
+        await asyncio.sleep(0.02)
+    task = (await scheduler.list_tasks())[0]
+    accounts = {a["account_id"]: a for a in await scheduler.list_accounts()}
+    assert task["error_code"] == "project_create_failed"
+    assert task["worker_job_id"] is None
+    assert task["attempt_count"] == 0
+    assert len(client.projects) == 1
+    assert client.submits == []
+    assert accounts["FLOW-002"]["current_task_id"] is None
+    await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_bound_real_task_continues_when_account_status_becomes_low_credits():
+    from gateway import crud
+    from gateway.config import GatewaySettings
+
+    states = {"FLOW-001": {"credits": 5}, "FLOW-002": {"credits": 50}, "FLOW-003": {"credits": 50}}
+    client = FakeRealWorkerClient(states, output_dir=RUN_ROOT / "low_credit_bound_outputs")
+    settings = GatewaySettings(db_path=local_db("low_credit_bound"), dry_run=False)
+    scheduler = make_scheduler(settings, client)
+    await scheduler.start()
+    await scheduler.create_task({
+        "idempotency_key": "low-credit-bound",
+        "image_path": "D:/img.png",
+        "prompt": "p",
+        "duration": 10,
+        "aspect_ratio": "9:16",
+        "preferred_account_id": "FLOW-002",
+    })
+    for _ in range(100):
+        task = (await scheduler.list_tasks())[0]
+        if task["project_id"]:
+            async with scheduler.assignment_lock:
+                await crud.update_task_status(scheduler.db, task["task_id"], task["status"])
+                await scheduler.db.execute("UPDATE flow_accounts SET status='low_credits' WHERE account_id='FLOW-002'")
+                await scheduler.db.commit()
+            break
+        await asyncio.sleep(0.02)
+    for _ in range(100):
+        task = (await scheduler.list_tasks())[0]
+        if task["status"] == "completed":
+            break
+        await asyncio.sleep(0.02)
+    task = (await scheduler.list_tasks())[0]
+    assert task["status"] == "completed"
+    assert task["error_code"] is None
+    assert len(client.projects) == 1
+    assert len(client.submits) == 1
+    await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_three_bound_accounts_release_only_matching_current_task_and_refresh_preserves_bindings():
+    from gateway.config import GatewaySettings
+
+    workers = RUN_ROOT / "three_bound_workers.json"
+    write_workers(workers, ["FLOW-024", "FLOW-025", "FLOW-026"])
+    states = {account_id: {"credits": 50} for account_id in ["FLOW-024", "FLOW-025", "FLOW-026"]}
+    class ControlledClient(FakeRealWorkerClient):
+        def __init__(self, states, output_dir):
+            super().__init__(states, output_dir)
+            self.complete_jobs = False
+            self.complete_accounts = set()
+
+        async def submit_omni_video(self, worker, payload):
+            result = await super().submit_omni_video(worker, payload)
+            self.jobs[result["job_id"]]["status"] = "processing"
+            return result
+
+        async def get_omni_video(self, worker, worker_job_id):
+            if self.complete_jobs or worker.account_id in self.complete_accounts:
+                self.jobs[worker_job_id]["status"] = "completed"
+                self.jobs[worker_job_id]["remaining_credits"] = self.states[worker.account_id]["credits"]
+            return self.jobs[worker_job_id]
+
+    client = ControlledClient(states, output_dir=RUN_ROOT / "three_bound_outputs")
+    settings = GatewaySettings(db_path=local_db("three_bound_release"), workers_path=workers, dry_run=False, max_concurrency=3)
+    scheduler = make_scheduler(settings, client)
+    await scheduler.start()
+    await scheduler.create_tasks([
+        {"idempotency_key": f"bound-{shot}", "image_path": f"D:/img-{shot}.png", "prompt": "p", "duration": 10, "aspect_ratio": "9:16"}
+        for shot in ["024", "025", "026"]
+    ])
+    for _ in range(100):
+        accounts = {a["account_id"]: a for a in await scheduler.list_accounts()}
+        if all(accounts[account_id]["current_task_id"] for account_id in ["FLOW-024", "FLOW-025", "FLOW-026"]):
+            break
+        await asyncio.sleep(0.02)
+    accounts_before = {a["account_id"]: a for a in await scheduler.list_accounts()}
+    task_by_account = {task["assigned_account_id"]: task["task_id"] for task in await scheduler.list_tasks()}
+    assert set(task_by_account) == {"FLOW-024", "FLOW-025", "FLOW-026"}
+
+    states["FLOW-024"]["credits"] = 5
+    await scheduler.refresh_workers()
+    accounts_after_refresh = {a["account_id"]: a for a in await scheduler.list_accounts()}
+    assert accounts_after_refresh["FLOW-024"]["status"] == "low_credits"
+    assert accounts_after_refresh["FLOW-024"]["current_task_id"] == task_by_account["FLOW-024"]
+    assert accounts_after_refresh["FLOW-025"]["current_task_id"] == task_by_account["FLOW-025"]
+    assert accounts_after_refresh["FLOW-026"]["current_task_id"] == task_by_account["FLOW-026"]
+
+    client.complete_accounts.add("FLOW-025")
+    for _ in range(140):
+        tasks_by_account = {task["assigned_account_id"]: task for task in await scheduler.list_tasks()}
+        if tasks_by_account["FLOW-025"]["status"] == "completed":
+            break
+        await asyncio.sleep(0.05)
+    accounts_after_release = {a["account_id"]: a for a in await scheduler.list_accounts()}
+    tasks_by_account = {task["assigned_account_id"]: task for task in await scheduler.list_tasks()}
+    assert tasks_by_account["FLOW-025"]["status"] == "completed"
+    assert accounts_after_release["FLOW-024"]["current_task_id"] == task_by_account["FLOW-024"]
+    assert accounts_after_release["FLOW-026"]["current_task_id"] == task_by_account["FLOW-026"]
+
+    client.complete_jobs = True
+    try:
+        for _ in range(140):
+            tasks = await scheduler.list_tasks()
+            if all(task["status"] == "completed" for task in tasks):
+                break
+            await asyncio.sleep(0.05)
+        tasks = await scheduler.list_tasks()
+        assert all(task["status"] == "completed" for task in tasks), tasks
+        assert len(client.projects) == 3
+        assert len(client.submits) == 3
+        accounts_final = {a["account_id"]: a for a in await scheduler.list_accounts()}
+        assert accounts_final["FLOW-024"]["status"] == "low_credits"
+        assert accounts_final["FLOW-024"]["current_task_id"] is None
+    finally:
+        await scheduler.stop()
 
 
 @pytest.mark.asyncio
@@ -531,6 +782,133 @@ async def test_manual_review_without_worker_job_id_is_not_requeued_on_restart():
     await scheduler.start()
     task = (await scheduler.list_tasks())[0]
     assert task["status"] == "manual_review"
+    assert client.submits == []
+    await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_recover_restores_empty_binding_for_active_task_with_worker_job():
+    from gateway.config import GatewaySettings
+    from gateway import crud
+    from gateway.db import connect
+
+    output_dir = RUN_ROOT / "recover_restore_binding_outputs"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    video_file = output_dir / "job-restore.mp4"
+    video_file.write_bytes(b"\x00\x00\x00\x18ftypmp42")
+    states = {"FLOW-001": {"credits": 5}, "FLOW-002": {"credits": 35}, "FLOW-003": {"credits": 35}}
+    settings = GatewaySettings(db_path=local_db("recover_restore_binding"), dry_run=False)
+    db = await connect(settings.db_path)
+    created = await crud.create_task(db, {"idempotency_key": "restore-binding", "project_id": "project-a", "image_path": "D:/img.png", "prompt": "p", "duration": 10, "aspect_ratio": "9:16", "preferred_account_id": "FLOW-002"})
+    await db.execute("UPDATE flow_tasks SET status='processing', assigned_account_id='FLOW-002', worker_job_id='job-restore' WHERE task_id=?", (created["task_id"],))
+    await db.commit()
+    await db.close()
+    client = FakeRealWorkerClient(states)
+    client.jobs["job-restore"] = {"job_id": "job-restore", "status": "processing", "video_path": str(video_file), "remaining_credits": 35}
+    scheduler = make_scheduler(settings, client)
+    await scheduler.start()
+    accounts = {a["account_id"]: a for a in await scheduler.list_accounts()}
+    assert accounts["FLOW-002"]["current_task_id"] == created["task_id"]
+    await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_recover_clears_stale_terminal_binding_conditionally():
+    from gateway.config import GatewaySettings
+    from gateway import crud
+    from gateway.db import connect
+
+    states = {"FLOW-001": {"credits": 5}, "FLOW-002": {"credits": 35}, "FLOW-003": {"credits": 35}}
+    settings = GatewaySettings(db_path=local_db("recover_stale_binding"), dry_run=False)
+    db = await connect(settings.db_path)
+    created = await crud.create_task(db, {"idempotency_key": "stale-binding", "project_id": "project-a", "image_path": "D:/img.png", "prompt": "p", "duration": 10, "aspect_ratio": "9:16", "preferred_account_id": "FLOW-002"})
+    await db.execute("UPDATE flow_tasks SET status='completed', assigned_account_id='FLOW-002' WHERE task_id=?", (created["task_id"],))
+    await db.execute("UPDATE flow_accounts SET current_task_id=? WHERE account_id='FLOW-002'", (created["task_id"],))
+    await db.commit()
+    await db.close()
+    scheduler = make_scheduler(settings, FakeRealWorkerClient(states))
+    await scheduler.start()
+    accounts = {a["account_id"]: a for a in await scheduler.list_accounts()}
+    assert accounts["FLOW-002"]["current_task_id"] is None
+    await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_recover_multiple_active_tasks_for_one_account_go_manual_review():
+    from gateway.config import GatewaySettings
+    from gateway import crud
+    from gateway.db import connect
+
+    states = {"FLOW-001": {"credits": 5}, "FLOW-002": {"credits": 35}, "FLOW-003": {"credits": 35}}
+    settings = GatewaySettings(db_path=local_db("recover_multiple_active"), dry_run=False)
+    db = await connect(settings.db_path)
+    for key in ("multi-active-1", "multi-active-2"):
+        created = await crud.create_task(db, {"idempotency_key": key, "project_id": f"project-{key}", "image_path": "D:/img.png", "prompt": "p", "duration": 10, "aspect_ratio": "9:16", "preferred_account_id": "FLOW-002"})
+        await db.execute("UPDATE flow_tasks SET status='waiting_recovery', assigned_account_id='FLOW-002', worker_job_id=? WHERE task_id=?", (f"job-{key}", created["task_id"]))
+    await db.commit()
+    await db.close()
+    scheduler = make_scheduler(settings, FakeRealWorkerClient(states))
+    await scheduler.start()
+    tasks = await scheduler.list_tasks()
+    assert {task["status"] for task in tasks} == {"manual_review"}
+    assert {task["error_code"] for task in tasks} == {"multiple_active_tasks_for_account"}
+    await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_recover_existing_worker_job_queries_without_submit_or_project_create():
+    from gateway.config import GatewaySettings
+    from gateway import crud
+    from gateway.db import connect
+
+    output_dir = RUN_ROOT / "recover_existing_job_outputs"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    video_file = output_dir / "job-existing-recover.mp4"
+    video_file.write_bytes(b"\x00\x00\x00\x18ftypmp42")
+    states = {"FLOW-001": {"credits": 5}, "FLOW-002": {"credits": 35}, "FLOW-003": {"credits": 35}}
+    settings = GatewaySettings(db_path=local_db("recover_existing_job"), dry_run=False)
+    db = await connect(settings.db_path)
+    created = await crud.create_task(db, {"idempotency_key": "recover-existing", "project_id": "project-a", "image_path": "D:/img.png", "prompt": "p", "duration": 10, "aspect_ratio": "9:16", "preferred_account_id": "FLOW-002"})
+    await db.execute("UPDATE flow_tasks SET status='processing', assigned_account_id='FLOW-002', worker_job_id='job-existing-recover' WHERE task_id=?", (created["task_id"],))
+    await db.commit()
+    await db.close()
+    client = FakeRealWorkerClient(states)
+    client.jobs["job-existing-recover"] = {"job_id": "job-existing-recover", "status": "completed", "video_path": str(video_file), "remaining_credits": 35}
+    scheduler = make_scheduler(settings, client)
+    await scheduler.start()
+    for _ in range(100):
+        task = (await scheduler.list_tasks())[0]
+        if task["status"] == "completed":
+            break
+        await asyncio.sleep(0.02)
+    task = (await scheduler.list_tasks())[0]
+    assert task["status"] == "completed"
+    assert client.projects == []
+    assert client.submits == []
+    assert client.gets == [("FLOW-002", "job-existing-recover")]
+    await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_recover_project_without_worker_job_goes_manual_review_without_submit():
+    from gateway.config import GatewaySettings
+    from gateway import crud
+    from gateway.db import connect
+
+    states = {"FLOW-001": {"credits": 5}, "FLOW-002": {"credits": 35}, "FLOW-003": {"credits": 35}}
+    settings = GatewaySettings(db_path=local_db("recover_submit_unknown"), dry_run=False)
+    db = await connect(settings.db_path)
+    created = await crud.create_task(db, {"idempotency_key": "submit-unknown", "project_id": "project-a", "image_path": "D:/img.png", "prompt": "p", "duration": 10, "aspect_ratio": "9:16", "preferred_account_id": "FLOW-002"})
+    await db.execute("UPDATE flow_tasks SET status='assigning', assigned_account_id='FLOW-002' WHERE task_id=?", (created["task_id"],))
+    await db.commit()
+    await db.close()
+    client = FakeRealWorkerClient(states)
+    scheduler = make_scheduler(settings, client)
+    await scheduler.start()
+    task = (await scheduler.list_tasks())[0]
+    assert task["status"] == "manual_review"
+    assert task["error_code"] == "submit_state_unknown"
+    assert client.projects == []
     assert client.submits == []
     await scheduler.stop()
 

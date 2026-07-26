@@ -20,6 +20,10 @@ GEMINI.md
 .pytest_cache/
 .pytest_tmp/
 .tmp/
+*.lock
+tmp_multi_storyboard_input/
+tmp_multi_storyboard_runs/
+tmp_multi_storyboard_reconcile/
 
 # Browser-generated extension metadata
 extension/_metadata/

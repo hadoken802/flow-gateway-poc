@@ -41,10 +41,30 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--output-dir")
     run.add_argument("--timeout-seconds", type=int, default=1200)
     run.add_argument("--idempotency-key")
+    batch = subparsers.add_parser("run-storyboard-batch")
+    batch.add_argument("--manifest", required=True)
+    batch.add_argument("--concurrency", type=int, default=3)
+    batch.add_argument("--output-dir")
+    batch.add_argument("--timeout-seconds", type=int, default=1200)
+    batch.add_argument("--gateway-port", type=int)
+    batch.add_argument("--test-mode", action="store_true")
+    reconcile = subparsers.add_parser("reconcile-existing-run")
+    reconcile.add_argument("--run-dir", required=True)
+    reconcile.add_argument("--output-run-dir")
     args = parser.parse_args(argv)
 
     if args.command == "run-video-once":
         result = run_video_once(args)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0 if result.get("ok") else 1
+    if args.command == "run-storyboard-batch":
+        from .storyboard_batch import run_storyboard_batch
+        result = run_storyboard_batch(args)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0 if result.get("ok") else 1
+    if args.command == "reconcile-existing-run":
+        from .reconcile import reconcile_existing_run
+        result = reconcile_existing_run(args)
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0 if result.get("ok") else 1
     return 2

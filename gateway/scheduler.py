@@ -1,5 +1,7 @@
 """Dry-run Gateway scheduler."""
 import asyncio
+import json
+import logging
 from pathlib import Path
 
 from . import crud
@@ -8,6 +10,8 @@ from .db import connect
 from .models import ACTIVE_TASK_STATUSES
 from .worker_client import WorkerClient
 from .worker_provider import WorkerConfig, WorkerSnapshot, build_worker_provider
+
+logger = logging.getLogger(__name__)
 
 
 class GatewayScheduler:
@@ -120,18 +124,92 @@ class GatewayScheduler:
                     await crud.upsert_account(self.db, worker, status="offline", credits=(account or {}).get("credits"), last_error=str(exc)[:500])
 
     async def recover_tasks(self):
+        tasks = await crud.list_tasks(self.db)
+        if self.settings.dry_run:
+            for task in tasks:
+                if task["status"] in {"assigning", "submitted", "processing", "waiting_recovery"}:
+                    await crud.update_task_status(self.db, task["task_id"], "queued")
+            await self.db.execute(
+                """
+                UPDATE flow_accounts
+                SET current_task_id=NULL
+                WHERE current_task_id IN (
+                    SELECT task_id FROM flow_tasks WHERE status='queued'
+                )
+                """
+            )
+            await self.db.commit()
+            await self.refresh_workers()
+            await self.schedule_once()
+            return
+
+        active_statuses = {"assigning", "submitted", "processing", "waiting_recovery"}
+        active_by_account: dict[str, list[dict]] = {}
+        terminal_task_ids = {task["task_id"] for task in tasks if task["status"] in {"completed", "failed", "manual_review"}}
+        task_ids = {task["task_id"] for task in tasks}
+        for task in tasks:
+            if (task["status"] in active_statuses or (task["status"] == "manual_review" and task.get("worker_job_id"))) and task.get("assigned_account_id"):
+                active_by_account.setdefault(task["assigned_account_id"], []).append(task)
+
+        for account in await crud.list_accounts(self.db):
+            current_task_id = account.get("current_task_id")
+            active = active_by_account.get(account["account_id"], [])
+            if len(active) > 1:
+                self._audit("recovery_conflict_detected", account_id=account["account_id"], task_ids=[task["task_id"] for task in active])
+                for task in active:
+                    await crud.release_task_for_manual_review(
+                        self.db,
+                        task["task_id"],
+                        account["account_id"],
+                        error_code="multiple_active_tasks_for_account",
+                        error_message="Multiple active tasks were assigned to one account during recovery",
+                    )
+                continue
+            if len(active) == 1:
+                task = active[0]
+                if current_task_id != task["task_id"]:
+                    await self.db.execute(
+                        """
+                        UPDATE flow_accounts
+                        SET current_task_id=?, status='busy',
+                            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                        WHERE account_id=? AND (current_task_id IS NULL OR current_task_id=? OR current_task_id NOT IN (SELECT task_id FROM flow_tasks WHERE status IN ('assigning','submitted','processing','waiting_recovery')))
+                        """,
+                        (task["task_id"], account["account_id"], current_task_id),
+                    )
+                    await self.db.commit()
+                    self._audit("recovery_binding_restored", account_id=account["account_id"], task_id=task["task_id"])
+                continue
+            if current_task_id and (current_task_id not in task_ids or current_task_id in terminal_task_ids):
+                await self.db.execute(
+                    """
+                    UPDATE flow_accounts
+                    SET current_task_id=NULL,
+                        updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                    WHERE account_id=? AND current_task_id=?
+                    """,
+                    (account["account_id"], current_task_id),
+                )
+                await self.db.commit()
+                self._audit("recovery_stale_binding_cleared", account_id=account["account_id"], task_id=current_task_id)
+
         for task in await crud.list_tasks(self.db):
-            if self.settings.dry_run and task["status"] in {"assigning", "submitted", "processing", "waiting_recovery"}:
-                await crud.update_task_status(self.db, task["task_id"], "queued")
-            elif not self.settings.dry_run and task["status"] in {"assigning", "submitted", "processing", "waiting_recovery"}:
+            if task["status"] in active_statuses:
                 if task.get("worker_job_id"):
                     self._real_tasks[task["task_id"]] = asyncio.create_task(self._run_real_task(task["task_id"], task["assigned_account_id"]))
+                elif task.get("project_id"):
+                    self._audit("account_released", task_id=task["task_id"], account_id=task.get("assigned_account_id"), release_reason="submit_state_unknown")
+                    await crud.release_task_for_manual_review(
+                        self.db,
+                        task["task_id"],
+                        task.get("assigned_account_id"),
+                        error_code="submit_state_unknown",
+                        error_message="Task has project_id but no worker_job_id during recovery",
+                    )
                 else:
                     await crud.update_task_status(self.db, task["task_id"], "queued")
-            elif not self.settings.dry_run and task["status"] == "manual_review" and task.get("worker_job_id"):
+            elif task["status"] == "manual_review" and task.get("worker_job_id") and task.get("error_code") != "multiple_active_tasks_for_account":
                 self._real_tasks[task["task_id"]] = asyncio.create_task(self._run_real_task(task["task_id"], task["assigned_account_id"]))
-        await self.db.execute("UPDATE flow_accounts SET current_task_id=NULL WHERE current_task_id IS NOT NULL")
-        await self.db.commit()
         await self.refresh_workers()
         await self.schedule_once()
 
@@ -147,10 +225,6 @@ class GatewayScheduler:
             await asyncio.sleep(0.05)
 
     async def create_task(self, payload):
-        if not self.settings.dry_run:
-            project_id = payload.get("project_id")
-            if not isinstance(project_id, str) or not project_id.strip():
-                raise ValueError("project_id_required_for_real_task")
         if not self.settings.dry_run and self.settings.canary_only:
             existing = sum(1 for task in await crud.list_tasks(self.db) if task.get("submitted_at") != "dry-run")
             if existing >= self.settings.canary_limit:
@@ -214,10 +288,16 @@ class GatewayScheduler:
             if not lock:
                 return
             async with lock:
-                task = await crud.assign_next_task(self.db, account_id, self.settings.omni_10s_credit_cost)
+                task = await crud.assign_next_task(
+                    self.db,
+                    account_id,
+                    selected.get("selected_runtime_instance_id"),
+                    self.settings.omni_10s_credit_cost,
+                )
                 if not task:
                     return
                 self.assignment_history.append((task["task_id"], account_id))
+                self._audit("account_reserved", task_id=task["task_id"], account_id=account_id, runtime_instance_id=selected.get("selected_runtime_instance_id"))
                 account["status"] = "busy"
                 account["current_task_id"] = task["task_id"]
                 status["active_count"] += 1
@@ -238,7 +318,11 @@ class GatewayScheduler:
             if account and (account.get("status") != "ready" or account.get("current_task_id")):
                 continue
             eligible.append(worker)
-        eligible.sort(key=lambda worker: worker.account_id)
+        eligible.sort(key=lambda worker: (
+            states.get(worker.account_id, {}).get("last_assigned_at") is not None,
+            states.get(worker.account_id, {}).get("last_assigned_at") or "",
+            worker.account_id,
+        ))
         if not eligible:
             return {
                 "result": "no_eligible_worker",
@@ -253,7 +337,7 @@ class GatewayScheduler:
             "selected_account_id": selected.account_id,
             "selected_runtime_instance_id": selected.runtime_instance_id,
             "selected_worker_api_endpoint": selected.api_url,
-            "selection_reason": "first eligible account by account_id",
+            "selection_reason": "least recently assigned eligible account",
             "selection_function": "GatewayScheduler.select_worker",
             **snapshot.diagnostics(),
         }
@@ -357,6 +441,10 @@ class GatewayScheduler:
             if not task or not worker:
                 return
             while not task.get("worker_job_id") and not self._stopping:
+                current_worker = await self._bound_ready_worker(task_id, account_id)
+                if not current_worker:
+                    return
+                worker = current_worker
                 if int(task.get("attempt_count") or 0) >= self.settings.real_submit_max_attempts:
                     async with self.assignment_lock:
                         await crud.release_task_for_manual_review(
@@ -370,16 +458,33 @@ class GatewayScheduler:
                     return
                 project_id = task.get("project_id")
                 if not isinstance(project_id, str) or not project_id.strip():
+                    try:
+                        self._audit("project_create_started", task_id=task_id, worker_account_id=worker.account_id, runtime_instance_id=worker.runtime_instance_id)
+                        project = await self.worker_client.create_project(worker, _project_payload(task_id))
+                        project_id = project.get("id")
+                        if not isinstance(project_id, str) or not project_id.strip() or project_id.startswith("gateway-"):
+                            raise ValueError("Worker project response did not include a real Flow project id")
+                        self._audit("project_create_completed", task_id=task_id, worker_account_id=worker.account_id, project_id=project_id)
+                    except Exception as exc:
+                        async with self.assignment_lock:
+                            self._audit("account_released", task_id=task_id, account_id=account_id, release_reason="project_create_failed")
+                            await crud.release_task_for_manual_review(
+                                self.db,
+                                task_id,
+                                account_id,
+                                error_code="project_create_failed",
+                                error_message=str(exc)[:500],
+                                remaining_credits=task.get("remaining_credits"),
+                            )
+                        return
                     async with self.assignment_lock:
-                        await crud.release_task_for_manual_review(
-                            self.db,
-                            task_id,
-                            account_id,
-                            error_code="project_id_required_for_real_task",
-                            error_message="Real Gateway tasks require a pre-created Flow project_id",
-                            remaining_credits=task.get("remaining_credits"),
-                        )
-                    return
+                        task = await crud.mark_project_created(self.db, task_id, project_id)
+                    if not task:
+                        return
+                    current_worker = await self._bound_ready_worker(task_id, account_id)
+                    if not current_worker:
+                        return
+                    worker = current_worker
                 payload = {
                     "idempotency_key": task["idempotency_key"],
                     "project_id": project_id,
@@ -390,9 +495,12 @@ class GatewayScheduler:
                 }
                 try:
                     await self._increment_attempt_count(task_id)
+                    self._audit("worker_submit_started", task_id=task_id, worker_account_id=worker.account_id, project_id=project_id)
                     result = await self.worker_client.submit_omni_video(worker, payload)
+                    self._audit("worker_submit_completed", task_id=task_id, worker_account_id=worker.account_id, worker_job_id=result.get("job_id") or result.get("worker_job_id"))
                 except Exception as exc:
                     async with self.assignment_lock:
+                        self._audit("account_released", task_id=task_id, account_id=account_id, release_reason="worker_submit_failed")
                         await crud.release_task_for_manual_review(
                             self.db,
                             task_id,
@@ -404,6 +512,7 @@ class GatewayScheduler:
                     return
                 worker_job_id = result.get("job_id") or result.get("worker_job_id")
                 if not worker_job_id:
+                    self._audit("account_released", task_id=task_id, account_id=account_id, release_reason="missing_worker_job_id")
                     await crud.release_task_for_manual_review(
                         self.db,
                         task_id,
@@ -425,6 +534,10 @@ class GatewayScheduler:
                 task = await crud.get_task(self.db, task_id)
                 if not task or task["status"] == "completed":
                     return
+                current_worker = await self._bound_ready_worker(task_id, account_id)
+                if not current_worker:
+                    return
+                worker = current_worker
                 try:
                     result = await self.worker_client.get_omni_video(worker, task["worker_job_id"])
                     if result.get("status") in {"waiting_download", "completed_remote"}:
@@ -439,6 +552,7 @@ class GatewayScheduler:
                     video_path = result.get("video_path")
                     if not video_path or not Path(video_path).exists():
                         async with self.assignment_lock:
+                            self._audit("account_released", task_id=task_id, account_id=account_id, release_reason="missing_video_path")
                             await crud.release_task_for_manual_review(
                                 self.db,
                                 task_id,
@@ -449,6 +563,7 @@ class GatewayScheduler:
                             )
                         return
                     async with self.assignment_lock:
+                        self._audit("account_released", task_id=task_id, account_id=account_id, release_reason="completed")
                         await crud.complete_real_task(
                             self.db,
                             task_id,
@@ -460,7 +575,15 @@ class GatewayScheduler:
                     return
                 if mapped == "manual_review":
                     async with self.assignment_lock:
-                        await crud.update_task_status(self.db, task_id, "manual_review", error_code=result.get("error_code"), error_message=result.get("error_message"))
+                        self._audit("account_released", task_id=task_id, account_id=account_id, release_reason="worker_manual_review")
+                        await crud.release_task_for_manual_review(
+                            self.db,
+                            task_id,
+                            account_id,
+                            error_code=result.get("error_code"),
+                            error_message=result.get("error_message"),
+                            remaining_credits=result.get("remaining_credits"),
+                        )
                     return
                 async with self.assignment_lock:
                     await crud.update_task_status(self.db, task_id, mapped)
@@ -488,9 +611,56 @@ class GatewayScheduler:
                 return worker
         return None
 
+    def _audit(self, event, **fields):
+        safe = {"event": event, **fields}
+        logger.info("gateway_audit %s", json.dumps(safe, sort_keys=True))
+
+    async def _bound_ready_worker(self, task_id, account_id):
+        task = await crud.get_task(self.db, task_id)
+        worker = self._worker_by_account(account_id)
+        if not task or not worker:
+            return None
+        if worker.account_id != task.get("assigned_account_id"):
+            await crud.release_task_for_manual_review(self.db, task_id, account_id, error_code="assigned_account_mismatch", error_message="Assigned account changed before submit")
+            return None
+        if task.get("assigned_runtime_instance_id") and worker.runtime_instance_id != task.get("assigned_runtime_instance_id"):
+            await crud.release_task_for_manual_review(self.db, task_id, account_id, error_code="stale_runtime_instance", error_message="Runtime instance changed after assignment")
+            return None
+        account = await crud.get_account(self.db, account_id)
+        if not account or account.get("current_task_id") != task_id:
+            self._audit(
+                "account_binding_lost",
+                task_id=task_id,
+                expected_account_id=account_id,
+                actual_current_task_id=(account or {}).get("current_task_id"),
+                account_status=(account or {}).get("status"),
+            )
+            self._audit("account_released", task_id=task_id, account_id=account_id, release_reason="account_not_bound")
+            await crud.release_task_for_manual_review(self.db, task_id, account_id, error_code="account_not_bound", error_message="Account is no longer bound to this task")
+            return None
+        try:
+            info = await self.worker_client.inspect(worker)
+        except Exception as exc:
+            await crud.release_task_for_manual_review(self.db, task_id, account_id, error_code="worker_offline", error_message=str(exc)[:500])
+            return None
+        if info.get("status") == "offline" or not info.get("extension_connected") or not info.get("flow_key_present"):
+            await crud.release_task_for_manual_review(self.db, task_id, account_id, error_code="worker_not_ready", error_message="Worker is no longer ready")
+            return None
+        return worker
+
 
 def _now_marker():
     return "dry-run"
+
+
+def _project_payload(task_id):
+    return {
+        "name": f"Flow Gateway Task {task_id}",
+        "language": "en",
+        "material": "realistic",
+        "allow_music": False,
+        "allow_voice": False,
+    }
 
 
 def _map_worker_status(status):

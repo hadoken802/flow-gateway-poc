@@ -92,7 +92,7 @@ async def count_tasks(db, statuses=None):
     return int((await cursor.fetchone())[0])
 
 
-async def assign_next_task(db, account_id, credit_cost):
+async def assign_task(db, task_id, account_id, runtime_instance_id, credit_cost):
     await db.commit()
     await db.execute("BEGIN IMMEDIATE")
     try:
@@ -111,10 +111,9 @@ async def assign_next_task(db, account_id, credit_cost):
         cursor = await db.execute(
             """
             SELECT * FROM flow_tasks
-            WHERE status='queued' AND (preferred_account_id IS NULL OR preferred_account_id=?)
-            ORDER BY created_at, task_id LIMIT 1
+            WHERE task_id=? AND status='queued' AND (preferred_account_id IS NULL OR preferred_account_id=?)
             """,
-            (account_id,),
+            (task_id, account_id),
         )
         task = await cursor.fetchone()
         if not task:
@@ -124,11 +123,12 @@ async def assign_next_task(db, account_id, credit_cost):
         await db.execute(
             """
             UPDATE flow_tasks
-            SET status='assigning', assigned_account_id=?, assigned_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+            SET status='assigning', assigned_account_id=?, assigned_runtime_instance_id=?,
+                assigned_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
                 updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
             WHERE task_id=? AND status='queued'
             """,
-            (account_id, task_id),
+            (account_id, runtime_instance_id, task_id),
         )
         await db.execute(
             """
@@ -144,6 +144,36 @@ async def assign_next_task(db, account_id, credit_cost):
     except Exception:
         await db.execute("ROLLBACK")
         raise
+
+
+async def assign_next_task(db, account_id, runtime_instance_id, credit_cost):
+    cursor = await db.execute(
+        """
+        SELECT task_id FROM flow_tasks
+        WHERE status='queued' AND (preferred_account_id IS NULL OR preferred_account_id=?)
+        ORDER BY created_at, task_id LIMIT 1
+        """,
+        (account_id,),
+    )
+    task = await cursor.fetchone()
+    if not task:
+        return None
+    return await assign_task(db, task["task_id"], account_id, runtime_instance_id, credit_cost)
+
+
+async def mark_project_created(db, task_id, project_id):
+    await db.execute(
+        """
+        UPDATE flow_tasks
+        SET project_id=?, project_created_by_gateway=1,
+            project_created_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+        WHERE task_id=? AND project_id IS NULL
+        """,
+        (project_id, task_id),
+    )
+    await db.commit()
+    return await get_task(db, task_id)
 
 
 async def update_task_status(db, task_id, status, **fields):
@@ -190,9 +220,9 @@ async def complete_task(db, task_id, account_id, credit_cost, video_path):
             SET credits=MAX(COALESCE(credits, 0)-?, 0), current_task_id=NULL,
                 status=CASE WHEN MAX(COALESCE(credits, 0)-?, 0) >= ? THEN 'ready' ELSE 'low_credits' END,
                 updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-            WHERE account_id=?
+            WHERE account_id=? AND current_task_id=?
             """,
-            (credit_cost, credit_cost, credit_cost, account_id),
+            (credit_cost, credit_cost, credit_cost, account_id, task_id),
         )
         await db.commit()
     except Exception:
@@ -220,9 +250,9 @@ async def complete_real_task(db, task_id, account_id, video_path, remaining_cred
             SET credits=COALESCE(?, credits), current_task_id=NULL,
                 status=CASE WHEN COALESCE(?, credits) >= 15 THEN 'ready' ELSE 'low_credits' END,
                 updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-            WHERE account_id=?
+            WHERE account_id=? AND current_task_id=?
             """,
-            (remaining_credits, remaining_credits, account_id),
+            (remaining_credits, remaining_credits, account_id, task_id),
         )
         await db.commit()
     except Exception:
@@ -249,9 +279,9 @@ async def release_task_for_manual_review(db, task_id, account_id, error_code=Non
             SET credits=COALESCE(?, credits), current_task_id=NULL,
                 status=CASE WHEN COALESCE(?, credits) >= 15 THEN 'ready' ELSE 'low_credits' END,
                 updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-            WHERE account_id=?
+            WHERE account_id=? AND current_task_id=?
             """,
-            (remaining_credits, remaining_credits, account_id),
+            (remaining_credits, remaining_credits, account_id, task_id),
         )
         await db.commit()
     except Exception:
