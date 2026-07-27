@@ -599,16 +599,18 @@ class GatewayScheduler:
                 mapped = _map_worker_status(result.get("status"))
                 if mapped == "completed":
                     video_path = result.get("video_path")
-                    if not video_path or not Path(video_path).exists():
+                    video_check = _valid_local_mp4(video_path)
+                    if not video_check["ok"]:
                         async with self.assignment_lock:
-                            self._audit("account_released", task_id=task_id, account_id=account_id, release_reason="missing_video_path")
+                            self._audit("account_released", task_id=task_id, account_id=account_id, release_reason=video_check["error_code"])
                             await crud.release_task_for_manual_review(
                                 self.db,
                                 task_id,
                                 account_id,
-                                error_code=result.get("error_code") or "missing_video_path",
-                                error_message=result.get("error_message") or "Worker completed without a local video_path",
+                                error_code=result.get("error_code") or video_check["error_code"],
+                                error_message=result.get("error_message") or video_check["error_message"],
                                 remaining_credits=result.get("remaining_credits"),
+                                status="download_failed",
                             )
                         return
                     async with self.assignment_lock:
@@ -746,3 +748,21 @@ def _requires_manual_submit(result: dict) -> bool:
         and "recaptcha evaluation failed" in text
         and "public_error_unusual_activity" in text
     )
+
+
+def _valid_local_mp4(video_path, min_size_bytes: int = 1024) -> dict:
+    if not video_path:
+        return {"ok": False, "error_code": "missing_video_path", "error_message": "Worker completed without a local video_path"}
+    path = Path(video_path)
+    try:
+        if not path.exists():
+            return {"ok": False, "error_code": "missing_video_path", "error_message": "Worker completed but local video_path does not exist"}
+        if path.stat().st_size < min_size_bytes:
+            return {"ok": False, "error_code": "video_too_small", "error_message": "Local video is too small to be valid"}
+        with path.open("rb") as fh:
+            header = fh.read(8)
+        if len(header) < 8 or header[4:8] != b"ftyp":
+            return {"ok": False, "error_code": "invalid_local_mp4", "error_message": "Local video is not a valid MP4 ftyp file"}
+    except OSError as exc:
+        return {"ok": False, "error_code": "video_path_error", "error_message": str(exc)[:500]}
+    return {"ok": True, "error_code": None, "error_message": None}

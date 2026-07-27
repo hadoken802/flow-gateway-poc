@@ -43,6 +43,7 @@ class FakeRealWorkerClient(FakeWorkerClient):
         self.projects = []
         self.fail_project_create = False
         self.gets = []
+        self.completed_invalid_video_path = None
 
     async def create_project(self, worker, payload):
         self.projects.append((worker.account_id, dict(payload)))
@@ -62,12 +63,12 @@ class FakeRealWorkerClient(FakeWorkerClient):
         if self.output_dir:
             video_file = self.output_dir / f"{job_id}.mp4"
             video_file.parent.mkdir(parents=True, exist_ok=True)
-            video_file.write_bytes(b"\x00\x00\x00\x18ftypmp42")
+            video_file.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"x" * 2048)
             video_path = str(video_file)
         self.jobs[job_id] = {
             "job_id": job_id,
             "status": "completed",
-            "video_path": video_path,
+            "video_path": str(self.completed_invalid_video_path) if self.completed_invalid_video_path else video_path,
             "remaining_credits": self.states[worker.account_id]["credits"] - 15,
         }
         return self.jobs[job_id]
@@ -512,6 +513,41 @@ async def test_real_mode_project_create_failure_releases_account_without_submit(
 
 
 @pytest.mark.asyncio
+async def test_real_mode_remote_completed_with_invalid_local_mp4_does_not_complete():
+    from gateway.config import GatewaySettings
+
+    invalid_video = RUN_ROOT / "invalid_completed" / "bad.mp4"
+    invalid_video.parent.mkdir(parents=True, exist_ok=True)
+    invalid_video.write_bytes(b"not-valid-mp4" + b"x" * 2048)
+    states = {"FLOW-001": {"credits": 5}, "FLOW-002": {"credits": 50}, "FLOW-003": {"credits": 50}}
+    client = FakeRealWorkerClient(states)
+    client.completed_invalid_video_path = invalid_video
+    settings = GatewaySettings(db_path=local_db("invalid_completed_video"), dry_run=False)
+    scheduler = make_scheduler(settings, client)
+    await scheduler.start()
+    await scheduler.create_task({
+        "idempotency_key": "invalid-completed-video",
+        "project_id": "project-a",
+        "image_path": "D:/img.png",
+        "prompt": "prompt",
+        "duration": 10,
+        "aspect_ratio": "9:16",
+        "preferred_account_id": "FLOW-002",
+    })
+    for _ in range(100):
+        task = (await scheduler.list_tasks())[0]
+        if task["status"] in {"download_failed", "manual_review"}:
+            break
+        await asyncio.sleep(0.02)
+    task = (await scheduler.list_tasks())[0]
+    accounts = {a["account_id"]: a for a in await scheduler.list_accounts()}
+    assert task["status"] == "download_failed"
+    assert task["error_code"] == "invalid_local_mp4"
+    assert accounts["FLOW-002"]["current_task_id"] is None
+    await scheduler.stop()
+
+
+@pytest.mark.asyncio
 async def test_bound_real_task_continues_when_account_status_becomes_low_credits():
     from gateway import crud
     from gateway.config import GatewaySettings
@@ -731,7 +767,7 @@ async def test_real_mode_retries_download_for_existing_worker_job_without_new_ta
     output_dir = RUN_ROOT / "gateway_retry_outputs"
     output_dir.mkdir(parents=True, exist_ok=True)
     video_file = output_dir / "job-existing.mp4"
-    video_file.write_bytes(b"\x00\x00\x00\x18ftypmp42")
+    video_file.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"x" * 2048)
     states = {"FLOW-001": {"credits": 5}, "FLOW-002": {"credits": 35}, "FLOW-003": {"credits": 35}}
     settings = GatewaySettings(db_path=local_db("gateway_retry_existing"), dry_run=False)
     db = await connect(settings.db_path)
@@ -793,7 +829,7 @@ async def test_real_mode_recovers_manual_review_task_with_existing_worker_job():
     output_dir = RUN_ROOT / "gateway_manual_review_retry_outputs"
     output_dir.mkdir(parents=True, exist_ok=True)
     video_file = output_dir / "job-manual.mp4"
-    video_file.write_bytes(b"\x00\x00\x00\x18ftypmp42")
+    video_file.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"x" * 2048)
     states = {"FLOW-001": {"credits": 5}, "FLOW-002": {"credits": 35}, "FLOW-003": {"credits": 35}}
     settings = GatewaySettings(db_path=local_db("gateway_manual_review_retry"), dry_run=False)
     db = await connect(settings.db_path)
@@ -914,7 +950,7 @@ async def test_recover_restores_empty_binding_for_active_task_with_worker_job():
     output_dir = RUN_ROOT / "recover_restore_binding_outputs"
     output_dir.mkdir(parents=True, exist_ok=True)
     video_file = output_dir / "job-restore.mp4"
-    video_file.write_bytes(b"\x00\x00\x00\x18ftypmp42")
+    video_file.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"x" * 2048)
     states = {"FLOW-001": {"credits": 5}, "FLOW-002": {"credits": 35}, "FLOW-003": {"credits": 35}}
     settings = GatewaySettings(db_path=local_db("recover_restore_binding"), dry_run=False)
     db = await connect(settings.db_path)
@@ -983,7 +1019,7 @@ async def test_recover_existing_worker_job_queries_without_submit_or_project_cre
     output_dir = RUN_ROOT / "recover_existing_job_outputs"
     output_dir.mkdir(parents=True, exist_ok=True)
     video_file = output_dir / "job-existing-recover.mp4"
-    video_file.write_bytes(b"\x00\x00\x00\x18ftypmp42")
+    video_file.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"x" * 2048)
     states = {"FLOW-001": {"credits": 5}, "FLOW-002": {"credits": 35}, "FLOW-003": {"credits": 35}}
     settings = GatewaySettings(db_path=local_db("recover_existing_job"), dry_run=False)
     db = await connect(settings.db_path)

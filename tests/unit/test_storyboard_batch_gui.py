@@ -816,6 +816,23 @@ def test_storyboard_gui_selected_video_path_from_loaded_result(tmp_path):
     assert StoryboardGui.selected_video_path(gui) == str(video)
 
 
+def test_storyboard_gui_applies_retry_download_result_by_task_id(tmp_path):
+    from gateway.storyboard_gui import StoryboardGui
+
+    gui = make_gui_shell(tmp_path)
+    video = tmp_path / "downloaded.mp4"
+    gui.shots = [{"shot_id": "001", "task_id": "task-1", "status": "download_failed"}]
+
+    StoryboardGui._apply_retry_download_tasks(gui, [{
+        "task_id": "task-1",
+        "gateway_status_after": "completed",
+        "video_path_after": str(video),
+    }])
+
+    assert gui.shots[0]["status"] == "completed"
+    assert gui.shots[0]["video_path"] == str(video)
+
+
 def test_storyboard_gui_has_no_fake_pause_button():
     text = Path("gateway/storyboard_gui.py").read_text(encoding="utf-8")
 

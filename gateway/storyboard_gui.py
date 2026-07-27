@@ -123,6 +123,7 @@ class StoryboardGui(tk.Tk):
             button.pack(side="left")
             if text == "开始制作":
                 self.start_button = button
+        ttk.Button(shot_buttons, text="重新下载选中视频", command=self.retry_download_selected_video).pack(side="left")
 
         settings = ttk.LabelFrame(root, text="批量设置")
         settings.pack(fill="x")
@@ -521,6 +522,42 @@ class StoryboardGui(tk.Tk):
         if index is not None:
             return self.shots[index].get("video_path")
         return None
+
+    def retry_download_selected_video(self) -> None:
+        shot = self._selected_shot()
+        db_path = self._gateway_db_path()
+        if not shot or not db_path:
+            return
+        account_id = shot.get("assigned_account_id")
+        if not account_id:
+            return
+        run_dir = db_path.parent
+
+        def work():
+            from .download_recovery import retry_downloads
+
+            result = retry_downloads(argparse.Namespace(run_dir=str(run_dir), account_id=[account_id], execute=True))
+            self.after(0, lambda: self._apply_retry_download_tasks(result.get("tasks", [])))
+            return result
+
+        self._threaded("retry_download", work)
+
+    def _apply_retry_download_tasks(self, rows: list[dict]) -> None:
+        by_task_id = {str(shot.get("task_id")): shot for shot in self.shots if shot.get("task_id")}
+        for row in rows:
+            task_id = str(row.get("task_id") or "")
+            shot = by_task_id.get(task_id)
+            if not shot:
+                continue
+            if row.get("gateway_status_after"):
+                shot["status"] = row.get("gateway_status_after")
+            if row.get("video_path_after"):
+                shot["video_path"] = row.get("video_path_after")
+            if row.get("error_code"):
+                shot["error_code"] = row.get("error_code")
+            if row.get("error_message"):
+                shot["error_message"] = row.get("error_message")
+        self._render_shots()
 
     def _selected_shot(self) -> dict | None:
         index = self._selected_shot_index()

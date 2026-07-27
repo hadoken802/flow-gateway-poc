@@ -57,6 +57,10 @@ def main(argv: list[str] | None = None) -> int:
     smoke.add_argument("--account-ids", required=True)
     smoke.add_argument("--output-dir", required=True)
     smoke.add_argument("--timeout-seconds", type=int, default=60)
+    retry_downloads = subparsers.add_parser("retry-downloads")
+    retry_downloads.add_argument("--run-dir", required=True)
+    retry_downloads.add_argument("--account-id", action="append", default=[])
+    retry_downloads.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
 
     if args.command == "run-video-once":
@@ -75,6 +79,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if result.get("ok") else 1
     if args.command == "gateway-startup-smoke":
         result = gateway_startup_smoke(args)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0 if result.get("ok") else 1
+    if args.command == "retry-downloads":
+        from .download_recovery import retry_downloads
+        result = retry_downloads(args)
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0 if result.get("ok") else 1
     return 2
