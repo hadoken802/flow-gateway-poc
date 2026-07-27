@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 import threading
+from types import SimpleNamespace
 from pathlib import Path
 from tkinter import filedialog, messagebox
 import tkinter as tk
@@ -16,6 +17,7 @@ from runtime.process_manager import RuntimeManager
 from runtime.window_manager import WindowManager
 
 from .storyboard_batch import run_storyboard_batch
+from .worker_client import WorkerClient
 
 
 DEFAULT_ACCOUNT_IDS = {"FLOW-025", "FLOW-026", "FLOW-027"}
@@ -111,6 +113,8 @@ class StoryboardGui(tk.Tk):
             ("加载批次结果", self.load_batch_result),
             ("上移", lambda: self.move_shot(-1)),
             ("下移", lambda: self.move_shot(1)),
+            ("打开对应Flow项目", self.open_selected_flow_project),
+            ("人工生成后检查结果", self.check_manual_result),
             ("开始制作", self.start_batch),
             ("打开输出目录", self.open_output_dir),
             ("打开所选视频", self.open_selected_video),
@@ -335,9 +339,11 @@ class StoryboardGui(tk.Tk):
         self._apply_result_tasks(result)
         self._log(f"batch done ok={result.get('ok')} result={result.get('result')} stage={result.get('stage')} error_code={result.get('error_code')} run_dir={result.get('run_dir')}")
         if not result.get("ok"):
+            title = self._error_title(result)
+            details = self._manual_submit_details(result)
             messagebox.showerror(
-                "Gateway启动失败",
-                f"stage={result.get('stage')}\nerror_code={result.get('error_code')}\nerror_message={self._safe(result.get('error_message'))}\nrun_dir={result.get('run_dir')}",
+                title,
+                f"stage={result.get('stage')}\nerror_code={result.get('error_code')}\nerror_message={self._safe(result.get('error_message'))}\nrun_dir={result.get('run_dir')}{details}",
             )
 
     def _build_batch_args(self, preflight_only: bool) -> argparse.Namespace:
@@ -403,11 +409,122 @@ class StoryboardGui(tk.Tk):
         if path:
             os.startfile(path)
 
+    def open_selected_flow_project(self) -> None:
+        shot = self._selected_shot()
+        if not shot:
+            return
+        account_id = shot.get("assigned_account_id")
+        project_id = shot.get("project_id")
+        if account_id and project_id:
+            self._threaded("open_flow_project", lambda: WindowManager().open_or_focus_flow_project(account_id, project_id).to_dict())
+
+    def check_manual_result(self) -> None:
+        shot = self._selected_shot()
+        if not shot:
+            return
+        self._threaded("manual_result_check", lambda: self._check_manual_result_for_shot(shot))
+
+    def _check_manual_result_for_shot(self, shot: dict) -> dict:
+        account_id = shot.get("assigned_account_id")
+        project_id = shot.get("project_id")
+        account = self.account_rows.get(account_id or "", {})
+        api_url = account.get("worker_api_endpoint") or account.get("api_url")
+        if not project_id or not api_url:
+            return {"result": "manual_result_not_checkable", "shot_id": shot.get("shot_id"), "project_id": shot.get("project_id")}
+        worker = SimpleNamespace(api_url=api_url)
+        exclude_media_ids = self._failed_job_media_ids(worker, shot.get("worker_job_id"))
+        client = WorkerClient()
+        candidates = self._run_async(client.list_manual_flow_results(
+            worker,
+            project_id,
+            after=shot.get("manual_submit_required_at"),
+            exclude_media_ids=exclude_media_ids,
+        )).get("candidates", [])
+        if not candidates:
+            shot["status"] = shot.get("status") or "manual_submit_required"
+            self.after(0, self._render_shots)
+            return {"result": "not_completed", "status": shot.get("status"), "candidate_count": 0}
+        if len(candidates) > 1:
+            shot["status"] = "manual_result_ambiguous"
+            shot["error_code"] = "manual_result_ambiguous"
+            shot["error_message"] = f"Multiple manual video candidates: {len(candidates)}"
+            self._update_gateway_task_from_shot(shot)
+            self.after(0, self._render_shots)
+            return {"result": "manual_result_ambiguous", "candidate_count": len(candidates)}
+        candidate = candidates[0]
+        result = self._run_async(client.download_manual_flow_result(worker, candidate["media_id"]))
+        video_path = result.get("video_path")
+        if result.get("status") == "completed" and video_path and self._valid_mp4(Path(video_path)):
+            shot.update({
+                "status": "completed",
+                "video_path": video_path,
+                "error_code": None,
+                "error_message": None,
+                "manual_result_media_id": candidate.get("media_id"),
+                "manual_result_operation_id": candidate.get("operation_id"),
+                "manual_result_source": result.get("source") or "manual_project_media",
+            })
+            self._update_gateway_task_from_shot(shot)
+            self.after(0, self._render_shots)
+            return {"result": "completed", "video_path": video_path, "media_id": candidate.get("media_id")}
+        shot["status"] = "manual_submit_required"
+        self.after(0, self._render_shots)
+        return {"result": "not_completed", "status": shot.get("status"), "error_code": result.get("error_code")}
+
+    def _failed_job_media_ids(self, worker, worker_job_id: str | None) -> set[str]:
+        if not worker_job_id:
+            return set()
+        try:
+            result = self._run_async(WorkerClient().get_omni_video(worker, worker_job_id))
+        except Exception:
+            return set()
+        return {value for value in (result.get("input_media_id"), result.get("output_media_id")) if value}
+
+    def _update_gateway_task_from_shot(self, shot: dict) -> None:
+        task_id = shot.get("task_id")
+        if not task_id:
+            return
+        db_path = self._gateway_db_path()
+        if not db_path or not db_path.exists():
+            return
+        with sqlite3.connect(db_path) as db:
+            db.execute(
+                """
+                UPDATE flow_tasks
+                SET status=?, video_path=?, error_code=?, error_message=?,
+                    manual_result_media_id=?, manual_result_operation_id=?, manual_result_source=?,
+                    completed_at=CASE WHEN ?='completed' THEN strftime('%Y-%m-%dT%H:%M:%SZ', 'now') ELSE completed_at END,
+                    updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                WHERE task_id=?
+                """,
+                (
+                    shot.get("status"),
+                    shot.get("video_path"),
+                    shot.get("error_code"),
+                    shot.get("error_message"),
+                    shot.get("manual_result_media_id"),
+                    shot.get("manual_result_operation_id"),
+                    shot.get("manual_result_source"),
+                    shot.get("status"),
+                    task_id,
+                ),
+            )
+            db.commit()
+
+    def _gateway_db_path(self) -> Path | None:
+        if self.last_result and self.last_result.get("run_dir"):
+            return Path(self.last_result["run_dir"]) / "gateway.db"
+        return None
+
     def selected_video_path(self) -> str | None:
         index = self._selected_shot_index()
         if index is not None:
             return self.shots[index].get("video_path")
         return None
+
+    def _selected_shot(self) -> dict | None:
+        index = self._selected_shot_index()
+        return self.shots[index] if index is not None else None
 
     def _shot_dialog(self, current: dict | None = None) -> dict | None:
         dialog = tk.Toplevel(self)
@@ -482,6 +599,20 @@ class StoryboardGui(tk.Tk):
         if button is not None:
             button.configure(state=state)
 
+    def _run_async(self, coro):
+        import asyncio
+
+        return asyncio.run(coro)
+
+    def _valid_mp4(self, path: Path) -> bool:
+        try:
+            if not path.exists() or path.stat().st_size <= 0:
+                return False
+            with path.open("rb") as fh:
+                return fh.read(8)[4:8] == b"ftyp"
+        except OSError:
+            return False
+
     def _log(self, text: str) -> None:
         self.log.configure(state="normal")
         self.log.insert("end", self._safe(text) + "\n")
@@ -496,6 +627,32 @@ class StoryboardGui(tk.Tk):
             if blocked in lowered:
                 return "[redacted]"
         return text
+
+    def _error_title(self, result: dict) -> str:
+        code = result.get("error_code")
+        stage = result.get("stage")
+        if code == "UPSTREAM_UNUSUAL_ACTIVITY":
+            return "视频自动提交未被Google接受"
+        if stage == "gateway_startup":
+            return "Gateway启动失败"
+        if stage == "project_create":
+            return "Flow Project创建失败"
+        if stage == "worker_submit":
+            return "视频提交失败"
+        if stage == "task_download":
+            return "视频下载失败"
+        return "批量制作失败"
+
+    def _manual_submit_details(self, result: dict) -> str:
+        rows = [row for row in result.get("tasks", []) if row.get("status") == "manual_submit_required"]
+        if not rows:
+            return ""
+        lines = ["", "manual_submit_required:"]
+        for row in rows:
+            lines.append(
+                f"shot_id={row.get('shot_id')} account={row.get('assigned_account_id')} project_id={row.get('project_id')}"
+            )
+        return "\n" + "\n".join(lines)
 
 
 class AccountSelectionStore:

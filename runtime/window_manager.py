@@ -30,20 +30,28 @@ class WindowManager:
         self.runtime_manager = runtime_manager or RuntimeManager(self.registry)
 
     def open_or_focus_flow(self, account_id: str) -> WindowResult:
+        return self.open_or_focus_flow_url(account_id, FLOW_URL)
+
+    def open_or_focus_flow_project(self, account_id: str, project_id: str) -> WindowResult:
+        safe_project_id = str(project_id).strip()
+        url = f"{FLOW_URL}/projects/{quote(safe_project_id, safe='')}"
+        return self.open_or_focus_flow_url(account_id, url)
+
+    def open_or_focus_flow_url(self, account_id: str, url: str) -> WindowResult:
         account = self.registry.get(account_id)
         if not account:
-            return WindowResult(account_id, "account_not_found", None, FLOW_URL, False, False)
+            return WindowResult(account_id, "account_not_found", None, url, False, False)
         runtime_started = False
         status = self.runtime_manager.status(account_id)
         if status.details.get("runtime_status") != "running":
             started = self.runtime_manager.start_one(account_id)
             runtime_started = bool(started.ok)
             if not started.ok:
-                return WindowResult(account_id, started.result, account.chrome_pid, FLOW_URL, False, runtime_started)
+                return WindowResult(account_id, started.result, account.chrome_pid, url, False, runtime_started)
             self._wait_for_runtime(account_id)
             account = self.registry.get(account_id) or account
-        opened = self._open_cdp_tab(int(account.chrome_cdp_port), FLOW_URL)
-        return WindowResult(account_id, "opened", account.chrome_pid, opened or FLOW_URL, False, runtime_started)
+        opened = self._open_cdp_tab(int(account.chrome_cdp_port), url)
+        return WindowResult(account_id, "opened", account.chrome_pid, opened or url, False, runtime_started)
 
     def _wait_for_runtime(self, account_id: str) -> None:
         deadline = time.monotonic() + 30

@@ -552,6 +552,25 @@ class GatewayScheduler:
                         remaining_credits=result.get("remaining_credits"),
                     )
                     return
+                if _requires_manual_submit(result):
+                    async with self.assignment_lock:
+                        await crud.mark_submitted(
+                            self.db,
+                            task_id,
+                            worker_job_id,
+                            remaining_credits=result.get("remaining_credits"),
+                        )
+                        self._audit("account_released", task_id=task_id, account_id=account_id, release_reason="manual_submit_required")
+                        await crud.release_task_for_manual_review(
+                            self.db,
+                            task_id,
+                            account_id,
+                            error_code="UPSTREAM_UNUSUAL_ACTIVITY",
+                            error_message="Google requires manual submission for this Flow project",
+                            remaining_credits=result.get("remaining_credits"),
+                            status="manual_submit_required",
+                        )
+                    return
                 async with self.assignment_lock:
                     await crud.mark_submitted(
                         self.db,
@@ -605,14 +624,16 @@ class GatewayScheduler:
                     return
                 if mapped == "manual_review":
                     async with self.assignment_lock:
-                        self._audit("account_released", task_id=task_id, account_id=account_id, release_reason="worker_manual_review")
+                        manual_status = "manual_submit_required" if _requires_manual_submit(result) else "manual_review"
+                        self._audit("account_released", task_id=task_id, account_id=account_id, release_reason=manual_status)
                         await crud.release_task_for_manual_review(
                             self.db,
                             task_id,
                             account_id,
-                            error_code=result.get("error_code"),
-                            error_message=result.get("error_message"),
+                            error_code="UPSTREAM_UNUSUAL_ACTIVITY" if manual_status == "manual_submit_required" else result.get("error_code"),
+                            error_message="Google requires manual submission for this Flow project" if manual_status == "manual_submit_required" else result.get("error_message"),
                             remaining_credits=result.get("remaining_credits"),
+                            status=manual_status,
                         )
                     return
                 async with self.assignment_lock:
@@ -715,3 +736,13 @@ def _map_worker_status(status):
     if status == "failed":
         return "manual_review"
     return "submitted"
+
+
+def _requires_manual_submit(result: dict) -> bool:
+    text = f"{result.get('error_code') or ''} {result.get('error_message') or ''}".lower()
+    return (
+        "403" in text
+        and "permission_denied" in text
+        and "recaptcha evaluation failed" in text
+        and "public_error_unusual_activity" in text
+    )

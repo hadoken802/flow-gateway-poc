@@ -37,6 +37,10 @@ CREATE TABLE IF NOT EXISTS flow_tasks (
     error_code TEXT,
     error_message TEXT,
     video_path TEXT,
+    manual_submit_required_at TEXT,
+    manual_result_media_id TEXT,
+    manual_result_operation_id TEXT,
+    manual_result_source TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     assigned_at TEXT,
     submitted_at TEXT,
@@ -70,6 +74,10 @@ async def _migrate(db):
         "preferred_account_id": "TEXT",
         "project_created_by_gateway": "INTEGER NOT NULL DEFAULT 0",
         "project_created_at": "TEXT",
+        "manual_submit_required_at": "TEXT",
+        "manual_result_media_id": "TEXT",
+        "manual_result_operation_id": "TEXT",
+        "manual_result_source": "TEXT",
     }
     for name, ddl in additions.items():
         if name not in columns:

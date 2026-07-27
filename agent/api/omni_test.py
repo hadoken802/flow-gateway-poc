@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 
 import aiohttp
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from agent.config import OUTPUT_DIR
@@ -116,14 +116,16 @@ async def submit_omni_video(body: OmniVideoRequest):
         user_paygate_tier="PAYGATE_TIER_NOT_PAID",
     )
     if result.get("error") or (isinstance(result.get("status"), int) and result["status"] >= 400):
-        await crud.update_omni_test_job(
+        job = await crud.update_omni_test_job(
             job_id,
             status="failed",
             error_code=str(result.get("status") or "submit_error"),
             error_message=str(result.get("error") or result.get("data") or "Submit failed"),
             raw_response_shape=json.dumps(response_shape(unwrap_response(result))),
         )
-        raise HTTPException(result.get("status", 502), result.get("error", result.get("data")))
+        response = _public_job(job)
+        response["reused"] = False
+        return response
 
     data = unwrap_response(result)
     fields = extract_submit_fields(data)
@@ -177,6 +179,61 @@ async def retry_omni_video_download(job_id: str):
         response = _public_job(updated)
         response["reused"] = False
         return response
+
+
+@router.get("/manual-flow-results/{project_id}")
+async def list_manual_flow_results(
+    project_id: str,
+    after: str | None = None,
+    exclude_media_ids: str = Query(default=""),
+):
+    excluded = {item.strip() for item in exclude_media_ids.split(",") if item.strip()}
+    requests = await crud.list_requests(project_id=project_id, status="COMPLETED")
+    candidates = []
+    for item in requests:
+        media_id = item.get("media_id")
+        if not media_id or media_id in excluded:
+            continue
+        if item.get("type") not in {"GENERATE_VIDEO", "REGENERATE_VIDEO", "GENERATE_VIDEO_REFS"}:
+            continue
+        timestamp = item.get("updated_at") or item.get("created_at")
+        if after and timestamp and timestamp <= after:
+            continue
+        candidates.append({
+            "media_id": media_id,
+            "operation_id": item.get("request_id"),
+            "project_id": item.get("project_id"),
+            "request_id": item.get("id"),
+            "type": item.get("type"),
+            "created_at": item.get("created_at"),
+            "updated_at": item.get("updated_at"),
+        })
+    return {"project_id": project_id, "candidate_count": len(candidates), "candidates": candidates}
+
+
+@router.get("/manual-flow-results/media/{media_id}/download")
+async def download_manual_flow_result(media_id: str):
+    client = get_flow_client()
+    if not client.connected:
+        raise HTTPException(503, "Extension not connected")
+    if client._flow_key is None:
+        raise HTTPException(503, "Flow key not present")
+    result = await client.get_media(media_id)
+    if result.get("error"):
+        raise HTTPException(502, result["error"])
+    data = unwrap_response(result)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    dest = OUTPUT_DIR / f"manual-{media_id}.mp4"
+    encoded = resolve_encoded_video(data)
+    if encoded:
+        video_bytes = _decode_encoded_video_candidate(encoded, media_id)
+        _write_valid_mp4_bytes_atomic(video_bytes, dest)
+        return {"status": "completed", "media_id": media_id, "video_path": str(dest), "source": "manual_project_media"}
+    url = extract_video_url(data)
+    if not url:
+        return {"status": "waiting_download", "media_id": media_id, "error_code": "missing_video_url", "error_message": "Manual media did not include downloadable video"}
+    await _download_mp4(url, dest)
+    return {"status": "completed", "media_id": media_id, "video_path": str(dest), "source": "manual_project_media"}
 
 
 async def recover_omni_jobs() -> None:

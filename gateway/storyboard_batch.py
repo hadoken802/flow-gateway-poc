@@ -33,7 +33,7 @@ class StoryboardShot:
     prompt: str
     duration: int
     aspect_ratio: str
-    idempotency_key: str
+    idempotency_key: str | None = None
 
 
 def run_storyboard_batch(args: argparse.Namespace) -> dict[str, Any]:
@@ -137,7 +137,7 @@ def load_manifest(path: Path) -> list[StoryboardShot]:
         aspect_ratio = str(item.get("aspect_ratio") or "")
         if aspect_ratio not in SUPPORTED_ASPECT_RATIOS:
             raise StoryboardBatchError("input_validation_failed", "aspect_ratio must be 9:16 or 16:9")
-        shots.append(StoryboardShot(shot_id, str(image), prompt, duration, aspect_ratio, item.get("idempotency_key") or f"storyboard-{shot_id}-{index}"))
+        shots.append(StoryboardShot(shot_id, str(image), prompt, duration, aspect_ratio))
     return shots
 
 
@@ -354,7 +354,6 @@ def _cleanup_lock(db_path: Path) -> None:
 
 def _post_tasks(port: int, shots: list[StoryboardShot]) -> list[dict[str, Any]]:
     payloads = [{
-        "idempotency_key": shot.idempotency_key,
         "image_path": shot.image,
         "prompt": shot.prompt,
         "duration": shot.duration,
@@ -372,7 +371,7 @@ def _wait_for_tasks(port: int, tasks: list[dict[str, Any]], timeout_seconds: int
             task_id = task["task_id"]
             if task_id in final:
                 continue
-            if task["status"] in {"completed", "manual_review", "failed"}:
+            if task["status"] in {"completed", "manual_review", "manual_submit_required", "failed"}:
                 final[task_id] = task
             elif time.monotonic() > deadlines.get(task_id, 0):
                 final[task_id] = {**task, "status": "manual_review", "error_code": "task_timeout", "error_message": "Task timeout"}
@@ -400,9 +399,16 @@ def _result(run_dir: Path, port: int, pid: int | None, shots: list[StoryboardSho
             "video_path": str(video_path) if video_path else None,
             "video_size_bytes": video_path.stat().st_size if video_path and video_path.exists() else 0,
             "mp4_ftyp_valid": _mp4_ftyp_valid(video_path) if video_path else False,
+            "manual_submit_required_at": task.get("manual_submit_required_at"),
+            "manual_result_media_id": task.get("manual_result_media_id"),
+            "manual_result_operation_id": task.get("manual_result_operation_id"),
+            "manual_result_source": task.get("manual_result_source"),
         })
+    ok = all(row["status"] == "completed" and row["mp4_ftyp_valid"] for row in rows)
+    summary = _failure_summary(rows)
     return {
-        "ok": all(row["status"] == "completed" and row["mp4_ftyp_valid"] for row in rows),
+        "ok": ok,
+        **({} if ok else summary),
         "run_dir": str(run_dir),
         "gateway_port": port,
         "gateway_pid": pid,
@@ -411,6 +417,33 @@ def _result(run_dir: Path, port: int, pid: int | None, shots: list[StoryboardSho
         "tasks": rows,
         "flow_runtime_kept_running": True,
     }
+
+
+def _failure_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    failed = [row for row in rows if row.get("status") != "completed" or not row.get("mp4_ftyp_valid")]
+    if any(row.get("status") == "manual_submit_required" for row in failed):
+        return {
+            "stage": "worker_submit",
+            "error_code": "UPSTREAM_UNUSUAL_ACTIVITY",
+            "error_message": "One or more tasks require manual submission",
+        }
+    first = failed[0] if failed else {}
+    return {
+        "stage": _stage_for_error(first),
+        "error_code": first.get("error_code") or "task_failed",
+        "error_message": first.get("error_message") or "One or more tasks failed",
+    }
+
+
+def _stage_for_error(row: dict[str, Any]) -> str:
+    code = str(row.get("error_code") or "")
+    if "project" in code:
+        return "project_create"
+    if "download" in code or "video" in code:
+        return "task_download"
+    if code:
+        return "worker_submit"
+    return "task"
 
 
 def _mp4_ftyp_valid(path: Path) -> bool:

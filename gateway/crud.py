@@ -33,23 +33,24 @@ async def get_account(db, account_id):
 
 
 async def create_task(db, payload):
+    task_id = str(uuid.uuid4())
+    idempotency_key = payload.get("idempotency_key") or f"storyboard:{task_id}:attempt:1"
     cursor = await db.execute(
         "SELECT * FROM flow_tasks WHERE idempotency_key=?",
-        (payload["idempotency_key"],),
+        (idempotency_key,),
     )
     existing = await cursor.fetchone()
     if existing:
         item = dict(existing)
         item["reused"] = True
         return item
-    task_id = str(uuid.uuid4())
     await db.execute(
         """
         INSERT INTO flow_tasks(task_id, idempotency_key, project_id, image_path, prompt, duration, aspect_ratio, preferred_account_id)
         VALUES(?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            task_id, payload["idempotency_key"], payload.get("project_id"), payload["image_path"],
+            task_id, idempotency_key, payload.get("project_id"), payload["image_path"],
             payload["prompt"], payload["duration"], payload["aspect_ratio"], payload.get("preferred_account_id"),
         ),
     )
@@ -260,18 +261,52 @@ async def complete_real_task(db, task_id, account_id, video_path, remaining_cred
         raise
 
 
-async def release_task_for_manual_review(db, task_id, account_id, error_code=None, error_message=None, remaining_credits=None):
+async def complete_manual_result_task(db, task_id, account_id, video_path, media_id=None, operation_id=None, source=None):
     await db.commit()
     await db.execute("BEGIN IMMEDIATE")
     try:
         await db.execute(
             """
             UPDATE flow_tasks
-            SET status='manual_review', error_code=?, error_message=?, remaining_credits=?,
+            SET status='completed', video_path=?, manual_result_media_id=?,
+                manual_result_operation_id=?, manual_result_source=?,
+                error_code=NULL, error_message=NULL,
+                completed_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
                 updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
             WHERE task_id=?
             """,
-            (error_code, error_message, remaining_credits, task_id),
+            (video_path, media_id, operation_id, source, task_id),
+        )
+        await db.execute(
+            """
+            UPDATE flow_accounts
+            SET current_task_id=NULL,
+                status=CASE WHEN COALESCE(credits, 0) >= 15 THEN 'ready' ELSE 'low_credits' END,
+                updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+            WHERE account_id=? AND (current_task_id=? OR current_task_id IS NULL)
+            """,
+            (account_id, task_id),
+        )
+        await db.commit()
+    except Exception:
+        await db.execute("ROLLBACK")
+        raise
+
+
+async def release_task_for_manual_review(db, task_id, account_id, error_code=None, error_message=None, remaining_credits=None, status="manual_review"):
+    await db.commit()
+    await db.execute("BEGIN IMMEDIATE")
+    try:
+        manual_submit_required_at = "strftime('%Y-%m-%dT%H:%M:%SZ', 'now')" if status == "manual_submit_required" else "manual_submit_required_at"
+        await db.execute(
+            """
+            UPDATE flow_tasks
+            SET status=?, error_code=?, error_message=?, remaining_credits=?,
+                manual_submit_required_at={manual_submit_required_at},
+                updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+            WHERE task_id=?
+            """.format(manual_submit_required_at=manual_submit_required_at),
+            (status, error_code, error_message, remaining_credits, task_id),
         )
         await db.execute(
             """

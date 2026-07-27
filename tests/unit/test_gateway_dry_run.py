@@ -328,6 +328,28 @@ async def test_duplicate_idempotency_key_reuses_original_task():
 
 
 @pytest.mark.asyncio
+async def test_missing_idempotency_key_uses_gateway_task_id_and_avoids_old_storyboard_key():
+    from gateway.config import GatewaySettings
+
+    settings = GatewaySettings(db_path=local_db("task_id_idempotency"), dry_run=True)
+    scheduler = make_scheduler(settings, FakeWorkerClient({
+        "FLOW-001": {"credits": 5},
+        "FLOW-002": {"credits": 50},
+        "FLOW-003": {"credits": 50},
+    }))
+    await scheduler.start()
+    first = await scheduler.create_task({"image_path": "D:/a.png", "prompt": "one", "duration": 10, "aspect_ratio": "9:16"})
+    second = await scheduler.create_task({"image_path": "D:/a.png", "prompt": "one", "duration": 10, "aspect_ratio": "9:16"})
+
+    assert first["task_id"] != second["task_id"]
+    assert first["idempotency_key"] == f"storyboard:{first['task_id']}:attempt:1"
+    assert second["idempotency_key"] == f"storyboard:{second['task_id']}:attempt:1"
+    assert first["idempotency_key"] != "storyboard-003-2"
+    assert second["idempotency_key"] != "storyboard-003-2"
+    await scheduler.stop()
+
+
+@pytest.mark.asyncio
 async def test_restart_recovers_queued_and_active_tasks():
     from gateway.config import GatewaySettings
 
@@ -629,6 +651,43 @@ async def test_real_mode_missing_worker_job_id_releases_account_for_manual_revie
     assert task["attempt_count"] == 1
     assert task["worker_job_id"] is None
     accounts = {a["account_id"]: a for a in await scheduler.list_accounts()}
+    assert accounts["FLOW-002"]["current_task_id"] is None
+    await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_real_mode_upstream_403_saves_worker_job_and_requires_manual_submit():
+    from gateway.config import GatewaySettings
+
+    class Upstream403Client(FakeRealWorkerClient):
+        async def submit_omni_video(self, worker, payload):
+            self.submits.append((worker.account_id, dict(payload)))
+            return {
+                "job_id": "job-upstream-403",
+                "status": "failed",
+                "error_code": "403",
+                "error_message": "{'error': {'code': 403, 'message': 'reCAPTCHA evaluation failed', 'status': 'PERMISSION_DENIED', 'details': [{'reason': 'PUBLIC_ERROR_UNUSUAL_ACTIVITY'}]}}",
+                "remaining_credits": self.states[worker.account_id]["credits"],
+            }
+
+    states = {"FLOW-001": {"credits": 5}, "FLOW-002": {"credits": 50}, "FLOW-003": {"credits": 50}}
+    client = Upstream403Client(states)
+    settings = GatewaySettings(db_path=local_db("upstream_403_manual"), dry_run=False)
+    scheduler = make_scheduler(settings, client)
+    await scheduler.start()
+    await scheduler.create_task({"idempotency_key": "manual-submit-403", "project_id": "project-a", "image_path": "D:/img.png", "prompt": "p", "duration": 10, "aspect_ratio": "9:16", "preferred_account_id": "FLOW-002"})
+    for _ in range(100):
+        task = (await scheduler.list_tasks())[0]
+        if task["status"] == "manual_submit_required":
+            break
+        await asyncio.sleep(0.02)
+    task = (await scheduler.list_tasks())[0]
+    accounts = {a["account_id"]: a for a in await scheduler.list_accounts()}
+
+    assert len(client.submits) == 1
+    assert task["status"] == "manual_submit_required"
+    assert task["worker_job_id"] == "job-upstream-403"
+    assert task["error_code"] == "UPSTREAM_UNUSUAL_ACTIVITY"
     assert accounts["FLOW-002"]["current_task_id"] is None
     await scheduler.stop()
 

@@ -326,6 +326,72 @@ def test_storyboard_batch_without_allowlist_keeps_existing_path_compatible(tmp_p
     assert calls["account_ids"] == []
 
 
+def test_storyboard_batch_omits_manifest_idempotency_key_so_gateway_uses_task_id(tmp_path, monkeypatch):
+    from gateway import storyboard_batch
+
+    image = png(tmp_path / "a.png")
+    path = manifest(tmp_path, [
+        {"shot_id": "003", "image": str(image.resolve()), "prompt": "p", "duration": 10, "aspect_ratio": "9:16"},
+    ])
+    shots = storyboard_batch.load_manifest(path.resolve())
+    payloads = {}
+
+    def post_json(port, route, body, timeout=30):
+        payloads["body"] = body
+        return {"tasks": [{"task_id": "task-new"}]}
+
+    monkeypatch.setattr(storyboard_batch.cli, "_post_json", post_json)
+
+    tasks = storyboard_batch._post_tasks(9999, shots)
+
+    assert tasks == [{"task_id": "task-new"}]
+    assert "idempotency_key" not in payloads["body"]["tasks"][0]
+
+
+def test_storyboard_batch_ignores_explicit_manifest_idempotency_key_to_avoid_cross_batch_reuse(tmp_path, monkeypatch):
+    from gateway import storyboard_batch
+
+    image = png(tmp_path / "a.png")
+    path = manifest(tmp_path, [
+        {"shot_id": "003", "image": str(image.resolve()), "prompt": "p", "duration": 10, "aspect_ratio": "9:16", "idempotency_key": "custom-key"},
+    ])
+    shots = storyboard_batch.load_manifest(path.resolve())
+    payloads = {}
+
+    def post_json(port, route, body, timeout=30):
+        payloads["body"] = body
+        return {"tasks": [{"task_id": "task-new"}]}
+
+    monkeypatch.setattr(storyboard_batch.cli, "_post_json", post_json)
+
+    storyboard_batch._post_tasks(9999, shots)
+
+    assert "idempotency_key" not in payloads["body"]["tasks"][0]
+
+
+def test_storyboard_result_summarizes_manual_submit_required(tmp_path):
+    from gateway import storyboard_batch
+
+    shot = storyboard_batch.StoryboardShot("003", "D:/img.png", "p", 10, "9:16")
+    result = storyboard_batch._result(tmp_path, 9999, 123, [shot], [{
+        "task_id": "task-1",
+        "project_id": "project-1",
+        "assigned_account_id": "FLOW-027",
+        "assigned_runtime_instance_id": "runtime-27",
+        "worker_job_id": "job-1",
+        "attempt_count": 1,
+        "status": "manual_submit_required",
+        "error_code": "UPSTREAM_UNUSUAL_ACTIVITY",
+        "error_message": "Google requires manual submission for this Flow project",
+        "video_path": None,
+    }])
+
+    assert result["ok"] is False
+    assert result["stage"] == "worker_submit"
+    assert result["error_code"] == "UPSTREAM_UNUSUAL_ACTIVITY"
+    assert result["error_message"] == "One or more tasks require manual submission"
+
+
 def test_storyboard_gui_import_does_not_start_mainloop():
     import gateway.storyboard_gui as gui
 
@@ -586,6 +652,157 @@ def test_storyboard_gui_loads_batch_result_without_submit(tmp_path):
     assert calls == []
     assert gui.shots[0]["video_path"] == str(video)
     assert gui.shots[0]["assigned_account_id"] == "FLOW-025"
+
+
+def test_storyboard_gui_manual_submit_error_title_and_details(tmp_path, monkeypatch):
+    from gateway.storyboard_gui import StoryboardGui
+
+    messages = []
+    gui = make_gui_shell(tmp_path)
+    monkeypatch.setattr("gateway.storyboard_gui.messagebox.showerror", lambda title, body: messages.append((title, body)))
+
+    StoryboardGui._batch_done(gui, {
+        "ok": False,
+        "stage": "worker_submit",
+        "error_code": "UPSTREAM_UNUSUAL_ACTIVITY",
+        "error_message": "One or more tasks require manual submission",
+        "run_dir": str(tmp_path),
+        "tasks": [{
+            "shot_id": "003",
+            "status": "manual_submit_required",
+            "assigned_account_id": "FLOW-027",
+            "project_id": "project-27",
+        }],
+    })
+
+    assert messages
+    assert messages[0][0] == "视频自动提交未被Google接受"
+    assert "Gateway启动失败" not in messages[0][0]
+    assert "FLOW-027" in messages[0][1]
+    assert "project-27" in messages[0][1]
+
+
+def test_storyboard_gui_open_flow_project_uses_existing_project_only(tmp_path):
+    from gateway.storyboard_gui import StoryboardGui
+
+    calls = []
+    gui = make_gui_shell(tmp_path)
+    gui.shots = [{"shot_id": "003", "assigned_account_id": "FLOW-027", "project_id": "project-27"}]
+    gui.shot_tree = FakeTree(("0",))
+    gui._threaded = lambda name, func: calls.append((name, func))
+
+    StoryboardGui.open_selected_flow_project(gui)
+
+    assert calls[0][0] == "open_flow_project"
+
+
+def test_storyboard_gui_manual_result_check_does_not_post_and_keeps_not_completed(tmp_path, monkeypatch):
+    from gateway.storyboard_gui import StoryboardGui
+
+    calls = []
+
+    class Client:
+        async def get_omni_video(self, worker, worker_job_id):
+            calls.append(("get", worker.api_url, worker_job_id))
+            return {"status": "failed", "error_code": "403", "input_media_id": "old-input"}
+
+        async def list_manual_flow_results(self, worker, project_id, after=None, exclude_media_ids=None):
+            calls.append(("list", worker.api_url, project_id, after, sorted(exclude_media_ids)))
+            return {"candidates": []}
+
+    gui = make_gui_shell(tmp_path)
+    gui.account_rows = {"FLOW-027": {"worker_api_endpoint": "http://worker-27"}}
+    shot = {"shot_id": "003", "assigned_account_id": "FLOW-027", "project_id": "project-27", "worker_job_id": "job-27", "status": "manual_submit_required", "manual_submit_required_at": "2026-07-27T08:00:00Z"}
+    monkeypatch.setattr("gateway.storyboard_gui.WorkerClient", lambda: Client())
+
+    result = StoryboardGui._check_manual_result_for_shot(gui, shot)
+
+    assert calls == [
+        ("get", "http://worker-27", "job-27"),
+        ("list", "http://worker-27", "project-27", "2026-07-27T08:00:00Z", ["old-input"]),
+    ]
+    assert result["result"] == "not_completed"
+    assert shot["status"] == "manual_submit_required"
+
+
+def test_storyboard_gui_manual_result_check_finds_project_video_when_old_job_failed(tmp_path, monkeypatch):
+    from gateway.storyboard_gui import StoryboardGui
+
+    video = tmp_path / "manual.mp4"
+    video.write_bytes(b"\x00\x00\x00\x18ftypmp42")
+
+    class Client:
+        async def get_omni_video(self, worker, worker_job_id):
+            return {"status": "failed", "error_code": "403", "output_media_id": None}
+
+        async def list_manual_flow_results(self, worker, project_id, after=None, exclude_media_ids=None):
+            return {"candidates": [{"media_id": "manual-media-1", "operation_id": "operation-1"}]}
+
+        async def download_manual_flow_result(self, worker, media_id):
+            return {"status": "completed", "media_id": media_id, "video_path": str(video), "source": "manual_project_media"}
+
+    gui = make_gui_shell(tmp_path)
+    gui.account_rows = {"FLOW-027": {"worker_api_endpoint": "http://worker-27"}}
+    shot = {"shot_id": "003", "assigned_account_id": "FLOW-027", "project_id": "project-27", "worker_job_id": "job-27", "status": "manual_submit_required"}
+    monkeypatch.setattr("gateway.storyboard_gui.WorkerClient", lambda: Client())
+
+    result = StoryboardGui._check_manual_result_for_shot(gui, shot)
+
+    assert result["result"] == "completed"
+    assert shot["status"] == "completed"
+    assert shot["video_path"] == str(video)
+    assert shot["worker_job_id"] == "job-27"
+    assert shot["manual_result_media_id"] == "manual-media-1"
+    assert shot["manual_result_operation_id"] == "operation-1"
+
+
+def test_storyboard_gui_manual_result_check_multiple_candidates_are_ambiguous(tmp_path, monkeypatch):
+    from gateway.storyboard_gui import StoryboardGui
+
+    class Client:
+        async def get_omni_video(self, worker, worker_job_id):
+            return {"status": "failed"}
+
+        async def list_manual_flow_results(self, worker, project_id, after=None, exclude_media_ids=None):
+            return {"candidates": [{"media_id": "media-1"}, {"media_id": "media-2"}]}
+
+    gui = make_gui_shell(tmp_path)
+    gui.account_rows = {"FLOW-027": {"worker_api_endpoint": "http://worker-27"}}
+    shot = {"shot_id": "003", "assigned_account_id": "FLOW-027", "project_id": "project-27", "worker_job_id": "job-27", "status": "manual_submit_required"}
+    monkeypatch.setattr("gateway.storyboard_gui.WorkerClient", lambda: Client())
+
+    result = StoryboardGui._check_manual_result_for_shot(gui, shot)
+
+    assert result["result"] == "manual_result_ambiguous"
+    assert shot["status"] == "manual_result_ambiguous"
+    assert shot["error_code"] == "manual_result_ambiguous"
+
+
+def test_storyboard_gui_manual_result_check_rejects_invalid_mp4(tmp_path, monkeypatch):
+    from gateway.storyboard_gui import StoryboardGui
+
+    video = tmp_path / "bad.mp4"
+    video.write_bytes(b"not an mp4")
+
+    class Client:
+        async def get_omni_video(self, worker, worker_job_id):
+            return {"status": "failed"}
+
+        async def list_manual_flow_results(self, worker, project_id, after=None, exclude_media_ids=None):
+            return {"candidates": [{"media_id": "manual-media-1"}]}
+
+        async def download_manual_flow_result(self, worker, media_id):
+            return {"status": "completed", "media_id": media_id, "video_path": str(video)}
+
+    gui = make_gui_shell(tmp_path)
+    gui.account_rows = {"FLOW-027": {"worker_api_endpoint": "http://worker-27"}}
+    shot = {"shot_id": "003", "assigned_account_id": "FLOW-027", "project_id": "project-27", "worker_job_id": "job-27", "status": "manual_submit_required"}
+    monkeypatch.setattr("gateway.storyboard_gui.WorkerClient", lambda: Client())
+
+    result = StoryboardGui._check_manual_result_for_shot(gui, shot)
+
+    assert result["result"] == "not_completed"
+    assert shot["status"] == "manual_submit_required"
 
 
 def test_storyboard_gui_selected_video_path_from_loaded_result(tmp_path):
