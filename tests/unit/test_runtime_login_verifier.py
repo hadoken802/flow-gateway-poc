@@ -167,6 +167,37 @@ def test_flow_accessible_without_redirect_returns_true(tmp_path):
     assert cdp.opened == []
 
 
+def test_localized_flow_urls_are_recognized(tmp_path):
+    urls = [
+        "https://labs.google/fx/tools/flow",
+        "https://labs.google/fx/tools/flow/",
+        "https://labs.google/fx/tools/flow?foo=bar#section",
+        "https://labs.google/fx/zh/tools/flow",
+        "https://labs.google/fx/en/tools/flow",
+        "https://labs.google/fx/zh-CN/tools/flow",
+        "https://labs.google/fx/ja/tools/flow",
+        "https://labs.google/fx/fr/tools/flow",
+        "https://labs.google/fx/fr/tools/flow/?foo=bar#section",
+    ]
+    verifier, _, _ = make_verifier(tmp_path, {"account_id": "FLOW-005", "extension_connected": True}, [])
+
+    assert all(verifier._is_flow_target({"url": url}) for url in urls)
+
+
+def test_non_flow_urls_are_not_recognized(tmp_path):
+    urls = [
+        "https://accounts.google.com/",
+        "https://labs.google/",
+        "https://labs.google/fx/zh/tools/image-fx",
+        "https://labs.google/fx/zh/tools/flowing-text",
+        "https://labs.google/fx/tools/image-fx?next=/flow",
+        "https://example.com/fx/zh/tools/flow",
+    ]
+    verifier, _, _ = make_verifier(tmp_path, {"account_id": "FLOW-005", "extension_connected": True}, [])
+
+    assert not any(verifier._is_flow_target({"url": url}) for url in urls)
+
+
 def test_logged_in_flow_page_with_stale_accounts_target_returns_true(tmp_path):
     targets = [
         {"id": "login-1", "type": "page", "url": "https://accounts.google.com/signin/v2/identifier?token=SECRET", "title": "Sign in"},

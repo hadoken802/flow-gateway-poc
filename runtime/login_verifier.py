@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+import re
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -21,6 +22,7 @@ LOGIN_TEXT_MARKERS = (
     "use another account",
     "session expired",
 )
+FLOW_PATH_RE = re.compile(r"^/fx(?:/[a-z]{2,3}(?:-[A-Za-z]{2})?)?/tools/flow/?$")
 
 
 @dataclass
@@ -110,9 +112,11 @@ class CdpReadOnlyClient:
   const inputs = Array.from(document.querySelectorAll("input"))
     .map((el) => `${el.type || ""}:${el.name || ""}:${el.getAttribute("aria-label") || ""}`.toLowerCase());
   const flowApp = bodyText.includes("new project")
-    || controls.some((value) => value.includes("new project"))
+    || bodyText.includes("新建项目")
+    || controls.some((value) => value.includes("new project") || value.includes("新建项目"))
     || !!document.querySelector("[aria-label*='Google Account'],[aria-label*='Google account'],a[href*='myaccount.google.com']");
-  const accountUi = !!document.querySelector("[aria-label*='Google Account'],[aria-label*='Google account'],a[href*='myaccount.google.com'],img[alt*='profile' i]");
+  const accountUi = bodyText.includes("pro")
+    || !!document.querySelector("[aria-label*='Google Account'],[aria-label*='Google account'],a[href*='myaccount.google.com'],img[alt*='profile' i]");
   const loginForm = bodyText.includes("choose an account")
     || bodyText.includes("sign in with google")
     || inputs.some((value) => /email|identifier|password|passwd/.test(value));
@@ -293,7 +297,11 @@ class LoginVerifier:
 
     def _is_flow_target(self, target: dict) -> bool:
         parsed = urlparse(str(target.get("url") or ""))
-        return parsed.scheme == "https" and parsed.netloc.lower() == "labs.google" and parsed.path.startswith("/fx/tools/flow")
+        return (
+            parsed.scheme == "https"
+            and parsed.netloc.lower() == "labs.google"
+            and bool(FLOW_PATH_RE.match(parsed.path))
+        )
 
     def _is_login_target(self, target: dict) -> bool:
         url = str(target.get("url") or "")
