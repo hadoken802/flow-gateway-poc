@@ -20,7 +20,7 @@ from .storyboard_batch import run_storyboard_batch
 from .worker_client import WorkerClient
 
 
-DEFAULT_ACCOUNT_IDS = {"FLOW-025", "FLOW-026", "FLOW-027"}
+DEFAULT_ACCOUNT_IDS = {"FLOW-001", "FLOW-002", "FLOW-003"}
 REQUIRED_CREDITS = 15
 SELECTION_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "storyboard_gui_selection.db"
 

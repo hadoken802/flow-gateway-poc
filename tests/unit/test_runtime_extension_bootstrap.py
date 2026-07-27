@@ -1485,9 +1485,10 @@ def test_regular_chrome_command_loads_flowkit_extension_deterministically(tmp_pa
     command = manager.chrome_command(account)
 
     assert command.count("--disable-skia-graphite") == 1
+    assert command.count("--disable-gpu") == 1
+    assert command.count("--no-sandbox") == 1
     assert len([part for part in command if str(part).startswith("--load-extension=")]) == 1
     assert len([part for part in command if str(part).startswith("--disable-extensions-except=")]) == 1
-    assert "--disable-gpu" not in command
 
 
 def test_bootstrap_chrome_command_loads_extension_and_starts_about_blank(tmp_path):
@@ -1498,6 +1499,8 @@ def test_bootstrap_chrome_command_loads_extension_and_starts_about_blank(tmp_pat
     command = bootstrapper.bootstrap_chrome_command(account, f"chrome-extension://{EXPECTED_FLOWKIT_EXTENSION_ID}/options.html?bootstrap=1&nonce=SECRET")
 
     assert command.count("--disable-skia-graphite") == 1
+    assert command.count("--disable-gpu") == 1
+    assert command.count("--no-sandbox") == 1
     assert len([part for part in command if str(part).startswith("--load-extension=")]) == 1
     assert len([part for part in command if str(part).startswith("--disable-extensions-except=")]) == 1
     assert Path([part for part in command if str(part).startswith("--load-extension=")][0].split("=", 1)[1]).is_absolute()
@@ -1572,7 +1575,7 @@ def test_bootstrap_chrome_command_forces_disable_skia_graphite_once_and_removes_
     assert "--enable-skia-graphite" not in command
     assert "--enable-skia-graphite=true" not in command
     assert "--no-sandbox" in command
-    assert "--disable-gpu" not in command
+    assert "--disable-gpu" in command
     assert "--use-angle" not in command
     assert "--use-gl" not in command
     assert "--skia-graphite-dawn-backend" not in command
@@ -1781,13 +1784,13 @@ def test_bootstrap_retries_once_for_gpu_chrome_exit_before_cdp_ready(tmp_path):
     assert result.result == "extension_bootstrapped"
     assert runtime.worker_only_started == ["FLOW-006"]
     assert len(runtime.launched) == 2
-    forbidden_gpu_args = {"--disable-gpu", "--use-angle", "--use-gl", "--skia-graphite-dawn-backend"}
+    forbidden_gpu_args = {"--use-angle", "--use-gl", "--skia-graphite-dawn-backend"}
     assert runtime.launched[0][1].count("--disable-skia-graphite") == 1
     assert runtime.launched[1][1].count("--disable-skia-graphite") == 1
+    assert runtime.launched[0][1].count("--disable-gpu") == 1
+    assert runtime.launched[1][1].count("--disable-gpu") == 1
     assert not any(arg in runtime.launched[0][1] for arg in forbidden_gpu_args)
     assert not any(arg in runtime.launched[1][1] for arg in forbidden_gpu_args)
-    assert "--disable-gpu" not in runtime.launched[0][1]
-    assert "--disable-gpu" not in runtime.launched[1][1]
     assert runtime.launched[0][1][-1] == "about:blank"
     assert runtime.launched[1][1][-1] == "about:blank"
     assert len(bootstrapper.cdp.opened_urls) == 1

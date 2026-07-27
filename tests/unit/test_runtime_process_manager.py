@@ -546,6 +546,8 @@ def test_open_login_uses_registered_profile_cdp_and_extension_flags(tmp_path, mo
     assert f"--user-data-dir={Path(account.profile_path)}" in command
     assert "--remote-debugging-port=9300" in command
     assert "--disable-skia-graphite" in command
+    assert "--disable-gpu" in command
+    assert "--no-sandbox" in command
     assert len([part for part in command if str(part).startswith("--load-extension=")]) == 1
     assert len([part for part in command if str(part).startswith("--disable-extensions-except=")]) == 1
     assert registry.get("FLOW-005").chrome_pid == manager.launched[0].pid

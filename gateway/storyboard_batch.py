@@ -226,14 +226,15 @@ def run_preflight(shots: list[StoryboardShot], account_ids: list[str], run_dir: 
             "eligible_for_batch": eligible_for_batch,
             "exclusion_reasons": deduped,
         })
-    if requested and "FLOW-024" in candidates and "FLOW-024" not in requested:
-        excluded["FLOW-024"] = ["excluded_by_allowlist"]
-        accounts.append({
-            "account_id": "FLOW-024",
-            "excluded_by_allowlist": True,
-            "eligible_for_batch": False,
-            "exclusion_reasons": ["excluded_by_allowlist"],
-        })
+    if requested:
+        for account_id in sorted(set(candidates) - set(requested)):
+            excluded[account_id] = ["excluded_by_allowlist"]
+            accounts.append({
+                "account_id": account_id,
+                "excluded_by_allowlist": True,
+                "eligible_for_batch": False,
+                "exclusion_reasons": ["excluded_by_allowlist"],
+            })
     ok = not missing and (not requested or set(eligible) == set(requested))
     result = {
         "ok": ok,

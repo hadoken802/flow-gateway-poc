@@ -547,7 +547,7 @@ def test_storyboard_gui_account_selection_persists_across_refresh_and_restart(tm
 
     class Projection:
         def candidates(self):
-            return [Candidate(account_id) for account_id in ["FLOW-024", "FLOW-025", "FLOW-026", "FLOW-027"]]
+            return [Candidate(account_id) for account_id in ["FLOW-001", "FLOW-002", "FLOW-003", "FLOW-004"]]
 
     monkeypatch.setattr("gateway.storyboard_gui.GatewayProjection", Projection)
     store_path = tmp_path / "selection.db"
@@ -557,34 +557,34 @@ def test_storyboard_gui_account_selection_persists_across_refresh_and_restart(tm
     gui.selection_store = AccountSelectionStore(store_path)
     gui._log = logs.append
     StoryboardGui.refresh_accounts(gui)
-    assert "FLOW-024" not in gui.selected_account_ids
-    assert "FLOW-025" in gui.selected_account_ids
+    assert "FLOW-004" not in gui.selected_account_ids
+    assert "FLOW-001" in gui.selected_account_ids
 
-    gui.account_tree = FakeTree(("FLOW-024",))
+    gui.account_tree = FakeTree(("FLOW-004",))
     StoryboardGui.toggle_selected_account(gui)
-    gui.account_tree = FakeTree(("FLOW-025",))
+    gui.account_tree = FakeTree(("FLOW-001",))
     StoryboardGui.toggle_selected_account(gui)
 
-    assert gui.selection_store.get("FLOW-024") is True
-    assert gui.selection_store.get("FLOW-025") is False
-    assert "account selection saved account_id=FLOW-024 selected_for_batch=True" in logs
-    assert "account selection saved account_id=FLOW-025 selected_for_batch=False" in logs
+    assert gui.selection_store.get("FLOW-004") is True
+    assert gui.selection_store.get("FLOW-001") is False
+    assert "account selection saved account_id=FLOW-004 selected_for_batch=True" in logs
+    assert "account selection saved account_id=FLOW-001 selected_for_batch=False" in logs
 
     StoryboardGui.refresh_accounts(gui)
-    assert "FLOW-024" in gui.selected_account_ids
-    assert "FLOW-025" not in gui.selected_account_ids
+    assert "FLOW-004" in gui.selected_account_ids
+    assert "FLOW-001" not in gui.selected_account_ids
 
     restarted = make_gui_shell(tmp_path)
     restarted.selection_store = AccountSelectionStore(store_path)
     StoryboardGui.refresh_accounts(restarted)
-    assert "FLOW-024" in restarted.selected_account_ids
-    assert "FLOW-025" not in restarted.selected_account_ids
-    assert StoryboardGui.get_batch_account_ids(restarted) == ["FLOW-024", "FLOW-026", "FLOW-027"]
+    assert "FLOW-004" in restarted.selected_account_ids
+    assert "FLOW-001" not in restarted.selected_account_ids
+    assert StoryboardGui.get_batch_account_ids(restarted) == ["FLOW-002", "FLOW-003", "FLOW-004"]
 
     image = png(tmp_path / "a.png")
     restarted.shots = [{"shot_id": "001", "image": str(image), "prompt": "p", "duration": 10, "aspect_ratio": "9:16"}]
     args = StoryboardGui._build_batch_args(restarted, preflight_only=True)
-    assert args.account_ids == "FLOW-024,FLOW-026,FLOW-027"
+    assert args.account_ids == "FLOW-002,FLOW-003,FLOW-004"
 
 
 def test_storyboard_gui_account_selection_save_failure_rolls_back(tmp_path, monkeypatch):

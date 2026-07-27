@@ -81,6 +81,8 @@ GPU_RETRY_FAILURE_CLASSES = {
 }
 VOLATILE_BOOTSTRAP_CACHE_DIR = Path("GPUPersistentCache")
 DISABLE_SKIA_GRAPHITE_ARG = "--disable-skia-graphite"
+DISABLE_GPU_ARG = "--disable-gpu"
+NO_SANDBOX_ARG = "--no-sandbox"
 ENABLE_SKIA_GRAPHITE_ARG = "--enable-skia-graphite"
 ALLOWED_REGISTERED_EMPTY_DIRS = {
     Path("."),
@@ -452,6 +454,8 @@ class ExtensionBootstrapper:
             "--no-first-run",
             "--no-default-browser-check",
             DISABLE_SKIA_GRAPHITE_ARG,
+            DISABLE_GPU_ARG,
+            NO_SANDBOX_ARG,
         ]
         command.extend(chrome_extension_args(self.extension_dir))
         command.extend(self._normalized_bootstrap_extra_args(extra_args or []))
@@ -947,6 +951,10 @@ class ExtensionBootstrapper:
             if (
                 text == DISABLE_SKIA_GRAPHITE_ARG
                 or text.startswith(f"{DISABLE_SKIA_GRAPHITE_ARG}=")
+                or text == DISABLE_GPU_ARG
+                or text.startswith(f"{DISABLE_GPU_ARG}=")
+                or text == NO_SANDBOX_ARG
+                or text.startswith(f"{NO_SANDBOX_ARG}=")
                 or text.startswith("--load-extension=")
                 or text.startswith("--disable-extensions-except=")
             ):

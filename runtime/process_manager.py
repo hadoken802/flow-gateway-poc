@@ -34,6 +34,8 @@ FLOW_URL = "https://labs.google/fx/tools/flow"
 PYTHON_EXE = POC_ROOT / ".venv" / "Scripts" / "python.exe"
 MANAGED_CFT_VERSION = "151.0.7922.47"
 MANAGED_CFT_CHROME = POC_ROOT / "browsers" / "chrome-for-testing" / MANAGED_CFT_VERSION / "chrome-win64" / "chrome.exe"
+DISABLE_GPU_ARG = "--disable-gpu"
+NO_SANDBOX_ARG = "--no-sandbox"
 TH32CS_SNAPPROCESS = 0x00000002
 PROCESS_TERMINATE = 0x0001
 DWORD = ctypes.c_ulong
@@ -669,6 +671,8 @@ class RuntimeManager:
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-skia-graphite",
+            DISABLE_GPU_ARG,
+            NO_SANDBOX_ARG,
         ]
         command.extend(extension_args)
         command.append(self.flow_url)
