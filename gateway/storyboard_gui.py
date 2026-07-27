@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 import threading
 from pathlib import Path
 from tkinter import filedialog, messagebox
@@ -19,6 +20,7 @@ from .storyboard_batch import run_storyboard_batch
 
 DEFAULT_ACCOUNT_IDS = {"FLOW-025", "FLOW-026", "FLOW-027"}
 REQUIRED_CREDITS = 15
+SELECTION_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "storyboard_gui_selection.db"
 
 
 class StoryboardGui(tk.Tk):
@@ -29,7 +31,8 @@ class StoryboardGui(tk.Tk):
         self.batch_runner = batch_runner
         self.shots: list[dict] = []
         self.account_rows: dict[str, dict] = {}
-        self.selected_account_ids: set[str] = set(DEFAULT_ACCOUNT_IDS)
+        self.selection_store = AccountSelectionStore(SELECTION_DB_PATH)
+        self.selected_account_ids: set[str] = set()
         self.batch_thread: threading.Thread | None = None
         self.preflight_thread: threading.Thread | None = None
         self.last_result: dict | None = None
@@ -140,6 +143,10 @@ class StoryboardGui(tk.Tk):
         for candidate in GatewayProjection().candidates():
             data = candidate.to_dict()
             account_id = data["account_id"]
+            selected = self.selection_store.get(account_id)
+            if selected is None:
+                selected = account_id in DEFAULT_ACCOUNT_IDS
+                self.selection_store.set(account_id, selected)
             self.account_rows[account_id] = {
                 "account_id": account_id,
                 "registration_status": data.get("registration_status"),
@@ -149,9 +156,9 @@ class StoryboardGui(tk.Tk):
                 "current_task_id": data.get("current_task_id"),
                 "exclusion_reasons": data.get("exclusion_reasons"),
             }
-            if account_id in DEFAULT_ACCOUNT_IDS:
+            if selected:
                 self.selected_account_ids.add(account_id)
-            elif account_id == "FLOW-024":
+            else:
                 self.selected_account_ids.discard(account_id)
         self._render_accounts()
 
@@ -182,10 +189,18 @@ class StoryboardGui(tk.Tk):
         account_id = self.selected_account()
         if not account_id:
             return
-        if account_id in self.selected_account_ids:
-            self.selected_account_ids.remove(account_id)
-        else:
+        selected = account_id not in self.selected_account_ids
+        try:
+            self.selection_store.set(account_id, selected)
+        except Exception as exc:
+            messagebox.showerror("保存失败", f"账号参与状态保存失败：{self._safe(exc)}")
+            self._render_accounts()
+            return
+        if selected:
             self.selected_account_ids.add(account_id)
+        else:
+            self.selected_account_ids.discard(account_id)
+        self._log(f"account selection saved account_id={account_id} selected_for_batch={selected}")
         self._render_accounts()
 
     def open_selected_flow(self) -> None:
@@ -481,6 +496,47 @@ class StoryboardGui(tk.Tk):
             if blocked in lowered:
                 return "[redacted]"
         return text
+
+
+class AccountSelectionStore:
+    def __init__(self, path: Path):
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self.path) as db:
+            db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS storyboard_account_selection (
+                    account_id TEXT PRIMARY KEY,
+                    selected_for_batch INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                )
+                """
+            )
+            db.commit()
+
+    def get(self, account_id: str) -> bool | None:
+        with sqlite3.connect(self.path) as db:
+            row = db.execute(
+                "SELECT selected_for_batch FROM storyboard_account_selection WHERE account_id=?",
+                (account_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return bool(row[0])
+
+    def set(self, account_id: str, selected: bool) -> None:
+        with sqlite3.connect(self.path) as db:
+            db.execute(
+                """
+                INSERT INTO storyboard_account_selection(account_id, selected_for_batch, updated_at)
+                VALUES(?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+                ON CONFLICT(account_id) DO UPDATE SET
+                  selected_for_batch=excluded.selected_for_batch,
+                  updated_at=excluded.updated_at
+                """,
+                (account_id, int(selected)),
+            )
+            db.commit()
 
 
 def main() -> None:
