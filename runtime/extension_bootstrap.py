@@ -16,6 +16,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
+from .extension_paths import chrome_extension_arg_value, chrome_extension_args
 from .paths import EXTENSION_DIR, PROFILES_ROOT
 from .port_allocator import port_can_bind, port_is_listening
 from .process_manager import RuntimeManager, RuntimeResult
@@ -444,7 +445,6 @@ class ExtensionBootstrapper:
 
     def bootstrap_chrome_command(self, account: AccountRecord, bootstrap_url: str, extra_args: list[str] | None = None) -> list[str]:
         chrome = self.runtime._find_chrome()
-        extension_dir = str(self.extension_dir.resolve())
         command = [
             str(chrome),
             f"--user-data-dir={Path(account.profile_path)}",
@@ -452,9 +452,8 @@ class ExtensionBootstrapper:
             "--no-first-run",
             "--no-default-browser-check",
             DISABLE_SKIA_GRAPHITE_ARG,
-            f"--disable-extensions-except={extension_dir}",
-            f"--load-extension={extension_dir}",
         ]
+        command.extend(chrome_extension_args(self.extension_dir))
         command.extend(self._normalized_bootstrap_extra_args(extra_args or []))
         command.append("about:blank")
         return command
@@ -1770,10 +1769,10 @@ class ExtensionBootstrapper:
     def _extension_loaded_from_command_line(self, command: list[str] | None) -> bool:
         if not command:
             return False
-        extension_dir = str(self.extension_dir.resolve())
+        extension_arg_value = chrome_extension_arg_value(self.extension_dir)
         load_args = [str(part) for part in command if str(part).startswith("--load-extension=")]
         except_args = [str(part) for part in command if str(part).startswith("--disable-extensions-except=")]
-        return load_args == [f"--load-extension={extension_dir}"] and except_args == [f"--disable-extensions-except={extension_dir}"]
+        return load_args == [f"--load-extension={extension_arg_value}"] and except_args == [f"--disable-extensions-except={extension_arg_value}"]
 
     def _wait_extension_ready(self, account: AccountRecord, attempts: int = 75, chrome_pid: int | None = None, diagnostics: dict | None = None) -> RuntimeResult:
         started = time.monotonic()

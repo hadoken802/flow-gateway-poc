@@ -18,6 +18,11 @@ from runtime.process_manager import BOOL, DWORD, HANDLE, INVALID_HANDLE_VALUE, K
 from runtime.registry import AccountRecord, AccountRegistry
 
 
+def write_extension_manifest(extension_dir):
+    extension_dir.mkdir(parents=True, exist_ok=True)
+    (extension_dir / "manifest.json").write_text('{"manifest_version":3,"name":"Test Extension","version":"1.0"}', encoding="utf-8")
+
+
 @pytest.fixture(autouse=True)
 def default_free_bind_probe(monkeypatch):
     monkeypatch.setattr("runtime.process_manager.port_can_bind", lambda port: True)
@@ -197,7 +202,7 @@ def test_start_worker_only_uses_account_env_and_does_not_launch_chrome(tmp_path,
     account = add_account(registry, "FLOW-005")
     Path(account.profile_path).mkdir(parents=True, exist_ok=True)
     extension_dir = tmp_path / "extension"
-    extension_dir.mkdir()
+    write_extension_manifest(extension_dir)
     inspector = FakeInspector()
     launched = []
 
@@ -251,7 +256,7 @@ def make_manager(tmp_path, registry, inspector=None, health=None, cdp=False, hea
     else:
         chrome_path = chrome_path_marker
     extension = tmp_path / "extension"
-    extension.mkdir(exist_ok=True)
+    write_extension_manifest(extension)
     launched = []
 
     def fake_popen(command, **kwargs):
@@ -544,6 +549,71 @@ def test_open_login_uses_registered_profile_cdp_and_extension_flags(tmp_path, mo
     assert len([part for part in command if str(part).startswith("--load-extension=")]) == 1
     assert len([part for part in command if str(part).startswith("--disable-extensions-except=")]) == 1
     assert registry.get("FLOW-005").chrome_pid == manager.launched[0].pid
+
+
+def test_runtime_chrome_command_loads_extra_extensions_from_env(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    account = add_account(registry, "FLOW-005")
+    manager = make_manager(tmp_path, registry)
+    extra = tmp_path / "cookie-reset"
+    write_extension_manifest(extra)
+    monkeypatch.setenv("FLOW_EXTRA_EXTENSION_DIRS", str(extra))
+
+    command = manager.chrome_command(account)
+    load_arg = next(part for part in command if str(part).startswith("--load-extension="))
+    except_arg = next(part for part in command if str(part).startswith("--disable-extensions-except="))
+    load_dirs = load_arg.split("=", 1)[1].split(",")
+    except_dirs = except_arg.split("=", 1)[1].split(",")
+
+    assert load_dirs == except_dirs
+    assert str(manager.extension_dir.resolve()) in load_dirs
+    assert str(extra.resolve()) in load_dirs
+    assert len(load_dirs) == 2
+    assert f"--user-data-dir={Path(account.profile_path)}" in command
+
+
+def test_runtime_chrome_command_dedupes_extra_extension_dirs(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    account = add_account(registry, "FLOW-005")
+    manager = make_manager(tmp_path, registry)
+    extra = tmp_path / "extension"
+    monkeypatch.setenv("FLOW_EXTRA_EXTENSION_DIRS", str(extra))
+
+    command = manager.chrome_command(account)
+    load_arg = next(part for part in command if str(part).startswith("--load-extension="))
+    assert load_arg.split("=", 1)[1].split(",") == [str(manager.extension_dir.resolve())]
+
+
+def test_runtime_preflight_fails_when_extra_extension_manifest_missing(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    account = add_account(registry, "FLOW-005")
+    manager = make_manager(tmp_path, registry)
+    missing = tmp_path / "missing-extension"
+    missing.mkdir()
+    monkeypatch.setenv("FLOW_EXTRA_EXTENSION_DIRS", str(missing))
+
+    result = manager.open_login(account.account_id)
+
+    assert result.ok is False
+    assert result.error == "extension_manifest_missing"
+    assert not manager.launched
+
+
+def test_runtime_accounts_keep_distinct_user_data_dirs_with_extra_extensions(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    first = add_account(registry, "FLOW-005")
+    second = add_account(registry, "FLOW-006")
+    manager = make_manager(tmp_path, registry)
+    extra = tmp_path / "cookie-reset"
+    write_extension_manifest(extra)
+    monkeypatch.setenv("FLOW_EXTRA_EXTENSION_DIRS", str(extra))
+
+    first_command = manager.chrome_command(first)
+    second_command = manager.chrome_command(second)
+
+    assert f"--user-data-dir={Path(first.profile_path)}" in first_command
+    assert f"--user-data-dir={Path(second.profile_path)}" in second_command
+    assert Path(first.profile_path) != Path(second.profile_path)
 
 
 def test_runtime_manager_does_not_fallback_to_system_chrome_when_cft_missing(tmp_path, monkeypatch):

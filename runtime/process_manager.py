@@ -24,6 +24,7 @@ from .ownership import (
     validate_challenge,
     verify_challenge_response,
 )
+from .extension_paths import chrome_extension_args, runtime_extension_dirs
 from .paths import EXTENSION_DIR, FLOWKIT_DIR, POC_ROOT
 from .port_allocator import port_can_bind, port_is_listening
 from .registry import AccountRecord, AccountRegistry
@@ -660,18 +661,18 @@ class RuntimeManager:
 
     def chrome_command(self, account: AccountRecord) -> list[str]:
         chrome = self._find_chrome()
-        extension_dir = str(self.extension_dir.resolve())
-        return [
+        extension_args = chrome_extension_args(self.extension_dir)
+        command = [
             str(chrome),
             f"--user-data-dir={Path(account.profile_path)}",
             f"--remote-debugging-port={account.chrome_cdp_port}",
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-skia-graphite",
-            f"--disable-extensions-except={extension_dir}",
-            f"--load-extension={extension_dir}",
-            self.flow_url,
         ]
+        command.extend(extension_args)
+        command.append(self.flow_url)
+        return command
 
     def _wait_startup_extension_ready(self, account: AccountRecord, worker_pid: int | None, chrome_pid: int | None, attempts: int = 75) -> RuntimeResult:
         last = self.status(account.account_id)
@@ -768,6 +769,10 @@ class RuntimeManager:
             return RuntimeResult("profile_missing", account.account_id, False)
         if not self.extension_dir.exists():
             return RuntimeResult("failed", account.account_id, False, "extension_not_found", {"path": str(self.extension_dir)})
+        try:
+            runtime_extension_dirs(self.extension_dir)
+        except (FileNotFoundError, ValueError) as exc:
+            return RuntimeResult("failed", account.account_id, False, "extension_manifest_missing", {"error": str(exc)})
         if require_chrome and not self._find_chrome():
             return RuntimeResult("cft_browser_not_configured", account.account_id, False, details={"cft_required": True, **self.browser_diagnostics()})
         return None

@@ -1506,6 +1506,34 @@ def test_bootstrap_chrome_command_loads_extension_and_starts_about_blank(tmp_pat
     assert not any("labs.google" in part or "aisandbox" in part for part in command)
 
 
+def test_bootstrap_chrome_command_uses_same_multi_extension_args(tmp_path, monkeypatch):
+    registry = make_registry(tmp_path)
+    account = add_account(registry)
+    extension_dir = tmp_path / "extension"
+    extra_dir = tmp_path / "cookie-reset"
+    write_manifest(extension_dir)
+    write_manifest(extra_dir, version="1.23.0")
+    monkeypatch.setenv("FLOW_EXTRA_EXTENSION_DIRS", str(extra_dir))
+    bootstrapper = ExtensionBootstrapper(
+        registry,
+        runtime=FakeRuntime(),
+        cdp=FakeCdp(),
+        profiles_root=registry.profiles_root,
+        extension_dir=extension_dir,
+    )
+
+    command = bootstrapper.bootstrap_chrome_command(account, "chrome-extension://id/options.html")
+    load_arg = next(part for part in command if str(part).startswith("--load-extension="))
+    except_arg = next(part for part in command if str(part).startswith("--disable-extensions-except="))
+
+    assert load_arg.split("=", 1)[1].split(",") == [
+        str(extension_dir.resolve()),
+        str(extra_dir.resolve()),
+    ]
+    assert except_arg.split("=", 1)[1] == load_arg.split("=", 1)[1]
+    assert bootstrapper._extension_loaded_from_command_line(command) is True
+
+
 def test_bootstrap_url_uses_expected_extension_id_and_local_config(tmp_path):
     registry = make_registry(tmp_path)
     account = add_account(registry)
