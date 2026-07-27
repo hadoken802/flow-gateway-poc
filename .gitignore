@@ -4,6 +4,9 @@ __pycache__/
 *.db-shm
 *.db-wal
 *.db-journal
+*.lock
+*.pid
+*.mp4
 .env
 output/
 youtube
@@ -20,12 +23,28 @@ GEMINI.md
 .pytest_cache/
 .pytest_tmp/
 .tmp/
-*.lock
+data/
+logs/
+test_inputs/
 tmp_multi_storyboard_input/
 tmp_multi_storyboard_runs/
 tmp_multi_storyboard_reconcile/
 tmp_multi_storyboard_preflight/
 tmp_multi_storyboard_gui/
+
+# Local browser/runtime data outside this repository root
+/../profiles/
+/../outputs/
+/../data/
+/../logs/
+
+# Browser profile internals if copied into the repo accidentally
+Cookie*
+Local Storage/
+IndexedDB/
+Cache/
+CacheStorage/
+Service Worker/
 
 # Browser-generated extension metadata
 extension/_metadata/
