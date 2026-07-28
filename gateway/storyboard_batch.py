@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from . import cli
+from .config import DEFAULT_GATEWAY_DB_PATH
 from .worker_client import WorkerClient
 from .worker_provider import RuntimeRegistryWorkerProvider
 
@@ -53,7 +54,7 @@ def run_storyboard_batch(args: argparse.Namespace) -> dict[str, Any]:
             return preflight
         if account_ids and not preflight.get("ok"):
             return preflight
-        db_path = run_dir / "gateway.db"
+        db_path = _gateway_db_path(args, run_dir)
         log_path = run_dir / "gateway.log"
         gateway_process = _start_gateway_for_batch(port, db_path, log_path, concurrency, bool(getattr(args, "test_mode", False)), account_ids)
         try:
@@ -267,6 +268,17 @@ def _account_summary(preflight: dict[str, Any]) -> dict[str, Any]:
         "excluded_account_ids": preflight.get("excluded_account_ids", []),
         "excluded_reasons": preflight.get("excluded_reasons", {}),
     }
+
+
+def _gateway_db_path(args: argparse.Namespace, run_dir: Path) -> Path:
+    explicit = getattr(args, "gateway_db", None)
+    if explicit:
+        return Path(explicit)
+    if getattr(args, "legacy_run_db", False):
+        warning = "WARNING: --legacy-run-db does not provide cross-batch global account locks."
+        print(warning, file=sys.stderr)
+        return run_dir / "gateway.db"
+    return DEFAULT_GATEWAY_DB_PATH
 
 
 def _start_gateway_for_batch(port: int, db_path: Path, log_path: Path, concurrency: int, test_mode: bool, account_ids: list[str] | None = None):

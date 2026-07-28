@@ -80,14 +80,43 @@ def test_storyboard_batch_starts_one_gateway_and_writes_one_database(tmp_path, m
     }])
     monkeypatch.setattr(storyboard_batch, "_stop_gateway", lambda proc: True)
 
-    result = storyboard_batch.run_storyboard_batch(argparse.Namespace(manifest=str(path.resolve()), concurrency=3, output_dir=str(tmp_path), timeout_seconds=1200, gateway_port=8888, test_mode=True))
+    result = storyboard_batch.run_storyboard_batch(argparse.Namespace(manifest=str(path.resolve()), concurrency=3, output_dir=str(tmp_path), timeout_seconds=1200, gateway_port=8888, gateway_db=None, legacy_run_db=False, test_mode=True))
 
     assert result["ok"] is True
     assert calls["starts"] == 1
-    assert calls["db_path"] == Path(result["run_dir"]) / "gateway.db"
+    from gateway.config import DEFAULT_GATEWAY_DB_PATH
+    assert calls["db_path"] == DEFAULT_GATEWAY_DB_PATH
     assert calls["concurrency"] == 3
     assert calls["account_ids"] == []
     assert (Path(result["run_dir"]) / "batch-result.json").exists()
+
+
+def test_storyboard_batch_legacy_run_db_still_uses_run_dir_database(tmp_path, monkeypatch, capsys):
+    from gateway import storyboard_batch
+
+    image = png(tmp_path / "a.png")
+    path = manifest(tmp_path, [{"shot_id": "001", "image": str(image.resolve()), "prompt": "p", "duration": 10, "aspect_ratio": "9:16"}])
+    calls = {}
+    video = tmp_path / "out.mp4"
+    video.write_bytes(b"\x00\x00\x00\x18ftypmp42")
+
+    class Proc:
+        pid = 123
+        def poll(self): return None
+        def terminate(self): pass
+        def wait(self, timeout=None): return 0
+
+    monkeypatch.setattr(storyboard_batch, "run_preflight", lambda shots, account_ids, run_dir: {"ok": True, "requested_account_ids": [], "eligible_account_ids": [], "excluded_account_ids": [], "excluded_reasons": {}})
+    monkeypatch.setattr(storyboard_batch, "_start_gateway_for_batch", lambda port, db_path, log_path, concurrency, test_mode, account_ids=None: calls.setdefault("db_path", db_path) or Proc())
+    monkeypatch.setattr(storyboard_batch.cli, "_wait_for_gateway", lambda *args, **kwargs: None)
+    monkeypatch.setattr(storyboard_batch, "_post_tasks", lambda port, shots: [{"task_id": "task-1"}])
+    monkeypatch.setattr(storyboard_batch, "_wait_for_tasks", lambda port, tasks, timeout: [{"task_id": "task-1", "project_id": "project-1", "assigned_account_id": "FLOW-024", "assigned_runtime_instance_id": "runtime-24", "worker_job_id": "job-1", "attempt_count": 1, "status": "completed", "error_code": None, "error_message": None, "video_path": str(video)}])
+    monkeypatch.setattr(storyboard_batch, "_stop_gateway", lambda proc: True)
+
+    result = storyboard_batch.run_storyboard_batch(argparse.Namespace(manifest=str(path.resolve()), concurrency=3, output_dir=str(tmp_path), timeout_seconds=1200, gateway_port=8889, gateway_db=None, legacy_run_db=True, test_mode=True))
+
+    assert calls["db_path"] == Path(result["run_dir"]) / "gateway.db"
+    assert "does not provide cross-batch global account locks" in capsys.readouterr().err
 
 
 def test_storyboard_batch_parse_account_ids_dedupes_stably():

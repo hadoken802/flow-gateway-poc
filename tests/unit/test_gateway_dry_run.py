@@ -394,7 +394,7 @@ async def test_worker_offline_and_recovery_keeps_same_task_id():
     states["FLOW-003"]["offline"] = True
     await scheduler.refresh_workers()
     current = await scheduler.get_task(task["task_id"])
-    assert current["status"] in {"waiting_recovery", "queued", "assigning", "submitted", "processing", "completed"}
+    assert current["status"] in {"waiting_recovery", "queued", "leased", "assigning", "submitted", "processing", "completed"}
     states["FLOW-002"]["offline"] = False
     states["FLOW-003"]["offline"] = False
     await scheduler.refresh_workers()
@@ -498,7 +498,7 @@ async def test_real_mode_project_create_failure_releases_account_without_submit(
     await scheduler.create_task({"idempotency_key": "project-fail", "image_path": "D:/img.png", "prompt": "p", "duration": 10, "aspect_ratio": "9:16", "preferred_account_id": "FLOW-002"})
     for _ in range(100):
         task = (await scheduler.list_tasks())[0]
-        if task["status"] == "manual_review":
+        if task["status"] == "submission_unknown":
             break
         await asyncio.sleep(0.02)
     task = (await scheduler.list_tasks())[0]
@@ -683,11 +683,11 @@ async def test_real_mode_missing_worker_job_id_releases_account_for_manual_revie
             break
         await asyncio.sleep(0.02)
     task = (await scheduler.list_tasks())[0]
-    assert task["status"] == "manual_review"
+    assert task["status"] == "submission_unknown"
     assert task["attempt_count"] == 1
     assert task["worker_job_id"] is None
     accounts = {a["account_id"]: a for a in await scheduler.list_accounts()}
-    assert accounts["FLOW-002"]["current_task_id"] is None
+    assert accounts["FLOW-002"]["current_task_id"] == task["task_id"]
     await scheduler.stop()
 
 
@@ -724,7 +724,7 @@ async def test_real_mode_upstream_403_saves_worker_job_and_requires_manual_submi
     assert task["status"] == "manual_submit_required"
     assert task["worker_job_id"] == "job-upstream-403"
     assert task["error_code"] == "UPSTREAM_UNUSUAL_ACTIVITY"
-    assert accounts["FLOW-002"]["current_task_id"] is None
+    assert accounts["FLOW-002"]["current_task_id"] == task["task_id"]
     await scheduler.stop()
 
 
@@ -750,7 +750,7 @@ async def test_real_mode_does_not_repost_after_worker_job_id_is_saved():
     await scheduler2.start()
     for _ in range(100):
         task = (await scheduler2.list_tasks())[0]
-        if task["status"] == "completed":
+        if task["status"] == "manual_review":
             break
         await asyncio.sleep(0.02)
     assert client2.submits == []
@@ -871,13 +871,12 @@ async def test_real_mode_recovers_manual_review_task_with_existing_worker_job():
 
     task = (await scheduler.list_tasks())[0]
     assert client.submits == []
-    assert client.retry_downloads == [("FLOW-003", "job-manual")]
+    assert client.retry_downloads == []
     assert task["task_id"] == created["task_id"]
     assert task["assigned_account_id"] == "FLOW-003"
     assert task["worker_job_id"] == "job-manual"
     assert task["attempt_count"] == 0
-    assert task["status"] == "completed"
-    assert task["video_path"] == str(video_file)
+    assert task["status"] == "manual_review"
     await scheduler.stop()
 
 
@@ -900,10 +899,10 @@ async def test_real_mode_retries_same_idempotency_key_after_lost_http_response()
     task = (await scheduler.list_tasks())[0]
     assert [payload["idempotency_key"] for _, payload in client.submits] == ["lost-1"]
     assert task["attempt_count"] == 1
-    assert task["status"] == "manual_review"
+    assert task["status"] == "submission_unknown"
     assert task["worker_job_id"] is None
     accounts = {a["account_id"]: a for a in await scheduler.list_accounts()}
-    assert accounts["FLOW-002"]["current_task_id"] is None
+    assert accounts["FLOW-002"]["current_task_id"] == task["task_id"]
     await scheduler.stop()
 
 
@@ -1061,8 +1060,8 @@ async def test_recover_project_without_worker_job_goes_manual_review_without_sub
     scheduler = make_scheduler(settings, client)
     await scheduler.start()
     task = (await scheduler.list_tasks())[0]
-    assert task["status"] == "manual_review"
-    assert task["error_code"] == "submit_state_unknown"
+    assert task["status"] == "submission_unknown"
+    assert task["last_error_code"] == "restart_after_project_before_job"
     assert client.projects == []
     assert client.submits == []
     await scheduler.stop()

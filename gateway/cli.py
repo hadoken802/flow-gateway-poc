@@ -47,6 +47,8 @@ def main(argv: list[str] | None = None) -> int:
     batch.add_argument("--output-dir")
     batch.add_argument("--timeout-seconds", type=int, default=1200)
     batch.add_argument("--gateway-port", type=int)
+    batch.add_argument("--gateway-db")
+    batch.add_argument("--legacy-run-db", action="store_true")
     batch.add_argument("--test-mode", action="store_true")
     batch.add_argument("--account-ids")
     batch.add_argument("--preflight-only", action="store_true")

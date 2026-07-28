@@ -2,6 +2,7 @@
 import asyncio
 import json
 import logging
+import uuid
 from pathlib import Path
 
 from . import crud
@@ -27,11 +28,15 @@ class GatewayScheduler:
         self._runner_task = None
         self._dry_tasks: dict[str, asyncio.Task] = {}
         self._real_tasks: dict[str, asyncio.Task] = {}
+        self._heartbeat_tasks: dict[str, asyncio.Task] = {}
+        self._fencing_lost: set[str] = set()
         self._stopping = False
         self.assignment_history: list[tuple[str, str]] = []
         self._last_worker_refresh = 0.0
         self._worker_refresh_lock = asyncio.Lock()
         self.startup_stage: str | None = None
+        self.boot_id = str(uuid.uuid4())
+        self.scheduler_instance_id = str(uuid.uuid4())
 
     def _load_worker_snapshot(self) -> WorkerSnapshot:
         try:
@@ -171,12 +176,13 @@ class GatewayScheduler:
             await self.schedule_once()
             return
 
-        active_statuses = {"assigning", "submitted", "processing", "waiting_recovery"}
+        recoverable_statuses = {"submitted", "processing", "download_pending", "downloading", "waiting_recovery"}
+        active_statuses = {"leased", "assigning", "project_create_pending", "project_create_in_progress", "project_created", "submit_pending", "submit_in_progress", "submitted", "processing", "download_pending", "downloading", "waiting_recovery"}
         active_by_account: dict[str, list[dict]] = {}
-        terminal_task_ids = {task["task_id"] for task in tasks if task["status"] in {"completed", "failed", "manual_review"}}
+        terminal_task_ids = {task["task_id"] for task in tasks if task["status"] in {"completed", "failed", "failed_before_remote_submit", "cancelled", "download_failed"}}
         task_ids = {task["task_id"] for task in tasks}
         for task in tasks:
-            if (task["status"] in active_statuses or (task["status"] == "manual_review" and task.get("worker_job_id"))) and task.get("assigned_account_id"):
+            if task["status"] in active_statuses and task.get("assigned_account_id"):
                 active_by_account.setdefault(task["assigned_account_id"], []).append(task)
 
         for account in await crud.list_accounts(self.db):
@@ -222,8 +228,28 @@ class GatewayScheduler:
                 self._audit("recovery_stale_binding_cleared", account_id=account["account_id"], task_id=current_task_id)
 
         for task in await crud.list_tasks(self.db):
-            if task["status"] in active_statuses:
+            if task["status"] in {"manual_review", "manual_submit_required", "project_creation_unknown", "submission_unknown", "remote_state_unknown"}:
+                continue
+            if task["status"] == "project_create_pending":
+                await crud.update_task_status(self.db, task["task_id"], "queued")
+                continue
+            if task["status"] == "project_create_in_progress":
+                await crud.update_task_status(self.db, task["task_id"], "project_creation_unknown", last_error_code="restart_during_project_create")
+                continue
+            if task["status"] == "submit_in_progress":
+                await crud.update_task_status(self.db, task["task_id"], "submission_unknown", last_error_code="restart_during_submit")
+                continue
+            if task["status"] == "assigning" and task.get("project_id") and not task.get("worker_job_id"):
+                await crud.update_task_status(self.db, task["task_id"], "submission_unknown", last_error_code="restart_after_project_before_job")
+                continue
+            if task["status"] == "download_failed":
+                continue
+            if task["status"] == "downloading":
+                await crud.update_task_status(self.db, task["task_id"], "download_pending")
+                continue
+            if task["status"] in recoverable_statuses:
                 if task.get("worker_job_id"):
+                    task = await crud.ensure_active_lease(self.db, task["task_id"], task["assigned_account_id"])
                     self._real_tasks[task["task_id"]] = asyncio.create_task(self._run_real_task(task["task_id"], task["assigned_account_id"]))
                 elif task.get("project_id"):
                     self._audit("account_released", task_id=task["task_id"], account_id=task.get("assigned_account_id"), release_reason="submit_state_unknown")
@@ -236,8 +262,6 @@ class GatewayScheduler:
                     )
                 else:
                     await crud.update_task_status(self.db, task["task_id"], "queued")
-            elif task["status"] == "manual_review" and task.get("worker_job_id") and task.get("error_code") != "multiple_active_tasks_for_account":
-                self._real_tasks[task["task_id"]] = asyncio.create_task(self._run_real_task(task["task_id"], task["assigned_account_id"]))
         await self.refresh_workers()
         await self.schedule_once()
 
@@ -321,6 +345,7 @@ class GatewayScheduler:
                     account_id,
                     selected.get("selected_runtime_instance_id"),
                     self.settings.omni_10s_credit_cost,
+                    self.settings.lease_duration_seconds,
                 )
                 if not task:
                     return
@@ -470,6 +495,8 @@ class GatewayScheduler:
             worker = self._worker_by_account(account_id)
             if not task or not worker:
                 return
+            token = _lease_token(task)
+            heartbeat_task = self._start_task_heartbeat(task_id, account_id, token)
             while not task.get("worker_job_id") and not self._stopping:
                 current_worker = await self._bound_ready_worker(task_id, account_id)
                 if not current_worker:
@@ -477,18 +504,35 @@ class GatewayScheduler:
                 worker = current_worker
                 if int(task.get("attempt_count") or 0) >= self.settings.real_submit_max_attempts:
                     async with self.assignment_lock:
-                        await crud.release_task_for_manual_review(
+                        account = await crud.get_account(self.db, account_id)
+                        await crud.guarded_release_account(
                             self.db,
                             task_id,
                             account_id,
+                            token["lease_owner"],
+                            token["lease_version"],
+                            int((account or {}).get("lock_version") or 0),
+                            "failed_before_remote_submit",
                             error_code="real_submit_attempts_exhausted",
                             error_message="Worker submit attempt limit reached",
                             remaining_credits=task.get("remaining_credits"),
+                            last_error_code="real_submit_attempts_exhausted",
+                            last_error_message="Worker submit attempt limit reached",
                         )
                     return
                 project_id = task.get("project_id")
                 if not isinstance(project_id, str) or not project_id.strip():
                     try:
+                        async with self.assignment_lock:
+                            task = await crud.guarded_update_task(self.db, task_id, token["lease_owner"], token["lease_version"], "project_create_pending", scheduler_instance_id=self.scheduler_instance_id, worker_instance_id=worker.runtime_instance_id, boot_id=self.boot_id)
+                        if not task:
+                            self._audit("fencing_lost", task_id=task_id, action="project_create_pending")
+                            return
+                        async with self.assignment_lock:
+                            task = await crud.guarded_update_task(self.db, task_id, token["lease_owner"], token["lease_version"], "project_create_in_progress")
+                        if not task:
+                            self._audit("fencing_lost", task_id=task_id, action="project_create_in_progress")
+                            return
                         self._audit("project_create_started", task_id=task_id, worker_account_id=worker.account_id, runtime_instance_id=worker.runtime_instance_id)
                         project = await self.worker_client.create_project(worker, _project_payload(task_id))
                         project_id = project.get("id")
@@ -498,18 +542,26 @@ class GatewayScheduler:
                     except Exception as exc:
                         async with self.assignment_lock:
                             self._audit("account_released", task_id=task_id, account_id=account_id, release_reason="project_create_failed")
-                            await crud.release_task_for_manual_review(
+                            account = await crud.get_account(self.db, account_id)
+                            await crud.guarded_release_account(
                                 self.db,
                                 task_id,
                                 account_id,
+                                token["lease_owner"],
+                                token["lease_version"],
+                                int((account or {}).get("lock_version") or 0),
+                                "failed_before_remote_submit",
                                 error_code="project_create_failed",
                                 error_message=str(exc)[:500],
                                 remaining_credits=task.get("remaining_credits"),
+                                last_error_code="project_create_failed",
+                                last_error_message=str(exc)[:500],
                             )
                         return
                     async with self.assignment_lock:
-                        task = await crud.mark_project_created(self.db, task_id, project_id)
+                        task = await crud.guarded_update_task(self.db, task_id, token["lease_owner"], token["lease_version"], "project_created", project_id=project_id, project_created_by_gateway=1, project_created_at=crud.utc_now())
                     if not task:
+                        self._audit("fencing_lost", task_id=task_id, action="project_created")
                         return
                     current_worker = await self._bound_ready_worker(task_id, account_id)
                     if not current_worker:
@@ -524,58 +576,98 @@ class GatewayScheduler:
                     "aspect_ratio": task["aspect_ratio"],
                 }
                 try:
-                    await self._increment_attempt_count(task_id)
+                    async with self.assignment_lock:
+                        task = await crud.guarded_update_task(self.db, task_id, token["lease_owner"], token["lease_version"], "submit_pending")
+                    if not task:
+                        self._audit("fencing_lost", task_id=task_id, action="submit_pending")
+                        return
+                    async with self.assignment_lock:
+                        task = await crud.guarded_transition(
+                            self.db,
+                            task_id,
+                            token["lease_owner"],
+                            token["lease_version"],
+                            "submit_pending",
+                            "submit_in_progress",
+                            generation_attempts=("increment", 1),
+                            attempt_count=("increment", 1),
+                            submission_started_at=crud.utc_now(),
+                        )
+                    if not task:
+                        self._audit("fencing_lost", task_id=task_id, action="submit_in_progress")
+                        return
                     self._audit("worker_submit_started", task_id=task_id, worker_account_id=worker.account_id, project_id=project_id)
                     result = await self.worker_client.submit_omni_video(worker, payload)
+                    if task_id in self._fencing_lost:
+                        self._audit("fencing_lost", task_id=task_id, action="after_submit")
+                        return
                     self._audit("worker_submit_completed", task_id=task_id, worker_account_id=worker.account_id, worker_job_id=result.get("job_id") or result.get("worker_job_id"))
                 except Exception as exc:
                     async with self.assignment_lock:
                         self._audit("account_released", task_id=task_id, account_id=account_id, release_reason="worker_submit_failed")
-                        await crud.release_task_for_manual_review(
+                        await crud.guarded_update_task(
                             self.db,
                             task_id,
-                            account_id,
+                            token["lease_owner"],
+                            token["lease_version"],
+                            "submission_unknown",
                             error_code=type(exc).__name__[:120],
                             error_message=str(exc)[:500],
+                            last_error_code=type(exc).__name__[:120],
+                            last_error_message=str(exc)[:500],
                             remaining_credits=task.get("remaining_credits"),
                         )
                     return
                 worker_job_id = result.get("job_id") or result.get("worker_job_id")
                 if not worker_job_id:
                     self._audit("account_released", task_id=task_id, account_id=account_id, release_reason="missing_worker_job_id")
-                    await crud.release_task_for_manual_review(
+                    await crud.guarded_update_task(
                         self.db,
                         task_id,
-                        account_id,
+                        token["lease_owner"],
+                        token["lease_version"],
+                        "submission_unknown",
                         error_code="missing_worker_job_id",
                         error_message=str(result)[:500],
+                        last_error_code="missing_worker_job_id",
+                        last_error_message=str(result)[:500],
                         remaining_credits=result.get("remaining_credits"),
                     )
                     return
                 if _requires_manual_submit(result):
                     async with self.assignment_lock:
-                        await crud.mark_submitted(
+                        await crud.guarded_update_task(
                             self.db,
                             task_id,
-                            worker_job_id,
+                            token["lease_owner"],
+                            token["lease_version"],
+                            "submitted",
+                            worker_job_id=worker_job_id,
+                            submission_confirmed_at=crud.utc_now(),
                             remaining_credits=result.get("remaining_credits"),
                         )
                         self._audit("account_released", task_id=task_id, account_id=account_id, release_reason="manual_submit_required")
-                        await crud.release_task_for_manual_review(
+                        await crud.guarded_update_task(
                             self.db,
                             task_id,
-                            account_id,
+                            token["lease_owner"],
+                            token["lease_version"],
+                            "manual_submit_required",
                             error_code="UPSTREAM_UNUSUAL_ACTIVITY",
                             error_message="Google requires manual submission for this Flow project",
                             remaining_credits=result.get("remaining_credits"),
-                            status="manual_submit_required",
+                            manual_submit_required_at=crud.utc_now(),
                         )
                     return
                 async with self.assignment_lock:
-                    await crud.mark_submitted(
+                    await crud.guarded_update_task(
                         self.db,
                         task_id,
-                        worker_job_id,
+                        token["lease_owner"],
+                        token["lease_version"],
+                        "submitted",
+                        worker_job_id=worker_job_id,
+                        submission_confirmed_at=crud.utc_now(),
                         remaining_credits=result.get("remaining_credits"),
                     )
                 task = await crud.get_task(self.db, task_id)
@@ -588,8 +680,31 @@ class GatewayScheduler:
                     return
                 worker = current_worker
                 try:
+                    token = _lease_token(task)
+                    account = await crud.get_account(self.db, account_id)
+                    async with self.assignment_lock:
+                        ok = await crud.heartbeat(self.db, task_id, account_id, token["lease_owner"], token["lease_version"], int((account or {}).get("lock_version") or 0))
+                    if not ok:
+                        self._audit("fencing_lost", task_id=task_id, action="heartbeat")
+                        return
                     result = await self.worker_client.get_omni_video(worker, task["worker_job_id"])
+                    if task_id in self._fencing_lost:
+                        self._audit("fencing_lost", task_id=task_id, action="after_poll")
+                        return
                     if result.get("status") in {"waiting_download", "completed_remote"}:
+                        async with self.assignment_lock:
+                            downloading = await crud.guarded_transition(
+                                self.db,
+                                task_id,
+                                token["lease_owner"],
+                                token["lease_version"],
+                                task.get("status"),
+                                "downloading",
+                                download_attempts=("increment", 1),
+                            )
+                        if not downloading:
+                            self._audit("fencing_lost", task_id=task_id, action="downloading")
+                            return
                         result = await self.worker_client.retry_omni_video_download(worker, task["worker_job_id"])
                 except Exception as exc:
                     async with self.assignment_lock:
@@ -603,45 +718,63 @@ class GatewayScheduler:
                     if not video_check["ok"]:
                         async with self.assignment_lock:
                             self._audit("account_released", task_id=task_id, account_id=account_id, release_reason=video_check["error_code"])
-                            await crud.release_task_for_manual_review(
+                            account = await crud.get_account(self.db, account_id)
+                            await crud.guarded_release_account(
                                 self.db,
                                 task_id,
                                 account_id,
+                                token["lease_owner"],
+                                token["lease_version"],
+                                int((account or {}).get("lock_version") or 0),
+                                "download_failed",
                                 error_code=result.get("error_code") or video_check["error_code"],
                                 error_message=result.get("error_message") or video_check["error_message"],
                                 remaining_credits=result.get("remaining_credits"),
-                                status="download_failed",
+                                last_error_code=result.get("error_code") or video_check["error_code"],
+                                last_error_message=result.get("error_message") or video_check["error_message"],
                             )
                         return
                     async with self.assignment_lock:
                         self._audit("account_released", task_id=task_id, account_id=account_id, release_reason="completed")
-                        await crud.complete_real_task(
+                        account = await crud.get_account(self.db, account_id)
+                        completed = await crud.guarded_complete_real_task(
                             self.db,
                             task_id,
                             account_id,
+                            token["lease_owner"],
+                            token["lease_version"],
+                            int((account or {}).get("lock_version") or 0),
                             video_path,
                             result.get("remaining_credits"),
                         )
+                        if not completed:
+                            self._audit("fencing_lost", task_id=task_id, action="completed")
+                            return
                     await self.schedule_once()
                     return
                 if mapped == "manual_review":
                     async with self.assignment_lock:
                         manual_status = "manual_submit_required" if _requires_manual_submit(result) else "manual_review"
                         self._audit("account_released", task_id=task_id, account_id=account_id, release_reason=manual_status)
-                        await crud.release_task_for_manual_review(
+                        await crud.guarded_update_task(
                             self.db,
                             task_id,
-                            account_id,
+                            token["lease_owner"],
+                            token["lease_version"],
+                            manual_status,
                             error_code="UPSTREAM_UNUSUAL_ACTIVITY" if manual_status == "manual_submit_required" else result.get("error_code"),
                             error_message="Google requires manual submission for this Flow project" if manual_status == "manual_submit_required" else result.get("error_message"),
                             remaining_credits=result.get("remaining_credits"),
-                            status=manual_status,
+                            manual_submit_required_at=crud.utc_now() if manual_status == "manual_submit_required" else task.get("manual_submit_required_at"),
                         )
                     return
                 async with self.assignment_lock:
-                    await crud.update_task_status(self.db, task_id, mapped)
+                    await crud.guarded_update_task(self.db, task_id, token["lease_owner"], token["lease_version"], mapped)
                 await asyncio.sleep(5)
         finally:
+            if heartbeat_task:
+                heartbeat_task.cancel()
+                await asyncio.gather(heartbeat_task, return_exceptions=True)
             self._real_tasks.pop(task_id, None)
 
     async def _account_online(self, account_id):
@@ -678,10 +811,46 @@ class GatewayScheduler:
                 safe[key] = value
         return json.dumps(safe, sort_keys=True)
 
+    def _start_task_heartbeat(self, task_id, account_id, token):
+        task = asyncio.create_task(self._heartbeat_loop(task_id, account_id, token))
+        self._heartbeat_tasks[task_id] = task
+        task.add_done_callback(lambda _task, _task_id=task_id: self._heartbeat_tasks.pop(_task_id, None))
+        return task
+
+    async def _heartbeat_loop(self, task_id, account_id, token):
+        try:
+            while not self._stopping:
+                await asyncio.sleep(self.settings.heartbeat_interval_seconds)
+                account = await crud.get_account(self.db, account_id)
+                async with self.assignment_lock:
+                    ok = await crud.heartbeat(
+                        self.db,
+                        task_id,
+                        account_id,
+                        token["lease_owner"],
+                        token["lease_version"],
+                        int((account or {}).get("lock_version") or 0),
+                        self.settings.lease_duration_seconds,
+                    )
+                if not ok:
+                    self._fencing_lost.add(task_id)
+                    self._audit("fencing_lost", task_id=task_id, action="heartbeat_loop")
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._audit("heartbeat_error", task_id=task_id, exception_type=type(exc).__name__, error_message=str(exc)[:500])
+            self._fencing_lost.add(task_id)
+        finally:
+            self._heartbeat_tasks.pop(task_id, None)
+
     async def _bound_ready_worker(self, task_id, account_id):
         task = await crud.get_task(self.db, task_id)
         worker = self._worker_by_account(account_id)
         if not task or not worker:
+            return None
+        if task.get("status") in {"project_creation_unknown", "submission_unknown"}:
+            self._audit("remote_state_unknown_no_auto_action", task_id=task_id, status=task.get("status"))
             return None
         if worker.account_id != task.get("assigned_account_id"):
             await crud.release_task_for_manual_review(self.db, task_id, account_id, error_code="assigned_account_mismatch", error_message="Assigned account changed before submit")
@@ -714,6 +883,13 @@ class GatewayScheduler:
 
 def _now_marker():
     return "dry-run"
+
+
+def _lease_token(task: dict) -> dict:
+    return {
+        "lease_owner": task.get("lease_owner"),
+        "lease_version": int(task.get("lease_version") or 0),
+    }
 
 
 def _project_payload(task_id):
