@@ -133,16 +133,28 @@ class GatewayScheduler:
                 try:
                     info = await self.worker_client.inspect(worker)
                     credits = info.get("credits")
+                    account = await crud.get_account(self.db, worker.account_id)
+                    stored_credits = (account or {}).get("credits")
+                    write_credits = credits if credits is not None else stored_credits
                     if info.get("status") == "offline":
                         status = "offline"
                     elif not info.get("extension_connected") or not info.get("flow_key_present"):
                         status = "needs_login"
                     elif credits is not None and credits < self.settings.omni_10s_credit_cost:
                         status = "low_credits"
+                    elif credits is None and account and account.get("status") == "low_credits":
+                        status = "low_credits"
+                    elif credits is None and stored_credits is not None and stored_credits < self.settings.omni_10s_credit_cost:
+                        status = "low_credits"
                     else:
-                        account = await crud.get_account(self.db, worker.account_id)
                         status = "busy" if account and account.get("current_task_id") else "ready"
-                    await crud.upsert_account(self.db, worker, status=status, credits=credits)
+                    await crud.upsert_account(
+                        self.db,
+                        worker,
+                        status=status,
+                        credits=write_credits,
+                        last_error=info.get("credits_error") if credits is None else None,
+                    )
                     if status in {"ready", "busy"} and self.settings.dry_run:
                         recovery_task = await crud.get_waiting_recovery_task_for_account(self.db, worker.account_id)
                         if recovery_task and recovery_task["task_id"] not in self._dry_tasks:

@@ -3,6 +3,9 @@ import hashlib
 import httpx
 
 
+CREDIT_FIELDS = ("credits", "remainingCredits", "subscriptionCredits", "remaining_credits")
+
+
 class WorkerSubmitError(RuntimeError):
     def __init__(self, status_code: int, message: str, response: dict | None = None):
         super().__init__(message)
@@ -28,13 +31,14 @@ class WorkerClient:
             health = (await client.get(f"{worker.api_url}/health")).json()
             info = (await client.get(f"{worker.api_url}/api/worker/info")).json()
             flow_status = (await client.get(f"{worker.api_url}/api/flow/status")).json()
-            credits = (await client.get(f"{worker.api_url}/api/flow/credits")).json()
+            credits_response = await client.get(f"{worker.api_url}/api/flow/credits")
+            credits_info = parse_worker_credits_response(credits_response)
         return {
             "status": health.get("status", "error"),
             "account_id": info.get("account_id"),
             "extension_connected": bool(flow_status.get("connected")),
             "flow_key_present": bool(flow_status.get("flow_key_present")),
-            "credits": int(credits.get("credits", credits.get("remainingCredits", 0)) or 0),
+            **credits_info,
         }
 
     async def submit_omni_video(self, *_args, **_kwargs):
@@ -177,4 +181,56 @@ def _safe_url(url: str) -> dict:
         "host": parsed.netloc,
         "path": parsed.path,
         "query_parameter_names": sorted({key for key, _ in parse_qsl(parsed.query, keep_blank_values=True)}),
+    }
+
+
+def parse_worker_credits_response(response) -> dict:
+    if response.status_code >= 400:
+        return _credits_unavailable(f"credits_http_{response.status_code}")
+    try:
+        payload = response.json()
+    except ValueError:
+        return _credits_unavailable("credits_json_invalid")
+    return parse_worker_credits_payload(payload)
+
+
+def parse_worker_credits_payload(payload) -> dict:
+    if not isinstance(payload, dict):
+        return _credits_unavailable("credits_response_not_object")
+    parsed = []
+    invalid_fields = []
+    for field in CREDIT_FIELDS:
+        if field not in payload:
+            continue
+        value = payload.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            invalid_fields.append(field)
+            continue
+        parsed.append((field, value))
+    present_fields = [field for field in CREDIT_FIELDS if field in payload]
+    if invalid_fields:
+        return _credits_unavailable("credits_invalid", present_fields=present_fields, invalid_fields=invalid_fields)
+    if not parsed:
+        return _credits_unavailable("credits_missing", present_fields=present_fields)
+    values = {value for _, value in parsed}
+    if len(values) > 1:
+        return _credits_unavailable("credits_conflict", present_fields=present_fields)
+    source, credits = parsed[0]
+    return {
+        "credits": credits,
+        "credits_available": True,
+        "credits_source": source,
+        "credits_error": None,
+        "credits_fields_present": present_fields,
+    }
+
+
+def _credits_unavailable(error_code: str, present_fields=None, invalid_fields=None) -> dict:
+    return {
+        "credits": None,
+        "credits_available": False,
+        "credits_source": None,
+        "credits_error": error_code,
+        "credits_fields_present": list(present_fields or []),
+        "credits_invalid_fields": list(invalid_fields or []),
     }

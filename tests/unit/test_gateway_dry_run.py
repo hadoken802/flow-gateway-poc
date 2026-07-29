@@ -21,7 +21,8 @@ class FakeWorkerClient:
             return {"status": "offline", "credits": None, "extension_connected": False, "flow_key_present": False}
         return {
             "status": "ok",
-            "credits": state["credits"],
+            "credits": state.get("credits"),
+            "credits_error": state.get("credits_error"),
             "extension_connected": state.get("extension_connected", True),
             "flow_key_present": state.get("flow_key_present", True),
         }
@@ -164,6 +165,108 @@ async def test_three_workers_are_classified_by_credits(monkeypatch):
     assert accounts["FLOW-001"]["status"] == "low_credits"
     assert accounts["FLOW-002"]["status"] == "ready"
     assert accounts["FLOW-003"]["status"] == "ready"
+    await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_missing_worker_credits_preserve_previous_value_and_status():
+    from gateway.config import GatewaySettings
+
+    FakeWorkerClient.generate_calls = 0
+    settings = GatewaySettings(db_path=local_db("missing_credits_preserve"))
+    states = {"FLOW-001": {"credits": 1050}, "FLOW-002": {"credits": 50}, "FLOW-003": {"credits": 50}}
+    scheduler = make_scheduler(settings, FakeWorkerClient(states))
+    await scheduler.start()
+    states["FLOW-001"] = {"credits": None, "credits_error": "credits_missing"}
+    await scheduler.refresh_workers()
+    accounts = {a["account_id"]: a for a in await scheduler.list_accounts()}
+    assert accounts["FLOW-001"]["credits"] == 1050
+    assert accounts["FLOW-001"]["status"] == "ready"
+    assert accounts["FLOW-001"]["last_error"] == "credits_missing"
+    assert FakeWorkerClient.generate_calls == 0
+    await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_missing_worker_credits_do_not_restore_low_credits_to_ready():
+    from gateway.config import GatewaySettings
+
+    FakeWorkerClient.generate_calls = 0
+    settings = GatewaySettings(db_path=local_db("missing_credits_keep_low"))
+    states = {"FLOW-001": {"credits": 0}, "FLOW-002": {"credits": 50}, "FLOW-003": {"credits": 50}}
+    scheduler = make_scheduler(settings, FakeWorkerClient(states))
+    await scheduler.start()
+    states["FLOW-001"] = {"credits": None, "credits_error": "credits_missing"}
+    await scheduler.refresh_workers()
+    accounts = {a["account_id"]: a for a in await scheduler.list_accounts()}
+    assert accounts["FLOW-001"]["credits"] == 0
+    assert accounts["FLOW-001"]["status"] == "low_credits"
+    assert FakeWorkerClient.generate_calls == 0
+    await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_explicit_zero_worker_credits_updates_low_credits():
+    from gateway.config import GatewaySettings
+
+    FakeWorkerClient.generate_calls = 0
+    settings = GatewaySettings(db_path=local_db("explicit_zero_credits"))
+    states = {"FLOW-001": {"credits": 1050}, "FLOW-002": {"credits": 50}, "FLOW-003": {"credits": 50}}
+    scheduler = make_scheduler(settings, FakeWorkerClient(states))
+    await scheduler.start()
+    states["FLOW-001"] = {"credits": 0}
+    await scheduler.refresh_workers()
+    accounts = {a["account_id"]: a for a in await scheduler.list_accounts()}
+    assert accounts["FLOW-001"]["credits"] == 0
+    assert accounts["FLOW-001"]["status"] == "low_credits"
+    assert FakeWorkerClient.generate_calls == 0
+    await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_worker_credits_update_from_old_cached_value():
+    from gateway.config import GatewaySettings
+
+    FakeWorkerClient.generate_calls = 0
+    settings = GatewaySettings(db_path=local_db("credits_update_from_cache"))
+    states = {"FLOW-001": {"credits": 1050}, "FLOW-002": {"credits": 1050}, "FLOW-003": {"credits": 50}}
+    scheduler = make_scheduler(settings, FakeWorkerClient(states))
+    await scheduler.start()
+    states["FLOW-002"] = {"credits": 1035}
+    await scheduler.refresh_workers()
+    accounts = {a["account_id"]: a for a in await scheduler.list_accounts()}
+    assert accounts["FLOW-002"]["credits"] == 1035
+    assert accounts["FLOW-002"]["status"] == "ready"
+    assert FakeWorkerClient.generate_calls == 0
+    await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_unavailable_worker_credits_do_not_change_binding_or_lease():
+    from gateway.config import GatewaySettings
+
+    FakeWorkerClient.generate_calls = 0
+    settings = GatewaySettings(db_path=local_db("credits_unavailable_keep_lock"))
+    states = {"FLOW-001": {"credits": 1050}, "FLOW-002": {"credits": 50}, "FLOW-003": {"credits": 50}}
+    scheduler = make_scheduler(settings, FakeWorkerClient(states))
+    await scheduler.start()
+    await scheduler.db.execute(
+        """
+        UPDATE flow_accounts
+        SET status='busy', current_task_id='task-held', lock_owner='owner-1',
+            lock_expires_at='2099-01-01T00:00:00Z'
+        WHERE account_id='FLOW-001'
+        """
+    )
+    await scheduler.db.commit()
+    states["FLOW-001"] = {"credits": None, "credits_error": "credits_conflict"}
+    await scheduler.refresh_workers()
+    accounts = {a["account_id"]: a for a in await scheduler.list_accounts()}
+    assert accounts["FLOW-001"]["credits"] == 1050
+    assert accounts["FLOW-001"]["status"] == "busy"
+    assert accounts["FLOW-001"]["current_task_id"] == "task-held"
+    assert accounts["FLOW-001"]["lock_owner"] == "owner-1"
+    assert FakeWorkerClient.generate_calls == 0
     await scheduler.stop()
 
 
