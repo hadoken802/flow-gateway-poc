@@ -73,9 +73,11 @@ class WorkerClient:
         if after:
             params["after"] = after
         if exclude_media_ids:
-            params["exclude_media_ids"] = ",".join(sorted(set(exclude_media_ids)))
+            excluded = sorted({str(item) for item in exclude_media_ids if item})
+            if excluded:
+                params["exclude_media_ids"] = ",".join(excluded)
         async with httpx.AsyncClient(timeout=30.0) as client:
-            return (await client.get(f"{worker.api_url}/api/test/manual-flow-results/{project_id}", params=params)).raise_for_status().json()
+            return (await client.get(f"{worker.api_url}/api/test/omni-video/manual-flow-results/{project_id}", params=params)).raise_for_status().json()
 
     async def download_manual_flow_result(self, worker, media_id):
         async with httpx.AsyncClient(timeout=120.0) as client:

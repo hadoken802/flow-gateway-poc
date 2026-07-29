@@ -9,6 +9,7 @@ from gateway import crud, db as gateway_db
 from gateway import cli
 from gateway import manual_submit_resume
 from gateway.manual_submit_resume import _resume_manual_submit, preflight_manual_submit_resume
+from gateway.worker_client import WorkerClient
 from gateway.worker_provider import WorkerSnapshot, WorkerConfig
 
 
@@ -57,6 +58,29 @@ class FakeClient:
     async def retry_omni_video_download(self, worker, worker_job_id):
         self.retry_calls += 1
         return self.poll.pop(0)
+
+
+class RecordingHttpxClient:
+    last_params = None
+    last_url = None
+
+    def __init__(self, timeout):
+        self.timeout = timeout
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def get(self, url, params=None):
+        RecordingHttpxClient.last_url = url
+        RecordingHttpxClient.last_params = params or {}
+        return SimpleNamespace(
+            raise_for_status=lambda: SimpleNamespace(
+                json=lambda: {"project_id": "project-2", "candidate_count": 0, "candidates": []}
+            )
+        )
 
 
 def args(db_path, task_id="task-2", execute=False, confirm=None, user_confirmed=False):
@@ -133,6 +157,56 @@ async def test_preflight_rejects_candidate_count(tmp_path):
     result = await preflight_manual_submit_resume(db_path, "task-2", FakeClient(candidates=1), Provider())
     assert result["resume_allowed"] is False
     assert "manual_flow_results_found" in result["reasons"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "candidates",
+    [
+        {"candidate_count": 0, "candidates": []},
+        {"candidate_count": 1, "candidates": [{"media_id": "media-1", "project_id": "project-2", "url": None, "created_at": None, "updated_at": None}]},
+        {"candidate_count": 2, "candidates": [{"media_id": None, "project_id": None}, {"media_id": "media-2", "updated_at": "bad-time"}]},
+    ],
+)
+async def test_preflight_handles_manual_flow_result_shapes_without_type_error(tmp_path, candidates):
+    class CandidateClient(FakeClient):
+        async def list_manual_flow_results(self, worker, project_id, after=None, exclude_media_ids=None):
+            return candidates
+
+    db_path = tmp_path / "gateway.db"
+    await seed(db_path)
+    result = await preflight_manual_submit_resume(db_path, "task-2", CandidateClient(), Provider())
+    assert result["reason_code"] in {None, "manual_flow_results_found"}
+
+
+@pytest.mark.asyncio
+async def test_worker_client_ignores_null_exclude_media_ids(monkeypatch):
+    import gateway.worker_client as worker_client
+
+    monkeypatch.setattr(worker_client.httpx, "AsyncClient", RecordingHttpxClient)
+    client = WorkerClient()
+    result = await client.list_manual_flow_results(
+        SimpleNamespace(api_url="http://worker"),
+        "project-2",
+        exclude_media_ids={"media-2", None, "media-1", ""},
+    )
+    assert result["candidate_count"] == 0
+    assert RecordingHttpxClient.last_url == "http://worker/api/test/omni-video/manual-flow-results/project-2"
+    assert RecordingHttpxClient.last_params == {"exclude_media_ids": "media-1,media-2"}
+
+
+@pytest.mark.asyncio
+async def test_worker_client_omits_exclude_param_when_all_media_ids_null(monkeypatch):
+    import gateway.worker_client as worker_client
+
+    monkeypatch.setattr(worker_client.httpx, "AsyncClient", RecordingHttpxClient)
+    client = WorkerClient()
+    await client.list_manual_flow_results(
+        SimpleNamespace(api_url="http://worker"),
+        "project-2",
+        exclude_media_ids={None, ""},
+    )
+    assert RecordingHttpxClient.last_params == {}
 
 
 @pytest.mark.asyncio
