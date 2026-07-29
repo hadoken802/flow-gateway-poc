@@ -10,7 +10,7 @@ from pathlib import Path
 
 import aiohttp
 from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
 from agent.config import OUTPUT_DIR
@@ -29,6 +29,7 @@ from agent.services.omni_client import (
 )
 from agent.services.remote_status_query import query_bound_remote_status_once
 from agent.services.remote_media_capability import query_download_capability_once
+from agent.services.reconciled_encoded_video_fetch import fetch_reconciled_encoded_video_once
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/test/omni-video", tags=["omni-test"])
@@ -89,6 +90,16 @@ class OmniVideoResumeRequest(BaseModel):
 class BoundRemoteStatusQueryRequest(BaseModel):
     project_id: str
     output_media_id: str
+
+
+class ReconciledEncodedVideoFetchRequest(BaseModel):
+    project_id: str
+    output_media_id: str
+    workflow_id: str
+    upstream_batch_id: str
+    expected_capability_result_sha256: str
+    expected_encoded_video_length: int
+    expected_encoded_video_sha256: str
 
 
 @router.post("")
@@ -292,6 +303,31 @@ async def query_omni_video_download_capability_once(job_id: str, body: BoundRemo
         client=get_flow_client(),
         media_id=body.output_media_id,
     )
+
+
+@router.post("/{job_id}/fetch-reconciled-encoded-video-once")
+async def fetch_omni_video_reconciled_encoded_video_once(job_id: str, body: ReconciledEncodedVideoFetchRequest):
+    job = await crud.get_omni_test_job(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    if job.get("status") != "remote_reconciled_completed_download_unverified":
+        raise HTTPException(409, "Job is not a reconciled completed download-unverified result")
+    for field in ("project_id", "output_media_id", "workflow_id", "upstream_batch_id"):
+        if job.get(field) != getattr(body, field):
+            raise HTTPException(409, f"{field} mismatch")
+    if job.get("video_path") or job.get("completed_at"):
+        raise HTTPException(409, "Job already has local completion fields")
+    result = await fetch_reconciled_encoded_video_once(
+        client=get_flow_client(),
+        media_id=body.output_media_id,
+        expected_encoded_video_length=body.expected_encoded_video_length,
+        expected_encoded_video_sha256=body.expected_encoded_video_sha256,
+    )
+    if not result.ok:
+        return JSONResponse(status_code=409, content=result.manifest, headers=result.headers)
+    headers = dict(result.headers)
+    headers["X-Capability-Result-Sha256"] = body.expected_capability_result_sha256
+    return Response(content=result.video_bytes, media_type="video/mp4", headers=headers)
 
 
 async def _submit_existing_input_media(

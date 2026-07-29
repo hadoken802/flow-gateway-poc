@@ -78,6 +78,20 @@ class WorkerClient:
         async with httpx.AsyncClient(timeout=60.0) as client:
             return (await client.post(f"{worker.api_url}/api/test/omni-video/{worker_job_id}/query-download-capability-once", json=payload)).raise_for_status().json()
 
+    async def fetch_reconciled_encoded_video_once(self, worker, worker_job_id, payload):
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(
+                f"{worker.api_url}/api/test/omni-video/{worker_job_id}/fetch-reconciled-encoded-video-once",
+                json=payload,
+            )
+        if response.status_code >= 400:
+            try:
+                data = response.json()
+            except ValueError:
+                data = {"error_code": "worker_http_error", "error_message_sanitized": response.text[:300]}
+            raise WorkerSubmitError(response.status_code, f"Worker encoded video fetch failed: HTTP {response.status_code}", data if isinstance(data, dict) else None)
+        return {"content": response.content, "headers": dict(response.headers), "status_code": response.status_code}
+
     async def list_manual_flow_results(self, worker, project_id, after=None, exclude_media_ids=None):
         params = {}
         if after:

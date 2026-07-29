@@ -151,6 +151,30 @@ def main(argv: list[str] | None = None) -> int:
     media_cap.add_argument("--confirm-poll-result-sha256")
     media_cap.add_argument("--allow-real-media-query", action="store_true")
     media_cap.add_argument("--result-file")
+    download_remote = subparsers.add_parser("download-reconciled-remote-result")
+    download_remote.add_argument("--task-id", required=True)
+    download_remote.add_argument("--poll-result-file", required=True)
+    download_remote.add_argument("--capability-result-file", required=True)
+    download_remote.add_argument("--gateway-db", required=True)
+    download_remote.add_argument("--agent-db", required=True)
+    download_remote.add_argument("--worker-base-url", required=True)
+    download_remote.add_argument("--output-path", required=True)
+    download_remote.add_argument("--execute", action="store_true")
+    download_remote.add_argument("--confirm-task-id")
+    download_remote.add_argument("--confirm-project-id")
+    download_remote.add_argument("--confirm-account-id")
+    download_remote.add_argument("--confirm-job-id")
+    download_remote.add_argument("--confirm-output-media-id")
+    download_remote.add_argument("--confirm-generation-attempt", type=int)
+    download_remote.add_argument("--confirm-lock-version", type=int)
+    download_remote.add_argument("--confirm-lease-version", type=int)
+    download_remote.add_argument("--confirm-poll-result-sha256")
+    download_remote.add_argument("--confirm-capability-result-sha256")
+    download_remote.add_argument("--confirm-encoded-video-length", type=int)
+    download_remote.add_argument("--confirm-encoded-video-sha256")
+    download_remote.add_argument("--confirm-output-path")
+    download_remote.add_argument("--allow-real-download", action="store_true")
+    download_remote.add_argument("--result-manifest")
     args = parser.parse_args(argv)
 
     if args.command == "run-video-once":
@@ -216,6 +240,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "query-reconciled-download-capability-once":
         from .reconciled_download_capability_query import query_reconciled_download_capability_once
         result = query_reconciled_download_capability_once(args)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0 if result.get("ok") else 1
+    if args.command == "download-reconciled-remote-result":
+        from .reconciled_remote_download import download_reconciled_remote_result
+        result = download_reconciled_remote_result(args)
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0 if result.get("ok") else 1
     return 2
