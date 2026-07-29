@@ -179,7 +179,16 @@ CREATE TABLE IF NOT EXISTS omni_test_jobs (
     submitted_at      TEXT,
     created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     updated_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-    completed_at      TEXT
+    completed_at      TEXT,
+    gateway_task_id   TEXT,
+    generation_attempt INTEGER,
+    source_worker_job_id TEXT,
+    resume_attempt_id TEXT,
+    request_batch_id TEXT,
+    extension_request_id TEXT,
+    submit_started_at TEXT,
+    remote_http_status INTEGER,
+    remote_submission_state TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_omni_test_jobs_status ON omni_test_jobs(status);
@@ -227,9 +236,28 @@ async def init_db():
         if "idempotency_key" not in omni_columns:
             await db.execute("ALTER TABLE omni_test_jobs ADD COLUMN idempotency_key TEXT")
             logger.info("Migrated: added idempotency_key column to omni_test_jobs")
+        omni_additions = {
+            "gateway_task_id": "TEXT",
+            "generation_attempt": "INTEGER",
+            "source_worker_job_id": "TEXT",
+            "resume_attempt_id": "TEXT",
+            "request_batch_id": "TEXT",
+            "extension_request_id": "TEXT",
+            "submit_started_at": "TEXT",
+            "remote_http_status": "INTEGER",
+            "remote_submission_state": "TEXT",
+        }
+        for name, ddl in omni_additions.items():
+            if name not in omni_columns:
+                await db.execute(f"ALTER TABLE omni_test_jobs ADD COLUMN {name} {ddl}")
+                logger.info("Migrated: added %s column to omni_test_jobs", name)
         await db.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_omni_test_jobs_idempotency "
             "ON omni_test_jobs(idempotency_key) WHERE idempotency_key IS NOT NULL"
+        )
+        await db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_omni_test_jobs_resume_attempt "
+            "ON omni_test_jobs(resume_attempt_id) WHERE resume_attempt_id IS NOT NULL"
         )
         # Migration: add queue columns to request table
         cursor = await db.execute("PRAGMA table_info(request)")

@@ -326,7 +326,7 @@ class FlowClient:
                 "Video reviewer uses get_media fallback automatically. "
                 "For URL refresh, open the project in Google Flow in Chrome."}
 
-    async def _send(self, method: str, params: dict, timeout: float = 300) -> dict:
+    async def _send(self, method: str, params: dict, timeout: float = 300, request_id: str | None = None) -> dict:
         """Send request to extension and wait for response.
 
         Always returns a dict. On error, returns {"error": "<reason>"} — callers
@@ -338,7 +338,7 @@ class FlowClient:
         if not self._extension_registered:
             return {"error": "Extension not registered"}
 
-        req_id = str(uuid.uuid4())
+        req_id = request_id or str(uuid.uuid4())
         future = asyncio.get_running_loop().create_future()
         self._pending[req_id] = future
 

@@ -1,6 +1,7 @@
 """Async CRUD operations with column whitelisting."""
 import json
 import logging
+import sqlite3
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -34,8 +35,15 @@ _COLUMNS = {
     "omni_test_jobs": {"project_id", "input_media_id", "output_media_id", "workflow_id", "operation_name",
                        "upstream_batch_id", "status", "remaining_credits", "prompt", "image_path",
                        "video_path", "error_code", "error_message", "raw_response_shape", "submitted_at",
-                       "updated_at", "completed_at"},
+                       "updated_at", "completed_at", "gateway_task_id", "generation_attempt",
+                       "source_worker_job_id", "resume_attempt_id", "request_batch_id",
+                       "extension_request_id", "submit_started_at", "remote_http_status",
+                       "remote_submission_state"},
 }
+
+
+class RowNotUpdatedError(RuntimeError):
+    """Raised when a critical update did not affect its target row."""
 
 
 def _now() -> str:
@@ -65,6 +73,30 @@ async def _update(table: str, pk: str, pk_val: str, **kwargs) -> Optional[dict]:
         await db.execute(f"UPDATE {table} SET {sets} WHERE {pk}=?", vals)
         await db.commit()
     return await _get_with_db(db, table, pk, pk_val)
+
+
+async def _update_required(table: str, pk: str, pk_val: str, **kwargs) -> dict:
+    _validate_table(table)
+    kwargs = _safe_kwargs(table, kwargs)
+    if not kwargs:
+        row = await _get(table, pk, pk_val)
+        if not row:
+            raise RowNotUpdatedError(f"{table}.{pk}={pk_val} not found")
+        return row
+    kwargs["updated_at"] = _now()
+    sets = ", ".join(f"{k}=?" for k in kwargs)
+    vals = list(kwargs.values()) + [pk_val]
+    db = await get_db()
+    async with _db_lock:
+        cur = await db.execute(f"UPDATE {table} SET {sets} WHERE {pk}=?", vals)
+        if cur.rowcount != 1:
+            await db.rollback()
+            raise RowNotUpdatedError(f"{table}.{pk}={pk_val} update affected {cur.rowcount} rows")
+        await db.commit()
+    row = await _get_with_db(db, table, pk, pk_val)
+    if not row:
+        raise RowNotUpdatedError(f"{table}.{pk}={pk_val} disappeared after update")
+    return row
 
 
 async def _get(table: str, pk: str, pk_val: str) -> Optional[dict]:
@@ -353,21 +385,41 @@ async def get_omni_test_job_by_idempotency_key(idempotency_key: str):
     return dict(row) if row else None
 
 
-async def create_omni_test_job(job_id: str, project_id: str, prompt: str, image_path: str, idempotency_key: str = None) -> dict:
+async def create_omni_test_job(job_id: str, project_id: str, prompt: str, image_path: str, idempotency_key: str = None, **fields) -> dict:
     db = await get_db()
     now = _now()
+    safe_fields = _safe_kwargs("omni_test_jobs", fields)
+    columns = ["job_id", "idempotency_key", "project_id", "prompt", "image_path", "status", "created_at", "updated_at"]
+    values = [job_id, idempotency_key, project_id, prompt, image_path, safe_fields.pop("status", "queued"), now, now]
+    for key, value in safe_fields.items():
+        columns.append(key)
+        values.append(value)
+    placeholders = ",".join("?" for _ in columns)
     async with _db_lock:
-        await db.execute(
-            """INSERT OR IGNORE INTO omni_test_jobs
-               (job_id,idempotency_key,project_id,prompt,image_path,status,created_at,updated_at)
-               VALUES (?,?,?,?,?,?,?,?)""",
-            (job_id, idempotency_key, project_id, prompt, image_path, "queued", now, now))
-        await db.commit()
-    if idempotency_key:
-        existing = await get_omni_test_job_by_idempotency_key(idempotency_key)
-        if existing:
-            return existing
-    return await _get_with_db(db, "omni_test_jobs", "job_id", job_id)
+        try:
+            cur = await db.execute(
+                f"INSERT INTO omni_test_jobs ({','.join(columns)}) VALUES ({placeholders})",
+                tuple(values),
+            )
+            await db.commit()
+        except sqlite3.IntegrityError:
+            await db.rollback()
+            if not idempotency_key:
+                raise
+            existing = await get_omni_test_job_by_idempotency_key(idempotency_key)
+            if existing:
+                existing["created"] = False
+                existing["reused"] = True
+                existing["conflict_reason"] = "idempotency_key_exists"
+                return existing
+            raise
+    row = await _get_with_db(db, "omni_test_jobs", "job_id", job_id)
+    if not row:
+        raise RowNotUpdatedError(f"omni_test_jobs.job_id={job_id} was not created")
+    row["created"] = True
+    row["reused"] = False
+    row["conflict_reason"] = None
+    return row
 
 
 async def get_omni_test_job(job_id: str):
@@ -376,6 +428,10 @@ async def get_omni_test_job(job_id: str):
 
 async def update_omni_test_job(job_id: str, **kw):
     return await _update("omni_test_jobs", "job_id", job_id, **kw)
+
+
+async def update_omni_test_job_required(job_id: str, **kw):
+    return await _update_required("omni_test_jobs", "job_id", job_id, **kw)
 
 
 async def list_omni_test_jobs(statuses: list[str] = None) -> list[dict]:

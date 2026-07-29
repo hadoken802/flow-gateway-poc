@@ -66,6 +66,12 @@ CREATE TABLE IF NOT EXISTS flow_tasks (
     manual_result_media_id TEXT,
     manual_result_operation_id TEXT,
     manual_result_source TEXT,
+    resume_attempt_id TEXT,
+    request_batch_id TEXT,
+    extension_request_id TEXT,
+    remote_http_status INTEGER,
+    remote_submission_state TEXT,
+    remote_result_query_state TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     assigned_at TEXT,
     submitted_at TEXT,
@@ -135,6 +141,12 @@ async def _migrate(db):
         "last_error_message": "TEXT",
         "next_retry_at": "TEXT",
         "run_dir": "TEXT",
+        "resume_attempt_id": "TEXT",
+        "request_batch_id": "TEXT",
+        "extension_request_id": "TEXT",
+        "remote_http_status": "INTEGER",
+        "remote_submission_state": "TEXT",
+        "remote_result_query_state": "TEXT",
     }
     for name, ddl in additions.items():
         if name not in columns:

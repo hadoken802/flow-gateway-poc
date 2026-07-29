@@ -10,6 +10,7 @@ from pathlib import Path
 
 import aiohttp
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from agent.config import OUTPUT_DIR
@@ -75,6 +76,12 @@ class OmniVideoResumeRequest(BaseModel):
     prompt: str
     duration: int
     aspect_ratio: str
+    gateway_task_id: str | None = None
+    generation_attempt: int | None = None
+    source_worker_job_id: str | None = None
+    resume_attempt_id: str | None = None
+    request_batch_id: str | None = None
+    extension_request_id: str | None = None
 
 
 @router.post("")
@@ -114,9 +121,13 @@ async def submit_omni_video(body: OmniVideoRequest):
     if not input_media_id:
         raise HTTPException(502, "Upload succeeded but mediaId was not returned")
 
-    job_id = str(uuid.uuid4())
-    await crud.create_omni_test_job(job_id, body.project_id, body.prompt, str(image_path), body.idempotency_key)
-    await crud.update_omni_test_job(job_id, input_media_id=input_media_id, status="queued")
+    job = await crud.create_omni_test_job(str(uuid.uuid4()), body.project_id, body.prompt, str(image_path), body.idempotency_key)
+    job_id = job["job_id"]
+    if job.get("reused"):
+        response = _public_job(job)
+        response["reused"] = True
+        return response
+    await crud.update_omni_test_job_required(job_id, input_media_id=input_media_id, status="queued")
 
     omni = OmniClient(client)
     result = await omni.submit_reference_video(
@@ -173,10 +184,60 @@ async def resume_omni_video(body: OmniVideoResumeRequest):
     if client._flow_key is None:
         raise HTTPException(503, "Flow key not present")
 
-    job_id = str(uuid.uuid4())
-    await crud.create_omni_test_job(job_id, body.project_id, body.prompt, body.image_path, body.idempotency_key)
-    await crud.update_omni_test_job(job_id, input_media_id=body.input_media_id, status="queued")
-    response = await _submit_existing_input_media(job_id, body.project_id, body.input_media_id, body.prompt)
+    request_batch_id = body.request_batch_id or str(uuid.uuid4())
+    extension_request_id = body.extension_request_id or str(uuid.uuid4())
+    resume_attempt_id = body.resume_attempt_id or body.idempotency_key
+    try:
+        job = await crud.create_omni_test_job(
+            str(uuid.uuid4()),
+            body.project_id,
+            body.prompt,
+            body.image_path,
+            body.idempotency_key,
+            input_media_id=body.input_media_id,
+            status="submit_in_progress",
+            gateway_task_id=body.gateway_task_id,
+            generation_attempt=body.generation_attempt,
+            source_worker_job_id=body.source_worker_job_id,
+            resume_attempt_id=resume_attempt_id,
+            request_batch_id=request_batch_id,
+            upstream_batch_id=request_batch_id,
+            extension_request_id=extension_request_id,
+            submit_started_at=crud._now(),
+            remote_submission_state="not_started",
+        )
+    except Exception as exc:
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error_code": type(exc).__name__,
+                "error_message": str(exc)[:500],
+                "remote_submission_state": "not_started",
+                "resume_attempt_id": resume_attempt_id,
+                "request_batch_id": request_batch_id,
+                "extension_request_id": extension_request_id,
+            },
+        )
+    job_id = job["job_id"]
+    if job.get("reused"):
+        response = _public_job(job)
+        response["reused"] = True
+        response["resume_submit"] = True
+        if job.get("status") in {"queued", "submit_in_progress"}:
+            response["remote_submission_state"] = job.get("remote_submission_state") or "unknown_or_in_progress"
+        return response
+    response = await _submit_existing_input_media(
+        job_id,
+        body.project_id,
+        body.input_media_id,
+        body.prompt,
+        request_batch_id=request_batch_id,
+        extension_request_id=extension_request_id,
+    )
+    if response.get("remote_submission_state") == "accepted_persist_failed":
+        response["reused"] = False
+        response["resume_submit"] = True
+        return JSONResponse(status_code=500, content=response)
     response["reused"] = False
     response["resume_submit"] = True
     return response
@@ -190,36 +251,70 @@ async def get_omni_video(job_id: str):
     return _public_job(job)
 
 
-async def _submit_existing_input_media(job_id: str, project_id: str, input_media_id: str, prompt: str) -> dict:
+async def _submit_existing_input_media(
+    job_id: str,
+    project_id: str,
+    input_media_id: str,
+    prompt: str,
+    request_batch_id: str | None = None,
+    extension_request_id: str | None = None,
+) -> dict:
     omni = OmniClient(get_flow_client())
     result = await omni.submit_reference_video(
         project_id=project_id,
         reference_media_ids=[input_media_id],
         prompt=prompt,
         user_paygate_tier="PAYGATE_TIER_NOT_PAID",
+        batch_id=request_batch_id,
+        extension_request_id=extension_request_id,
     )
+    remote_http_status = result.get("status") if isinstance(result.get("status"), int) else None
     if result.get("error") or (isinstance(result.get("status"), int) and result["status"] >= 400):
-        job = await crud.update_omni_test_job(
+        job = await crud.update_omni_test_job_required(
             job_id,
             status="failed",
             error_code=str(result.get("status") or "submit_error"),
             error_message=str(result.get("error") or result.get("data") or "Submit failed"),
             raw_response_shape=json.dumps(response_shape(unwrap_response(result))),
+            remote_http_status=remote_http_status,
+            remote_submission_state="rejected",
         )
         return _public_job(job)
 
     data = unwrap_response(result)
     fields = extract_submit_fields(data)
     status = fields.pop("upstream_status", None)
-    await crud.update_omni_test_job(
-        job_id,
-        **fields,
-        status=_initial_status(status),
-        submitted_at=crud._now(),
-        raw_response_shape=json.dumps(response_shape(data)),
-    )
+    try:
+        job = await crud.update_omni_test_job_required(
+            job_id,
+            **fields,
+            status=_initial_status(status),
+            submitted_at=crud._now(),
+            raw_response_shape=json.dumps(response_shape(data)),
+            remote_http_status=remote_http_status,
+            remote_submission_state="accepted",
+        )
+    except crud.RowNotUpdatedError as exc:
+        extracted = dict(fields)
+        return {
+            "job_id": job_id,
+            "project_id": project_id,
+            "input_media_id": input_media_id,
+            "output_media_id": extracted.get("output_media_id"),
+            "workflow_id": extracted.get("workflow_id"),
+            "operation_name": extracted.get("operation_name"),
+            "upstream_batch_id": extracted.get("upstream_batch_id") or request_batch_id,
+            "request_batch_id": request_batch_id,
+            "extension_request_id": extension_request_id,
+            "remote_http_status": remote_http_status,
+            "remote_submission_state": "accepted_persist_failed",
+            "error_code": "accepted_persist_failed",
+            "error_message": str(exc)[:500],
+            "raw_response_shape": response_shape(data),
+        }
+    if not job:
+        raise RuntimeError(f"Job {job_id} missing after submit persistence")
     _ensure_polling(job_id)
-    job = await crud.get_omni_test_job(job_id)
     logger.info(
         "Omni resume submitted job=%s project=%s input=%s output=%s status=%s remaining=%s",
         job_id, project_id[:8], input_media_id[:8],
@@ -620,6 +715,8 @@ def _public_job(job: dict) -> dict:
         "job_id", "idempotency_key", "project_id", "input_media_id", "output_media_id", "workflow_id",
         "operation_name", "upstream_batch_id", "status", "remaining_credits",
         "image_path", "video_path", "error_code", "error_message", "submitted_at",
-        "updated_at", "completed_at",
+        "updated_at", "completed_at", "gateway_task_id", "generation_attempt",
+        "source_worker_job_id", "resume_attempt_id", "request_batch_id",
+        "extension_request_id", "remote_http_status", "remote_submission_state",
     ]
     return {key: job.get(key) for key in keys}

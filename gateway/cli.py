@@ -70,6 +70,15 @@ def main(argv: list[str] | None = None) -> int:
     resume.add_argument("--execute", action="store_true")
     resume.add_argument("--confirm-task-id")
     resume.add_argument("--user-confirmed-verification-cleared", action="store_true")
+    reconcile_unknown = subparsers.add_parser("reconcile-submission-unknown")
+    reconcile_unknown.add_argument("--task-id", required=True)
+    reconcile_unknown.add_argument("--gateway-db", required=True)
+    resolve_unknown = subparsers.add_parser("resolve-submission-unknown")
+    resolve_unknown.add_argument("--task-id", required=True)
+    resolve_unknown.add_argument("--resolution", required=True, choices=["confirmed-rejected", "confirmed-not-started"])
+    resolve_unknown.add_argument("--gateway-db", required=True)
+    resolve_unknown.add_argument("--execute", action="store_true")
+    resolve_unknown.add_argument("--confirm-task-id")
     args = parser.parse_args(argv)
 
     if args.command == "run-video-once":
@@ -100,6 +109,16 @@ def main(argv: list[str] | None = None) -> int:
         if not args.execute:
             args.preflight_only = True
         result = resume_manual_submit(args)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0 if result.get("ok") else 1
+    if args.command == "reconcile-submission-unknown":
+        from .submission_reconcile import reconcile_submission_unknown
+        result = reconcile_submission_unknown(args)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0 if result.get("ok") else 1
+    if args.command == "resolve-submission-unknown":
+        from .submission_reconcile import resolve_submission_unknown
+        result = resolve_submission_unknown(args)
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0 if result.get("ok") else 1
     return 2

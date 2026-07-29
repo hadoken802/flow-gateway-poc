@@ -26,11 +26,13 @@ class OmniClient:
         reference_media_ids: list[str],
         prompt: str,
         user_paygate_tier: str = "PAYGATE_TIER_NOT_PAID",
+        batch_id: str | None = None,
+        extension_request_id: str | None = None,
     ) -> dict:
         if not reference_media_ids:
             return {"error": "reference_media_ids is required"}
 
-        batch_id = str(uuid.uuid4())
+        batch_id = batch_id or str(uuid.uuid4())
         ts = int(time.time() * 1000)
         body = {
             "clientContext": {
@@ -68,7 +70,7 @@ class OmniClient:
             "headers": random_headers(),
             "body": body,
             "captchaAction": "VIDEO_GENERATION",
-        }, timeout=60)
+        }, timeout=60, request_id=extension_request_id)
 
     async def check_status(self, project_id: str, media_name: str) -> dict:
         url = f"{GOOGLE_FLOW_API}/v1/video:batchCheckAsyncVideoGenerationStatus?key={GOOGLE_API_KEY}"

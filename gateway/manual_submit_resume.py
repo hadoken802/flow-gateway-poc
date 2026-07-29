@@ -11,7 +11,7 @@ from typing import Any
 from . import crud, db as gateway_db
 from .config import GatewaySettings
 from .scheduler import _map_worker_status, _requires_manual_submit, _valid_local_mp4
-from .worker_client import WorkerClient
+from .worker_client import WorkerClient, WorkerSubmitError
 from .worker_provider import RuntimeRegistryWorkerProvider
 
 
@@ -129,7 +129,8 @@ async def preflight_manual_submit_resume(db_path: Path, task_id: str, client: Wo
             "account": _account_summary(account),
             "worker_info": worker_info,
             "worker_job": _job_summary(job),
-            "manual_flow_results": {"candidate_count": candidates.get("candidate_count"), "error": candidates.get("error")},
+            "local_manual_candidates": {"candidate_count": candidates.get("candidate_count"), "error": candidates.get("error"), "source": "agent_local_request_table"},
+            "manual_flow_results": {"candidate_count": candidates.get("candidate_count"), "error": candidates.get("error"), "source": "agent_local_request_table"},
             "active_conflicts": active_conflicts,
             "page_check": page_check,
             "legacy_db": False,
@@ -164,17 +165,62 @@ async def _execute_resume(db_path: Path, task_id: str, client: WorkerClient, pro
             base_result.update({"ok": False, "error_code": UNKNOWN_REMOTE_CODE, "remote_evidence": before_submit})
             return base_result
 
+        generation_attempt = int(acquired.get("generation_attempts") or 0)
+        agent_idempotency_key = f"storyboard:{task_id}:attempt:{generation_attempt}"
+        resume_attempt_id = f"resume:{task_id}:attempt:{generation_attempt}"
+        request_batch_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{resume_attempt_id}:batch"))
+        extension_request_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{resume_attempt_id}:extension"))
+        identity_saved = await crud.guarded_update_task(
+            db,
+            task_id,
+            token["lease_owner"],
+            token["lease_version"],
+            resume_attempt_id=resume_attempt_id,
+            request_batch_id=request_batch_id,
+            extension_request_id=extension_request_id,
+            upstream_batch_id=request_batch_id,
+            remote_submission_state="not_started",
+        )
+        if not identity_saved:
+            base_result.update({"ok": False, "error_code": "fencing_lost"})
+            return base_result
         payload = {
-            "idempotency_key": acquired["idempotency_key"],
+            "idempotency_key": agent_idempotency_key,
             "project_id": acquired["project_id"],
             "input_media_id": before_submit["worker_job"]["input_media_id"],
             "image_path": acquired["image_path"],
             "prompt": acquired["prompt"],
             "duration": acquired["duration"],
             "aspect_ratio": acquired["aspect_ratio"],
+            "gateway_task_id": task_id,
+            "generation_attempt": generation_attempt,
+            "source_worker_job_id": acquired.get("worker_job_id"),
+            "resume_attempt_id": resume_attempt_id,
+            "request_batch_id": request_batch_id,
+            "extension_request_id": extension_request_id,
         }
         try:
             submit_result = await client.resume_omni_video(worker, payload)
+        except WorkerSubmitError as exc:
+            fields = _structured_worker_error_fields(exc.response)
+            status = "submission_unknown"
+            if fields.get("remote_submission_state") == "not_started":
+                status = "manual_submit_required"
+            worker_error_code = fields.pop("error_code", None)
+            await crud.guarded_update_task(
+                db,
+                task_id,
+                token["lease_owner"],
+                token["lease_version"],
+                status,
+                error_code=worker_error_code or type(exc).__name__[:120],
+                error_message=str(exc)[:500],
+                last_error_code=worker_error_code or type(exc).__name__[:120],
+                last_error_message=str(exc.response or exc)[:500],
+                **fields,
+            )
+            base_result.update({"ok": False, "error_code": status, "error_message": str(exc)[:500], "worker_error": fields})
+            return base_result
         except Exception as exc:
             await crud.guarded_update_task(db, task_id, token["lease_owner"], token["lease_version"], "submission_unknown", error_code=type(exc).__name__[:120], error_message=str(exc)[:500], last_error_code=type(exc).__name__[:120], last_error_message=str(exc)[:500])
             base_result.update({"ok": False, "error_code": "submission_unknown", "error_message": str(exc)[:500]})
@@ -188,7 +234,22 @@ async def _execute_resume(db_path: Path, task_id: str, client: WorkerClient, pro
             await crud.guarded_update_task(db, task_id, token["lease_owner"], token["lease_version"], "submission_unknown", error_code="missing_worker_job_id", error_message=str(submit_result)[:500], last_error_code="missing_worker_job_id", last_error_message=str(submit_result)[:500])
             base_result.update({"ok": False, "error_code": "missing_worker_job_id", "submit_call_count": 1})
             return base_result
-        await crud.guarded_update_task(db, task_id, token["lease_owner"], token["lease_version"], "submitted", worker_job_id=worker_job_id, output_media_id=submit_result.get("output_media_id"), workflow_id=submit_result.get("workflow_id"), operation_name=submit_result.get("operation_name"), upstream_batch_id=submit_result.get("upstream_batch_id"), submission_confirmed_at=crud.utc_now(), remaining_credits=submit_result.get("remaining_credits"))
+        await crud.guarded_update_task(
+            db,
+            task_id,
+            token["lease_owner"],
+            token["lease_version"],
+            "submitted",
+            worker_job_id=worker_job_id,
+            output_media_id=submit_result.get("output_media_id"),
+            workflow_id=submit_result.get("workflow_id"),
+            operation_name=submit_result.get("operation_name"),
+            upstream_batch_id=submit_result.get("upstream_batch_id") or request_batch_id,
+            submission_confirmed_at=crud.utc_now(),
+            remaining_credits=submit_result.get("remaining_credits"),
+            remote_http_status=submit_result.get("remote_http_status"),
+            remote_submission_state=submit_result.get("remote_submission_state") or "accepted",
+        )
         final = await _poll_download_complete(db, task_id, account_id, worker, client, token, lock_version)
         base_result.update(final)
         base_result["submit_call_count"] = 1
@@ -298,5 +359,30 @@ def _account_summary(account: dict) -> dict:
 
 
 def _job_summary(job: dict) -> dict:
-    keys = ["job_id", "project_id", "input_media_id", "output_media_id", "workflow_id", "operation_name", "upstream_batch_id", "status", "error_code", "submitted_at", "video_path"]
+    keys = ["job_id", "project_id", "input_media_id", "output_media_id", "workflow_id", "operation_name", "upstream_batch_id", "status", "error_code", "submitted_at", "video_path", "resume_attempt_id", "request_batch_id", "extension_request_id", "remote_http_status", "remote_submission_state"]
     return {key: job.get(key) for key in keys}
+
+
+def _structured_worker_error_fields(response: dict | None) -> dict[str, Any]:
+    if not isinstance(response, dict):
+        return {}
+    allowed = {
+        "job_id": "worker_job_id",
+        "worker_job_id": "worker_job_id",
+        "resume_attempt_id": "resume_attempt_id",
+        "extension_request_id": "extension_request_id",
+        "request_batch_id": "request_batch_id",
+        "upstream_batch_id": "upstream_batch_id",
+        "remote_http_status": "remote_http_status",
+        "remote_submission_state": "remote_submission_state",
+        "output_media_id": "output_media_id",
+        "workflow_id": "workflow_id",
+        "operation_name": "operation_name",
+        "error_code": "error_code",
+    }
+    fields: dict[str, Any] = {}
+    for source, target in allowed.items():
+        value = response.get(source)
+        if value is not None:
+            fields[target] = value
+    return fields

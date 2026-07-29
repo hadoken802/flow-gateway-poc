@@ -9,6 +9,7 @@ from gateway import crud, db as gateway_db
 from gateway import cli
 from gateway import manual_submit_resume
 from gateway.manual_submit_resume import _resume_manual_submit, preflight_manual_submit_resume
+from gateway.submission_reconcile import _reconcile_submission_unknown, _resolve_submission_unknown
 from gateway.worker_client import WorkerClient
 from gateway.worker_provider import WorkerSnapshot, WorkerConfig
 
@@ -36,6 +37,7 @@ class FakeClient:
         self.submit_calls = 0
         self.retry_calls = 0
         self.submitted_job_id = None
+        self.payloads = []
 
     async def inspect(self, worker):
         return {"status": "ok", "extension_connected": True, "flow_key_present": True}
@@ -50,6 +52,7 @@ class FakeClient:
 
     async def resume_omni_video(self, worker, payload):
         self.submit_calls += 1
+        self.payloads.append(payload)
         self.submitted_job_id = self.submit_result.get("job_id") or self.submit_result.get("worker_job_id")
         assert payload["input_media_id"] == "input-2"
         assert payload["project_id"] == "project-2"
@@ -94,6 +97,14 @@ def args(db_path, task_id="task-2", execute=False, confirm=None, user_confirmed=
     )
 
 
+def reconcile_args(db_path, task_id="task-2"):
+    return argparse.Namespace(task_id=task_id, gateway_db=str(db_path))
+
+
+def resolve_args(db_path, resolution="confirmed-not-started", execute=False, confirm=None):
+    return argparse.Namespace(task_id="task-2", gateway_db=str(db_path), resolution=resolution, execute=execute, confirm_task_id=confirm)
+
+
 async def seed(db_path, *, status="manual_submit_required", error_code="UPSTREAM_UNUSUAL_ACTIVITY", operation_name=None, video_path=None, current_task_id="task-2", project_id="project-2", prompt="prompt"):
     db = await gateway_db.connect(db_path)
     await db.execute(
@@ -115,6 +126,18 @@ async def seed(db_path, *, status="manual_submit_required", error_code="UPSTREAM
         (project_id, prompt, status, operation_name, error_code, video_path),
     )
     await db.commit()
+    await db.close()
+
+
+async def mark_unknown(db_path, *, remote_submission_state=None):
+    db = await gateway_db.connect(db_path)
+    await crud.update_task_status(
+        db,
+        "task-2",
+        "submission_unknown",
+        error_code="WorkerSubmitError",
+        remote_submission_state=remote_submission_state,
+    )
     await db.close()
 
 
@@ -246,6 +269,9 @@ async def test_execute_acquires_new_lease_and_increments_attempts_once(tmp_path)
     assert row["lease_version"] == 2
     assert account["lock_version"] == 2
     assert row["status"] == "manual_submit_required"
+    assert client.payloads[0]["idempotency_key"] == "storyboard:task-2:attempt:2"
+    assert client.payloads[0]["resume_attempt_id"] == "resume:task-2:attempt:2"
+    assert client.payloads[0]["generation_attempt"] == 2
 
 
 @pytest.mark.asyncio
@@ -320,6 +346,66 @@ async def test_submit_exception_enters_submission_unknown(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_structured_worker_500_fields_are_preserved(tmp_path):
+    from gateway.worker_client import WorkerSubmitError
+
+    class Structured500Client(FakeClient):
+        async def resume_omni_video(self, worker, payload):
+            self.submit_calls += 1
+            self.payloads.append(payload)
+            raise WorkerSubmitError(500, "Worker resume submit failed: HTTP 500", {
+                "job_id": "resume-job-2",
+                "resume_attempt_id": payload["resume_attempt_id"],
+                "extension_request_id": payload["extension_request_id"],
+                "request_batch_id": payload["request_batch_id"],
+                "remote_http_status": 200,
+                "remote_submission_state": "accepted_persist_failed",
+                "output_media_id": "media-lost",
+                "workflow_id": "workflow-lost",
+                "operation_name": "operation-lost",
+                "error_code": "accepted_persist_failed",
+            })
+
+    db_path = tmp_path / "gateway.db"
+    await seed(db_path)
+    client = Structured500Client()
+    result = await _resume_manual_submit(args(db_path, execute=True, confirm="task-2", user_confirmed=True), client, Provider())
+    row = await _task(db_path)
+    assert result["error_code"] == "submission_unknown"
+    assert row["status"] == "submission_unknown"
+    assert row["worker_job_id"] == "resume-job-2"
+    assert row["remote_http_status"] == 200
+    assert row["remote_submission_state"] == "accepted_persist_failed"
+    assert row["output_media_id"] == "media-lost"
+    assert client.submit_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_not_started_worker_error_returns_manual_submit_required(tmp_path):
+    from gateway.worker_client import WorkerSubmitError
+
+    class NotStartedClient(FakeClient):
+        async def resume_omni_video(self, worker, payload):
+            self.submit_calls += 1
+            raise WorkerSubmitError(500, "pre-submit persistence failed", {
+                "remote_submission_state": "not_started",
+                "resume_attempt_id": payload["resume_attempt_id"],
+                "request_batch_id": payload["request_batch_id"],
+                "extension_request_id": payload["extension_request_id"],
+                "error_code": "RowNotUpdatedError",
+            })
+
+    db_path = tmp_path / "gateway.db"
+    await seed(db_path)
+    client = NotStartedClient()
+    result = await _resume_manual_submit(args(db_path, execute=True, confirm="task-2", user_confirmed=True), client, Provider())
+    row = await _task(db_path)
+    assert result["error_code"] == "manual_submit_required"
+    assert row["status"] == "manual_submit_required"
+    assert row["remote_submission_state"] == "not_started"
+
+
+@pytest.mark.asyncio
 async def test_success_downloads_and_fenced_releases_account(tmp_path):
     mp4 = tmp_path / "out.mp4"
     mp4.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"\0" * 2048)
@@ -360,6 +446,64 @@ def test_cli_registers_resume_manual_submit_default_preflight(monkeypatch, tmp_p
     assert calls[0].execute is False
     assert calls[0].preflight_only is True
     assert '"preflight_only": true' in out
+
+
+@pytest.mark.asyncio
+async def test_reconcile_submission_unknown_is_read_only_and_marks_local_candidates(tmp_path):
+    class NoSubmitClient(FakeClient):
+        async def resume_omni_video(self, worker, payload):
+            raise AssertionError("reconcile must not submit")
+
+    db_path = tmp_path / "gateway.db"
+    await seed(db_path)
+    await mark_unknown(db_path, remote_submission_state="accepted_persist_failed")
+    before = await _task(db_path)
+    result = await _reconcile_submission_unknown(reconcile_args(db_path), NoSubmitClient(), Provider())
+    after = await _task(db_path)
+    assert result["ok"] is True
+    assert result["submit_called"] is False
+    assert result["actual_remote_project_results"]["state"] == "remote_query_unavailable"
+    assert result["local_manual_candidates"]["source"] == "agent_local_request_table"
+    assert before == after
+
+
+@pytest.mark.asyncio
+async def test_resolve_rejects_accepted_response_lost_to_manual(tmp_path):
+    db_path = tmp_path / "gateway.db"
+    await seed(db_path)
+    await mark_unknown(db_path, remote_submission_state="accepted_persist_failed")
+    result = await _resolve_submission_unknown(resolve_args(db_path, execute=True, confirm="task-2"))
+    row = await _task(db_path)
+    assert result["reason_code"] == "resolution_conflicts_with_remote_submission_state"
+    assert row["status"] == "submission_unknown"
+
+
+@pytest.mark.asyncio
+async def test_resolve_confirmed_not_started_uses_existing_fencing(tmp_path):
+    db_path = tmp_path / "gateway.db"
+    await seed(db_path)
+    await mark_unknown(db_path, remote_submission_state="not_started")
+    result = await _resolve_submission_unknown(resolve_args(db_path, execute=True, confirm="task-2"))
+    row = await _task(db_path)
+    account = await _account(db_path)
+    assert result["ok"] is True
+    assert row["status"] == "manual_submit_required"
+    assert row["generation_attempts"] == 1
+    assert account["current_task_id"] == "task-2"
+
+
+def test_cli_registers_reconcile_and_resolve(monkeypatch, tmp_path, capsys):
+    from gateway import submission_reconcile
+
+    monkeypatch.setattr(submission_reconcile, "reconcile_submission_unknown", lambda parsed: {"ok": True, "submit_called": False, "task_id": parsed.task_id})
+    code = cli.main(["reconcile-submission-unknown", "--task-id", "task-2", "--gateway-db", str(tmp_path / "gateway.db")])
+    assert code == 0
+    assert '"submit_called": false' in capsys.readouterr().out
+
+    monkeypatch.setattr(submission_reconcile, "resolve_submission_unknown", lambda parsed: {"ok": True, "execute": parsed.execute, "resolution": parsed.resolution})
+    code = cli.main(["resolve-submission-unknown", "--task-id", "task-2", "--resolution", "confirmed-rejected", "--gateway-db", str(tmp_path / "gateway.db")])
+    assert code == 0
+    assert '"confirmed-rejected"' in capsys.readouterr().out
 
 
 async def _task(db_path):
