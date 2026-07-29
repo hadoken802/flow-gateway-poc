@@ -293,6 +293,81 @@ async def heartbeat(db, task_id, account_id, lease_owner, lease_version, lock_ve
         raise
 
 
+async def acquire_manual_submit_resume(db, task_id, lease_seconds=LEASE_SECONDS, worker_instance_id=None, boot_id=None):
+    owner = str(uuid.uuid4())
+    deadline = lease_deadline(lease_seconds)
+    await db.commit()
+    await db.execute("BEGIN IMMEDIATE")
+    try:
+        cursor = await db.execute(
+            """
+            SELECT t.*, a.lock_version AS account_lock_version, a.current_task_id, a.status AS account_status
+            FROM flow_tasks t
+            JOIN flow_accounts a ON a.account_id=t.account_id
+            WHERE t.task_id=?
+            """,
+            (task_id,),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            await db.commit()
+            return None
+        item = dict(row)
+        if item.get("status") != "manual_submit_required":
+            await db.commit()
+            return None
+        if item.get("error_code") != "UPSTREAM_UNUSUAL_ACTIVITY":
+            await db.commit()
+            return None
+        if item.get("current_task_id") != task_id or item.get("account_status") not in {"busy", "locked"}:
+            await db.commit()
+            return None
+        account_id = item.get("account_id")
+        cursor = await db.execute(
+            """
+            UPDATE flow_tasks
+            SET status='submit_in_progress',
+                lease_owner=?, lease_version=lease_version+1, lease_expires_at=?,
+                heartbeat_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                worker_instance_id=COALESCE(?, worker_instance_id),
+                boot_id=COALESCE(?, boot_id),
+                generation_attempts=generation_attempts+1,
+                attempt_count=attempt_count+1,
+                submission_started_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                last_error_code=error_code,
+                last_error_message=error_message,
+                error_code=NULL,
+                error_message=NULL,
+                updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+            WHERE task_id=? AND status='manual_submit_required' AND error_code='UPSTREAM_UNUSUAL_ACTIVITY'
+              AND account_id=? AND output_media_id IS NULL AND workflow_id IS NULL
+              AND operation_name IS NULL AND upstream_batch_id IS NULL
+            """,
+            (owner, deadline, worker_instance_id, boot_id, task_id, account_id),
+        )
+        if cursor.rowcount != 1:
+            await db.execute("ROLLBACK")
+            return None
+        cursor = await db.execute(
+            """
+            UPDATE flow_accounts
+            SET lock_owner=?, lock_version=lock_version+1, lock_expires_at=?,
+                last_heartbeat_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+                updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+            WHERE account_id=? AND current_task_id=?
+            """,
+            (owner, deadline, account_id, task_id),
+        )
+        if cursor.rowcount != 1:
+            await db.execute("ROLLBACK")
+            return None
+        await db.commit()
+        return await get_task(db, task_id)
+    except Exception:
+        await db.execute("ROLLBACK")
+        raise
+
+
 async def ensure_active_lease(db, task_id, account_id, lease_seconds=LEASE_SECONDS):
     owner = str(uuid.uuid4())
     deadline = lease_deadline(lease_seconds)

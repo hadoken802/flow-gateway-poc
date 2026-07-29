@@ -63,6 +63,13 @@ def main(argv: list[str] | None = None) -> int:
     retry_downloads.add_argument("--run-dir", required=True)
     retry_downloads.add_argument("--account-id", action="append", default=[])
     retry_downloads.add_argument("--execute", action="store_true")
+    resume = subparsers.add_parser("resume-manual-submit")
+    resume.add_argument("--task-id", required=True)
+    resume.add_argument("--gateway-db", required=True)
+    resume.add_argument("--preflight-only", action="store_true")
+    resume.add_argument("--execute", action="store_true")
+    resume.add_argument("--confirm-task-id")
+    resume.add_argument("--user-confirmed-verification-cleared", action="store_true")
     args = parser.parse_args(argv)
 
     if args.command == "run-video-once":
@@ -86,6 +93,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "retry-downloads":
         from .download_recovery import retry_downloads
         result = retry_downloads(args)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0 if result.get("ok") else 1
+    if args.command == "resume-manual-submit":
+        from .manual_submit_resume import resume_manual_submit
+        if not args.execute:
+            args.preflight_only = True
+        result = resume_manual_submit(args)
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0 if result.get("ok") else 1
     return 2

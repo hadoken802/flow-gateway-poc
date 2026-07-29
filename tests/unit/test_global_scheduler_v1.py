@@ -357,7 +357,7 @@ async def test_continuous_heartbeat_extends_task_and_account_lease(tmp_path):
     before_account = (await crud.get_account(scheduler.db, "FLOW-001"))["lock_expires_at"]
 
     hb = scheduler._start_task_heartbeat(task["task_id"], "FLOW-001", {"lease_owner": leased["lease_owner"], "lease_version": leased["lease_version"]})
-    await asyncio.sleep(0.12)
+    await asyncio.sleep(1.1)
     hb.cancel()
     await asyncio.gather(hb, return_exceptions=True)
 

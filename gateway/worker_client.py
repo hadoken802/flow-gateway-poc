@@ -43,6 +43,19 @@ class WorkerClient:
             raise WorkerSubmitError(response.status_code, f"Worker submit failed: HTTP {response.status_code}", data if isinstance(data, dict) else None)
         return data
 
+    async def resume_omni_video(self, worker, payload):
+        async with httpx.AsyncClient(timeout=self.submit_timeout_seconds) as client:
+            response = await client.post(f"{worker.api_url}/api/test/omni-video/resume-submit", json=payload)
+        try:
+            data = response.json()
+        except ValueError:
+            data = None
+        if response.status_code >= 400:
+            if isinstance(data, dict) and data.get("job_id"):
+                return data
+            raise WorkerSubmitError(response.status_code, f"Worker resume submit failed: HTTP {response.status_code}", data if isinstance(data, dict) else None)
+        return data
+
     async def create_project(self, worker, payload):
         async with httpx.AsyncClient(timeout=120.0) as client:
             return (await client.post(f"{worker.api_url}/api/projects", json=payload)).raise_for_status().json()

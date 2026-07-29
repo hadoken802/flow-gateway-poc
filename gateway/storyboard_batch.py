@@ -271,6 +271,8 @@ def _account_summary(preflight: dict[str, Any]) -> dict[str, Any]:
 
 
 def _gateway_db_path(args: argparse.Namespace, run_dir: Path) -> Path:
+    if not hasattr(args, "gateway_db") and not hasattr(args, "legacy_run_db"):
+        return run_dir / "gateway.db"
     explicit = getattr(args, "gateway_db", None)
     if explicit:
         return Path(explicit)

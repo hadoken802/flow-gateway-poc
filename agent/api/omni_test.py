@@ -67,6 +67,16 @@ class OmniVideoRequest(BaseModel):
     aspect_ratio: str
 
 
+class OmniVideoResumeRequest(BaseModel):
+    idempotency_key: str
+    project_id: str
+    input_media_id: str
+    image_path: str
+    prompt: str
+    duration: int
+    aspect_ratio: str
+
+
 @router.post("")
 async def submit_omni_video(body: OmniVideoRequest):
     if body.duration != 10:
@@ -148,11 +158,72 @@ async def submit_omni_video(body: OmniVideoRequest):
     return response
 
 
+@router.post("/resume-submit")
+async def resume_omni_video(body: OmniVideoResumeRequest):
+    if body.duration != 10:
+        raise HTTPException(400, "Only duration=10 is supported in this POC")
+    if body.aspect_ratio != "9:16":
+        raise HTTPException(400, "Only aspect_ratio=9:16 is supported in this POC")
+    if not body.input_media_id:
+        raise HTTPException(400, "input_media_id is required")
+
+    client = get_flow_client()
+    if not client.connected:
+        raise HTTPException(503, "Extension not connected")
+    if client._flow_key is None:
+        raise HTTPException(503, "Flow key not present")
+
+    job_id = str(uuid.uuid4())
+    await crud.create_omni_test_job(job_id, body.project_id, body.prompt, body.image_path, body.idempotency_key)
+    await crud.update_omni_test_job(job_id, input_media_id=body.input_media_id, status="queued")
+    response = await _submit_existing_input_media(job_id, body.project_id, body.input_media_id, body.prompt)
+    response["reused"] = False
+    response["resume_submit"] = True
+    return response
+
+
 @router.get("/{job_id}")
 async def get_omni_video(job_id: str):
     job = await crud.get_omni_test_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
+    return _public_job(job)
+
+
+async def _submit_existing_input_media(job_id: str, project_id: str, input_media_id: str, prompt: str) -> dict:
+    omni = OmniClient(get_flow_client())
+    result = await omni.submit_reference_video(
+        project_id=project_id,
+        reference_media_ids=[input_media_id],
+        prompt=prompt,
+        user_paygate_tier="PAYGATE_TIER_NOT_PAID",
+    )
+    if result.get("error") or (isinstance(result.get("status"), int) and result["status"] >= 400):
+        job = await crud.update_omni_test_job(
+            job_id,
+            status="failed",
+            error_code=str(result.get("status") or "submit_error"),
+            error_message=str(result.get("error") or result.get("data") or "Submit failed"),
+            raw_response_shape=json.dumps(response_shape(unwrap_response(result))),
+        )
+        return _public_job(job)
+
+    data = unwrap_response(result)
+    fields = extract_submit_fields(data)
+    status = fields.pop("upstream_status", None)
+    await crud.update_omni_test_job(
+        job_id,
+        **fields,
+        status=_initial_status(status),
+        submitted_at=crud._now(),
+        raw_response_shape=json.dumps(response_shape(data)),
+    )
+    _ensure_polling(job_id)
+    job = await crud.get_omni_test_job(job_id)
+    logger.info(
+        "Omni resume submitted job=%s project=%s input=%s output=%s status=%s remaining=%s",
+        job_id, project_id[:8], input_media_id[:8],
+        (job.get("output_media_id") or "")[:8], job.get("status"), job.get("remaining_credits"))
     return _public_job(job)
 
 
