@@ -126,6 +126,13 @@ def main(argv: list[str] | None = None) -> int:
     apply_poll.add_argument("--confirm-lease-version", type=int)
     apply_poll.add_argument("--confirm-poll-result-sha256")
     apply_poll.add_argument("--allow-real-database", action="store_true")
+    prepare_download = subparsers.add_parser("prepare-reconciled-remote-download")
+    prepare_download.add_argument("--task-id", required=True)
+    prepare_download.add_argument("--poll-result-file", required=True)
+    prepare_download.add_argument("--gateway-db", required=True)
+    prepare_download.add_argument("--agent-db", required=True)
+    prepare_download.add_argument("--worker-base-url", required=True)
+    prepare_download.add_argument("--output-dir", required=True)
     args = parser.parse_args(argv)
 
     if args.command == "run-video-once":
@@ -181,6 +188,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "apply-reconciled-poll-result":
         from .reconciled_poll_result_apply import apply_reconciled_poll_result
         result = apply_reconciled_poll_result(args)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0 if result.get("ok") else 1
+    if args.command == "prepare-reconciled-remote-download":
+        from .reconciled_remote_download_preflight import prepare_reconciled_remote_download
+        result = prepare_reconciled_remote_download(args)
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0 if result.get("ok") else 1
     return 2
