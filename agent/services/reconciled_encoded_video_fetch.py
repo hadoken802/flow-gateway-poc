@@ -13,8 +13,11 @@ import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import parse_qsl, urlparse
 
-from agent.services.omni_client import resolve_encoded_video, unwrap_response
+import aiohttp
+
+from agent.services.omni_client import resolve_encoded_video, resolve_video_candidates, response_shape, unwrap_response
 
 
 MAX_ENCODED_VIDEO_CHARS = 32 * 1024 * 1024
@@ -64,10 +67,15 @@ async def fetch_reconciled_encoded_video_once(
             manifest.update({
                 "ok": False,
                 "error_code": "encoded_video_fingerprint_changed",
+                "stage": "post_get_media_fingerprint_validation",
+                "transport_detected": "encoded_video",
+                "encoded_video_present": True,
+                "video_url_present": bool(resolve_video_candidates(data)),
                 "actual_encoded_video_length": actual_fp["encoded_video_length"],
                 "actual_encoded_video_sha256": actual_fp["encoded_video_sha256"],
                 "expected_encoded_video_length": expected_encoded_video_length,
                 "expected_encoded_video_sha256": expected_encoded_video_sha256,
+                "url_download_call_count": 0,
             })
             return EncodedVideoFetchResult(False, media_id, b"", _headers(manifest), manifest)
         video_bytes, mime_type, data_uri_present, base64_format = decode_encoded_video(encoded)
@@ -77,6 +85,9 @@ async def fetch_reconciled_encoded_video_once(
         manifest.update({
             "ok": True,
             "transport": "encoded_video",
+            "transport_detected": "encoded_video",
+            "encoded_video_present": True,
+            "video_url_present": bool(resolve_video_candidates(data)),
             "encoded_video_length": expected_encoded_video_length,
             "encoded_video_sha256": expected_encoded_video_sha256,
             "encoded_fingerprint_matched": True,
@@ -86,12 +97,96 @@ async def fetch_reconciled_encoded_video_once(
             "decoded_byte_length": len(video_bytes),
             "decoded_sha256": decoded_sha,
             "mp4_valid": True,
+            "url_download_call_count": 0,
             "submit_called": False,
             "poll_called": False,
             "download_called": False,
             "database_writes_performed": False,
         })
         return EncodedVideoFetchResult(True, media_id, video_bytes, _headers(manifest), manifest)
+
+    except Exception as exc:
+        return _failure(media_id, type(exc).__name__, str(exc), started, get_media_call_count)
+
+
+async def fetch_reconciled_media_video_once(
+    *,
+    client: Any,
+    media_id: str,
+    expected_encoded_video_length: int | None = None,
+    expected_encoded_video_sha256: str | None = None,
+    url_fetcher: Any | None = None,
+) -> EncodedVideoFetchResult:
+    started = _now()
+    get_media_call_count = 0
+    try:
+        get_media_call_count += 1
+        result = await client.get_media(media_id)
+        if result.get("error"):
+            return _failure(media_id, "get_media_error", str(result.get("error")), started, get_media_call_count)
+        data = unwrap_response(result)
+        encoded = resolve_encoded_video(data)
+        urls = resolve_video_candidates(data)
+        if encoded:
+            fp = encoded_video_fingerprint(encoded.encoded_video)
+            if expected_encoded_video_length is not None and expected_encoded_video_sha256 is not None:
+                if fp["encoded_video_length"] != expected_encoded_video_length or fp["encoded_video_sha256"] != expected_encoded_video_sha256:
+                    manifest = _base_manifest(media_id, started, get_media_call_count)
+                    manifest.update({
+                        "ok": False,
+                        "error_code": "encoded_video_fingerprint_changed",
+                        "stage": "post_get_media_fingerprint_validation",
+                        "transport_detected": "encoded_video",
+                        "encoded_video_present": True,
+                        "video_url_present": bool(urls),
+                        "actual_encoded_video_length": fp["encoded_video_length"],
+                        "actual_encoded_video_sha256": fp["encoded_video_sha256"],
+                        "expected_encoded_video_length": expected_encoded_video_length,
+                        "expected_encoded_video_sha256": expected_encoded_video_sha256,
+                        "url_download_call_count": 0,
+                    })
+                    return EncodedVideoFetchResult(False, media_id, b"", _headers(manifest), manifest)
+            video_bytes, mime_type, data_uri_present, base64_format = decode_encoded_video(encoded.encoded_video)
+            validate_mp4_bytes(video_bytes)
+            manifest = _base_manifest(media_id, started, get_media_call_count)
+            manifest.update({
+                "ok": True,
+                "transport": "encoded_video",
+                "transport_detected": "encoded_video",
+                "encoded_video_present": True,
+                "encoded_video_path": encoded.path,
+                "video_url_present": bool(urls),
+                "encoded_video_length": fp["encoded_video_length"],
+                "encoded_video_sha256": fp["encoded_video_sha256"],
+                "encoded_fingerprint_matched": expected_encoded_video_sha256 is None or fp["encoded_video_sha256"] == expected_encoded_video_sha256,
+                "data_uri_present": data_uri_present,
+                "mime_type": mime_type,
+                "base64_format": base64_format,
+                "decoded_byte_length": len(video_bytes),
+                "decoded_sha256": hashlib.sha256(video_bytes).hexdigest(),
+                "mp4_valid": True,
+                "url_download_call_count": 0,
+                "response_shape": response_shape(data),
+                "submit_called": False,
+                "poll_called": False,
+                "download_called": False,
+                "database_writes_performed": False,
+            })
+            return EncodedVideoFetchResult(True, media_id, video_bytes, _headers(manifest), manifest)
+        if urls:
+            return await _fetch_url_transport(media_id, urls[0], started, get_media_call_count, data, url_fetcher=url_fetcher)
+        manifest = _base_manifest(media_id, started, get_media_call_count)
+        manifest.update({
+            "ok": False,
+            "error_code": "media_transport_missing",
+            "stage": "post_get_media_transport_detection",
+            "transport_detected": None,
+            "encoded_video_present": False,
+            "video_url_present": False,
+            "response_shape": response_shape(data),
+            "url_download_call_count": 0,
+        })
+        return EncodedVideoFetchResult(False, media_id, b"", _headers(manifest), manifest)
     except Exception as exc:
         return _failure(media_id, type(exc).__name__, str(exc), started, get_media_call_count)
 
@@ -142,6 +237,80 @@ def validate_mp4_bytes(data: bytes) -> dict[str, Any]:
     return {"mp4_valid": True, "major_brand": major_brand}
 
 
+async def _fetch_url_transport(media_id: str, candidate: Any, started: str, get_media_call_count: int, data: Any, url_fetcher: Any | None = None) -> EncodedVideoFetchResult:
+    url_summary = _safe_url(candidate.url)
+    manifest = _base_manifest(media_id, started, get_media_call_count)
+    manifest.update({
+        "transport_detected": "video_url",
+        "encoded_video_present": False,
+        "video_url_present": True,
+        "video_url_path_field": candidate.path,
+        "video_url_scheme": url_summary["scheme"],
+        "video_url_host": url_summary["host"],
+        "video_url_path": url_summary["path"],
+        "video_url_query_parameter_names": url_summary["query_parameter_names"],
+        "response_shape": response_shape(data),
+        "url_download_call_count": 0,
+    })
+    if url_summary["scheme"] != "https":
+        manifest.update({"ok": False, "error_code": "video_url_not_https", "stage": "pre_url_download_validation"})
+        return EncodedVideoFetchResult(False, media_id, b"", _headers(manifest), manifest)
+    try:
+        if url_fetcher is not None:
+            manifest["url_download_call_count"] = 1
+            status, content_type, video_bytes = await url_fetcher(candidate.url)
+            if 300 <= status < 400:
+                manifest.update({"ok": False, "error_code": "video_url_redirect_blocked", "stage": "url_download_http", "http_status": status})
+                return EncodedVideoFetchResult(False, media_id, b"", _headers(manifest), manifest)
+            if status < 200 or status >= 300:
+                manifest.update({"ok": False, "error_code": "video_url_http_error", "stage": "url_download_http", "http_status": status})
+                return EncodedVideoFetchResult(False, media_id, b"", _headers(manifest), manifest)
+        else:
+            timeout = aiohttp.ClientTimeout(total=120)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                manifest["url_download_call_count"] = 1
+                async with session.get(candidate.url, allow_redirects=False) as resp:
+                    status = resp.status
+                    content_type = (resp.headers.get("Content-Type") or "").lower()
+                    video_bytes = await resp.read()
+                if 300 <= status < 400:
+                    manifest.update({"ok": False, "error_code": "video_url_redirect_blocked", "stage": "url_download_http", "http_status": status})
+                    return EncodedVideoFetchResult(False, media_id, b"", _headers(manifest), manifest)
+                if status < 200 or status >= 300:
+                    manifest.update({"ok": False, "error_code": "video_url_http_error", "stage": "url_download_http", "http_status": status})
+                    return EncodedVideoFetchResult(False, media_id, b"", _headers(manifest), manifest)
+        if content_type and not ("video" in content_type or "octet-stream" in content_type or "mp4" in content_type):
+            manifest.update({"ok": False, "error_code": "video_url_content_type_invalid", "stage": "url_download_content_validation", "content_type": content_type[:100]})
+            return EncodedVideoFetchResult(False, media_id, b"", _headers(manifest), manifest)
+        validate_mp4_bytes(video_bytes)
+        manifest.update({
+            "ok": True,
+            "transport": "video_url",
+            "content_type": content_type,
+            "decoded_byte_length": len(video_bytes),
+            "decoded_sha256": hashlib.sha256(video_bytes).hexdigest(),
+            "mp4_valid": True,
+            "submit_called": False,
+            "poll_called": False,
+            "download_called": False,
+            "database_writes_performed": False,
+        })
+        return EncodedVideoFetchResult(True, media_id, video_bytes, _headers(manifest), manifest)
+    except Exception as exc:
+        manifest.update({"ok": False, "error_code": type(exc).__name__, "stage": "url_download_exception", "error_message_sanitized": str(exc)[:300]})
+        return EncodedVideoFetchResult(False, media_id, b"", _headers(manifest), manifest)
+
+
+def _safe_url(url: str) -> dict[str, Any]:
+    parsed = urlparse(url)
+    return {
+        "scheme": parsed.scheme,
+        "host": parsed.netloc,
+        "path": parsed.path,
+        "query_parameter_names": sorted({key for key, _ in parse_qsl(parsed.query, keep_blank_values=True)}),
+    }
+
+
 def _base_manifest(media_id: str, started: str, count: int) -> dict[str, Any]:
     return {
         "query_started_at": started,
@@ -157,7 +326,7 @@ def _base_manifest(media_id: str, started: str, count: int) -> dict[str, Any]:
 
 def _failure(media_id: str, code: str, message: str, started: str, count: int) -> EncodedVideoFetchResult:
     manifest = _base_manifest(media_id, started, count)
-    manifest.update({"ok": False, "error_code": code, "error_message_sanitized": message[:300]})
+    manifest.update({"ok": False, "error_code": code, "stage": "get_media_or_media_validation", "error_message_sanitized": message[:300], "url_download_call_count": 0})
     return EncodedVideoFetchResult(False, media_id, b"", _headers(manifest), manifest)
 
 
@@ -179,6 +348,9 @@ def _headers(manifest: dict[str, Any]) -> dict[str, str]:
         headers["X-Decoded-Sha256"] = str(manifest["decoded_sha256"])
     if manifest.get("error_code"):
         headers["X-Error-Code"] = str(manifest["error_code"])
+    if manifest.get("transport_detected"):
+        headers["X-Transport-Detected"] = str(manifest["transport_detected"])
+    headers["X-Url-Download-Call-Count"] = str(manifest.get("url_download_call_count", 0))
     return headers
 
 

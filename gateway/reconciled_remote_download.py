@@ -139,6 +139,8 @@ async def _download(args: argparse.Namespace, worker_client: Any | None) -> dict
         video_bytes = fetched["content"]
         headers = {str(k).lower(): str(v) for k, v in fetched["headers"].items()}
         get_media_count = int(headers.get("x-get-media-call-count", "1"))
+        url_download_count = int(headers.get("x-url-download-call-count", "0"))
+        transport_detected = headers.get("x-transport-detected") or "encoded_video"
         validate_mp4_bytes(video_bytes)
         actual_sha = hashlib.sha256(video_bytes).hexdigest()
         final = output["final"]
@@ -159,6 +161,7 @@ async def _download(args: argparse.Namespace, worker_client: Any | None) -> dict
             "encoded_fingerprint_matched": True,
             "decoded_byte_length": len(video_bytes),
             "decoded_sha256": actual_sha,
+            "transport_detected": transport_detected,
             "final_file_size": final.stat().st_size,
             "final_file_sha256": _sha256_file(final),
             "output_path": str(final),
@@ -166,6 +169,7 @@ async def _download(args: argparse.Namespace, worker_client: Any | None) -> dict
             "mp4_valid": True,
             "ffprobe": ffprobe,
             "get_media_call_count": get_media_count,
+            "url_download_call_count": url_download_count,
             "submit_called": False,
             "poll_called": False,
             "download_called": False,
@@ -178,6 +182,7 @@ async def _download(args: argparse.Namespace, worker_client: Any | None) -> dict
             "ok": True,
             "get_media_called": True,
             "get_media_call_count": get_media_count,
+            "url_download_call_count": url_download_count,
             "network_calls_performed": 1,
             "file_writes_performed": True,
             "database_writes_performed": False,

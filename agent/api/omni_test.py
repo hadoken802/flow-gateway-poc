@@ -29,7 +29,7 @@ from agent.services.omni_client import (
 )
 from agent.services.remote_status_query import query_bound_remote_status_once
 from agent.services.remote_media_capability import query_download_capability_once
-from agent.services.reconciled_encoded_video_fetch import fetch_reconciled_encoded_video_once
+from agent.services.reconciled_encoded_video_fetch import fetch_reconciled_media_video_once
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/test/omni-video", tags=["omni-test"])
@@ -317,7 +317,7 @@ async def fetch_omni_video_reconciled_encoded_video_once(job_id: str, body: Reco
             raise HTTPException(409, f"{field} mismatch")
     if job.get("video_path") or job.get("completed_at"):
         raise HTTPException(409, "Job already has local completion fields")
-    result = await fetch_reconciled_encoded_video_once(
+    result = await fetch_reconciled_media_video_once(
         client=get_flow_client(),
         media_id=body.output_media_id,
         expected_encoded_video_length=body.expected_encoded_video_length,

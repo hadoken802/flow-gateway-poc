@@ -12,6 +12,7 @@ from agent.services.reconciled_encoded_video_fetch import (
     decode_encoded_video,
     encoded_video_fingerprint,
     fetch_reconciled_encoded_video_once,
+    fetch_reconciled_media_video_once,
     validate_mp4_bytes,
 )
 from gateway.worker_client import WorkerRemoteMediaFetchError, _safe_worker_error
@@ -170,13 +171,14 @@ def test_dry_run_does_not_call_worker_or_write(monkeypatch, tmp_path):
 
 
 class FakeWorker:
-    def __init__(self, data):
+    def __init__(self, data, headers=None):
         self.calls = 0
         self.data = data
+        self.headers = headers or {"x-get-media-call-count": "1"}
 
     async def fetch_reconciled_encoded_video_once(self, *_args):
         self.calls += 1
-        return {"content": self.data, "headers": {"x-get-media-call-count": "1"}}
+        return {"content": self.data, "headers": self.headers}
 
 
 class FailingWorker:
@@ -214,6 +216,20 @@ def test_execute_writes_mp4_manifest_once(monkeypatch, tmp_path):
     assert out.exists()
     assert manifest.exists()
     assert json.loads(manifest.read_text())["database_writes_performed"] is False
+
+
+def test_execute_records_url_transport_headers(monkeypatch, tmp_path):
+    gw, ag, poll, cap, poll_sha, cap_sha, fp = _setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(download, "_inspect_worker", lambda _url: {"health": {"status": "ok", "extension_connected": True}, "extension_connected": True, "route_available": True, "blocking_reasons": []})
+    out = tmp_path / "out-url.mp4"
+    manifest = tmp_path / "manifest-url.json"
+    fake = FakeWorker(_mp4_bytes(), {"x-get-media-call-count": "1", "x-url-download-call-count": "1", "x-transport-detected": "video_url"})
+    result = download.download_reconciled_remote_result(_args(gw, ag, poll, cap, out, execute=True, poll_sha=poll_sha, cap_sha=cap_sha, fp=fp, manifest=manifest), fake)
+    assert result["ok"] is True
+    assert result["url_download_call_count"] == 1
+    written = json.loads(manifest.read_text())
+    assert written["transport_detected"] == "video_url"
+    assert written["url_download_call_count"] == 1
 
 
 def test_execute_surfaces_worker_409_without_worker_submit_error(monkeypatch, tmp_path):
@@ -311,3 +327,120 @@ async def test_agent_fetch_rejects_fingerprint_change():
     result = await fetch_reconciled_encoded_video_once(client=Client(), media_id=OUTPUT_MEDIA_ID, expected_encoded_video_length=len(encoded), expected_encoded_video_sha256="bad")
     assert result.ok is False
     assert result.manifest["error_code"] == "encoded_video_fingerprint_changed"
+
+
+@pytest.mark.asyncio
+async def test_atomic_fetch_keeps_encoded_video_success_path():
+    encoded = base64.b64encode(_mp4_bytes()).decode()
+
+    class Client:
+        calls = 0
+
+        async def get_media(self, _media_id):
+            self.calls += 1
+            return {"data": {"video": {"encodedVideo": encoded}}}
+
+    client = Client()
+    fp = encoded_video_fingerprint(encoded)
+    result = await fetch_reconciled_media_video_once(
+        client=client,
+        media_id=OUTPUT_MEDIA_ID,
+        expected_encoded_video_length=fp["encoded_video_length"],
+        expected_encoded_video_sha256=fp["encoded_video_sha256"],
+    )
+    assert result.ok is True
+    assert result.video_bytes == _mp4_bytes()
+    assert result.manifest["transport_detected"] == "encoded_video"
+    assert result.manifest["get_media_call_count"] == 1
+    assert result.manifest["url_download_call_count"] == 0
+    assert client.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_atomic_fetch_uses_https_url_when_encoded_missing():
+    class Client:
+        calls = 0
+
+        async def get_media(self, _media_id):
+            self.calls += 1
+            return {"data": {"video": {"generatedVideo": {"downloadUrl": "https://cdn.example/video.mp4?sig=secret&Expires=1"}}}}
+
+    url_calls = []
+
+    async def fetch_url(url):
+        url_calls.append(url)
+        return 200, "video/mp4", _mp4_bytes()
+
+    client = Client()
+    result = await fetch_reconciled_media_video_once(client=client, media_id=OUTPUT_MEDIA_ID, url_fetcher=fetch_url)
+    assert result.ok is True
+    assert result.video_bytes == _mp4_bytes()
+    assert result.manifest["transport_detected"] == "video_url"
+    assert result.manifest["encoded_video_present"] is False
+    assert result.manifest["video_url_present"] is True
+    assert result.manifest["video_url_host"] == "cdn.example"
+    assert result.manifest["video_url_query_parameter_names"] == ["Expires", "sig"]
+    assert "secret" not in json.dumps(result.manifest)
+    assert result.manifest["get_media_call_count"] == 1
+    assert result.manifest["url_download_call_count"] == 1
+    assert client.calls == 1
+    assert len(url_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_atomic_fetch_reports_missing_transport_shape():
+    class Client:
+        async def get_media(self, _media_id):
+            return {"data": {"video": {"generatedVideo": {"model": "abra_r2v_10s"}}}}
+
+    result = await fetch_reconciled_media_video_once(client=Client(), media_id=OUTPUT_MEDIA_ID)
+    assert result.ok is False
+    assert result.manifest["error_code"] == "media_transport_missing"
+    assert result.manifest["stage"] == "post_get_media_transport_detection"
+    assert result.manifest["encoded_video_present"] is False
+    assert result.manifest["video_url_present"] is False
+    assert result.manifest["get_media_call_count"] == 1
+    assert result.manifest["url_download_call_count"] == 0
+    assert "response_shape" in result.manifest
+
+
+@pytest.mark.asyncio
+async def test_atomic_fetch_url_http_error_called_once():
+    class Client:
+        calls = 0
+
+        async def get_media(self, _media_id):
+            self.calls += 1
+            return {"data": {"video": {"generatedVideo": {"downloadUrl": "https://cdn.example/video.mp4?sig=secret"}}}}
+
+    url_calls = 0
+
+    async def fetch_url(_url):
+        nonlocal url_calls
+        url_calls += 1
+        return 403, "text/html", b"<html>denied</html>"
+
+    client = Client()
+    result = await fetch_reconciled_media_video_once(client=client, media_id=OUTPUT_MEDIA_ID, url_fetcher=fetch_url)
+    assert result.ok is False
+    assert result.manifest["error_code"] == "video_url_http_error"
+    assert result.manifest["http_status"] == 403
+    assert result.manifest["get_media_call_count"] == 1
+    assert result.manifest["url_download_call_count"] == 1
+    assert client.calls == 1
+    assert url_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_atomic_fetch_rejects_non_https_url_before_url_get():
+    class Client:
+        async def get_media(self, _media_id):
+            return {"data": {"video": {"generatedVideo": {"downloadUrl": "http://cdn.example/video.mp4?sig=secret"}}}}
+
+    async def fetch_url(_url):
+        raise AssertionError("URL fetch must not be called")
+
+    result = await fetch_reconciled_media_video_once(client=Client(), media_id=OUTPUT_MEDIA_ID, url_fetcher=fetch_url)
+    assert result.ok is False
+    assert result.manifest["error_code"] == "video_url_not_https"
+    assert result.manifest["url_download_call_count"] == 0
