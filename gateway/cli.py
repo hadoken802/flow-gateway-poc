@@ -81,6 +81,19 @@ def main(argv: list[str] | None = None) -> int:
     resolve_unknown.add_argument("--gateway-db", required=True)
     resolve_unknown.add_argument("--execute", action="store_true")
     resolve_unknown.add_argument("--confirm-task-id")
+    bind_remote = subparsers.add_parser("bind-reconciled-remote-result")
+    bind_remote.add_argument("--task-id", required=True)
+    bind_remote.add_argument("--candidate-file", required=True)
+    bind_remote.add_argument("--gateway-db", required=True)
+    bind_remote.add_argument("--agent-db", required=True)
+    bind_remote.add_argument("--execute", action="store_true")
+    bind_remote.add_argument("--confirm-task-id")
+    bind_remote.add_argument("--confirm-project-id")
+    bind_remote.add_argument("--confirm-account-id")
+    bind_remote.add_argument("--confirm-generation-attempt", type=int)
+    bind_remote.add_argument("--confirm-output-media-id")
+    bind_remote.add_argument("--confirm-candidate-sha256")
+    bind_remote.add_argument("--allow-real-database", action="store_true")
     args = parser.parse_args(argv)
 
     if args.command == "run-video-once":
@@ -121,6 +134,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "resolve-submission-unknown":
         from .submission_reconcile import resolve_submission_unknown
         result = resolve_submission_unknown(args)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0 if result.get("ok") else 1
+    if args.command == "bind-reconciled-remote-result":
+        from .remote_result_binding import bind_reconciled_remote_result
+        result = bind_reconciled_remote_result(args)
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0 if result.get("ok") else 1
     return 2
