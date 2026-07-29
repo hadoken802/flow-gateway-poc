@@ -496,6 +496,24 @@ async def guarded_complete_real_task(db, task_id, account_id, lease_owner, lease
     )
 
 
+async def guarded_release_manual_submit_required(db, task_id, account_id, lease_owner, lease_version, lock_version, **fields):
+    fields.setdefault("error_code", "UPSTREAM_UNUSUAL_ACTIVITY")
+    fields.setdefault("error_message", "Google requires manual submission for this Flow project")
+    fields.setdefault("manual_submit_required_at", utc_now())
+    fields.setdefault("lease_owner", None)
+    fields.setdefault("lease_expires_at", None)
+    return await guarded_release_account(
+        db,
+        task_id,
+        account_id,
+        lease_owner,
+        lease_version,
+        lock_version,
+        "manual_submit_required",
+        **fields,
+    )
+
+
 async def complete_task(db, task_id, account_id, credit_cost, video_path):
     await db.commit()
     await db.execute("BEGIN IMMEDIATE")
@@ -592,14 +610,17 @@ async def release_task_for_manual_review(db, task_id, account_id, error_code=Non
     await db.execute("BEGIN IMMEDIATE")
     try:
         manual_submit_required_at = "strftime('%Y-%m-%dT%H:%M:%SZ', 'now')" if status == "manual_submit_required" else "manual_submit_required_at"
+        lease_clear = ", lease_owner=NULL, lease_expires_at=NULL" if status == "manual_submit_required" else ""
+        account_lock_clear = ", lock_owner=NULL, lock_expires_at=NULL" if status == "manual_submit_required" else ""
         await db.execute(
             """
             UPDATE flow_tasks
             SET status=?, error_code=?, error_message=?, remaining_credits=?,
                 manual_submit_required_at={manual_submit_required_at},
                 updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                {lease_clear}
             WHERE task_id=?
-            """.format(manual_submit_required_at=manual_submit_required_at),
+            """.format(manual_submit_required_at=manual_submit_required_at, lease_clear=lease_clear),
             (status, error_code, error_message, remaining_credits, task_id),
         )
         await db.execute(
@@ -608,8 +629,9 @@ async def release_task_for_manual_review(db, task_id, account_id, error_code=Non
             SET credits=COALESCE(?, credits), current_task_id=NULL,
                 status=CASE WHEN COALESCE(?, credits) >= 15 THEN 'ready' ELSE 'low_credits' END,
                 updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                {account_lock_clear}
             WHERE account_id=? AND current_task_id=?
-            """,
+            """.format(account_lock_clear=account_lock_clear),
             (remaining_credits, remaining_credits, account_id, task_id),
         )
         await db.commit()

@@ -44,6 +44,11 @@ class FakeRealWorkerClient(FakeWorkerClient):
         self.fail_project_create = False
         self.gets = []
         self.completed_invalid_video_path = None
+        self.remote_ids = {
+            "workflow_id": "workflow-default",
+            "output_media_id": "media-default",
+            "upstream_batch_id": "batch-default",
+        }
 
     async def create_project(self, worker, payload):
         self.projects.append((worker.account_id, dict(payload)))
@@ -70,6 +75,7 @@ class FakeRealWorkerClient(FakeWorkerClient):
             "status": "completed",
             "video_path": str(self.completed_invalid_video_path) if self.completed_invalid_video_path else video_path,
             "remaining_credits": self.states[worker.account_id]["credits"] - 15,
+            **self.remote_ids,
         }
         return self.jobs[job_id]
 
@@ -441,9 +447,95 @@ async def test_real_mode_posts_to_worker_and_passes_idempotency_key():
     task = (await scheduler.list_tasks())[0]
     assert task["worker_job_id"] == "job-real-1"
     assert task["assigned_account_id"] == "FLOW-002"
+    assert task["workflow_id"] == "workflow-default"
+    assert task["output_media_id"] == "media-default"
+    assert task["upstream_batch_id"] == "batch-default"
     assert task["error_code"] is None
     assert task["error_message"] is None
     assert task["video_path"].endswith("job-real-1.mp4")
+    assert client.retry_downloads == []
+    await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_real_mode_poll_and_download_responses_fill_missing_remote_ids():
+    from gateway.config import GatewaySettings
+
+    class PollThenDownloadClient(FakeRealWorkerClient):
+        async def submit_omni_video(self, worker, payload):
+            self.submits.append((worker.account_id, dict(payload)))
+            job_id = f"job-{payload['idempotency_key']}"
+            self.jobs[job_id] = {"job_id": job_id, "status": "waiting_download", "workflow_id": "wf-poll"}
+            return {"job_id": job_id, "status": "scheduled"}
+
+        async def retry_omni_video_download(self, worker, worker_job_id):
+            self.retry_downloads.append((worker.account_id, worker_job_id))
+            video_file = RUN_ROOT / "download_fill_ids" / f"{worker_job_id}.mp4"
+            video_file.parent.mkdir(parents=True, exist_ok=True)
+            video_file.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"x" * 2048)
+            self.jobs[worker_job_id] = {
+                "job_id": worker_job_id,
+                "status": "completed",
+                "video_path": str(video_file),
+                "remaining_credits": 35,
+                "workflow_id": "wf-poll",
+                "output_media_id": "media-download",
+                "upstream_batch_id": "batch-download",
+            }
+            return self.jobs[worker_job_id]
+
+    states = {"FLOW-001": {"credits": 5}, "FLOW-002": {"credits": 50}, "FLOW-003": {"credits": 50}}
+    client = PollThenDownloadClient(states)
+    settings = GatewaySettings(db_path=local_db("poll_download_fill_ids"), dry_run=False)
+    scheduler = make_scheduler(settings, client)
+    await scheduler.start()
+    await scheduler.create_task({"idempotency_key": "fill-ids", "project_id": "project-a", "image_path": "D:/img.png", "prompt": "p", "duration": 10, "aspect_ratio": "9:16", "preferred_account_id": "FLOW-002"})
+    for _ in range(100):
+        task = (await scheduler.list_tasks())[0]
+        if task["status"] == "completed":
+            break
+        await asyncio.sleep(0.02)
+
+    task = (await scheduler.list_tasks())[0]
+    assert task["status"] == "completed"
+    assert task["workflow_id"] == "wf-poll"
+    assert task["output_media_id"] == "media-download"
+    assert task["upstream_batch_id"] == "batch-download"
+    assert client.retry_downloads == [("FLOW-002", "job-fill-ids")]
+    await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_real_mode_remote_id_conflict_stops_without_overwrite():
+    from gateway.config import GatewaySettings
+    from gateway import crud
+    from gateway.db import connect
+
+    states = {"FLOW-001": {"credits": 5}, "FLOW-002": {"credits": 50}, "FLOW-003": {"credits": 50}}
+    settings = GatewaySettings(db_path=local_db("remote_id_conflict"), dry_run=False)
+    db = await connect(settings.db_path)
+    created = await crud.create_task(db, {"idempotency_key": "conflict", "project_id": "project-a", "image_path": "D:/img.png", "prompt": "p", "duration": 10, "aspect_ratio": "9:16", "preferred_account_id": "FLOW-002"})
+    await db.execute("UPDATE flow_tasks SET output_media_id='existing-media' WHERE task_id=?", (created["task_id"],))
+    await db.commit()
+    await db.close()
+
+    client = FakeRealWorkerClient(states, output_dir=RUN_ROOT / "conflict_outputs")
+    client.remote_ids = {"workflow_id": "workflow-new", "output_media_id": "different-media", "upstream_batch_id": "batch-new"}
+    scheduler = make_scheduler(settings, client)
+    await scheduler.start()
+    await scheduler.schedule_once()
+    for _ in range(100):
+        task = (await scheduler.list_tasks())[0]
+        if task["status"] == "manual_review":
+            break
+        await asyncio.sleep(0.02)
+
+    task = (await scheduler.list_tasks())[0]
+    accounts = {a["account_id"]: a for a in await scheduler.list_accounts()}
+    assert task["status"] == "manual_review"
+    assert task["output_media_id"] == "existing-media"
+    assert task["error_code"] == "remote_id_conflict"
+    assert accounts["FLOW-002"]["current_task_id"] is None
     await scheduler.stop()
 
 
@@ -724,7 +816,10 @@ async def test_real_mode_upstream_403_saves_worker_job_and_requires_manual_submi
     assert task["status"] == "manual_submit_required"
     assert task["worker_job_id"] == "job-upstream-403"
     assert task["error_code"] == "UPSTREAM_UNUSUAL_ACTIVITY"
-    assert accounts["FLOW-002"]["current_task_id"] == task["task_id"]
+    assert task["account_id"] == "FLOW-002"
+    assert accounts["FLOW-002"]["current_task_id"] is None
+    assert accounts["FLOW-002"]["lock_owner"] is None
+    assert task["lease_owner"] is None
     await scheduler.stop()
 
 
@@ -739,7 +834,8 @@ async def test_real_mode_does_not_repost_after_worker_job_id_is_saved():
     await scheduler.start()
     await scheduler.create_task({"idempotency_key": "real-2", "project_id": "project-a", "image_path": "D:/img.png", "prompt": "p", "duration": 10, "aspect_ratio": "9:16", "preferred_account_id": "FLOW-002"})
     for _ in range(50):
-        if client.submits:
+        task = (await scheduler.list_tasks())[0]
+        if task["worker_job_id"]:
             break
         await asyncio.sleep(0.02)
     await scheduler.stop()
@@ -984,6 +1080,59 @@ async def test_recover_clears_stale_terminal_binding_conditionally():
     await scheduler.start()
     accounts = {a["account_id"]: a for a in await scheduler.list_accounts()}
     assert accounts["FLOW-002"]["current_task_id"] is None
+    await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_recover_clears_manual_submit_runtime_lock_but_keeps_task_evidence():
+    from gateway.config import GatewaySettings
+    from gateway import crud
+    from gateway.db import connect
+
+    states = {"FLOW-001": {"credits": 5}, "FLOW-002": {"credits": 0}, "FLOW-003": {"credits": 35}}
+    settings = GatewaySettings(db_path=local_db("recover_manual_submit_lock"), dry_run=False)
+    db = await connect(settings.db_path)
+    created = await crud.create_task(db, {"idempotency_key": "manual-lock", "project_id": "project-a", "image_path": "D:/img.png", "prompt": "p", "duration": 10, "aspect_ratio": "9:16", "preferred_account_id": "FLOW-002"})
+    await db.execute(
+        """
+        UPDATE flow_tasks
+        SET status='manual_submit_required', account_id='FLOW-002', assigned_account_id='FLOW-002',
+            worker_job_id='job-manual', error_code='UPSTREAM_UNUSUAL_ACTIVITY',
+            lease_owner='lease-owner', lease_expires_at='2099-01-01T00:00:00Z'
+        WHERE task_id=?
+        """,
+        (created["task_id"],),
+    )
+    await db.execute(
+        """
+        INSERT INTO flow_accounts(account_id, api_url, enabled, status, credits, current_task_id, lock_owner, lock_expires_at)
+        VALUES('FLOW-002', 'http://127.0.0.1:8101', 1, 'low_credits', 0, ?, 'lease-owner', '2099-01-01T00:00:00Z')
+        """,
+        (created["task_id"],),
+    )
+    await db.commit()
+    await db.close()
+
+    scheduler = make_scheduler(settings, FakeRealWorkerClient(states))
+    await scheduler.start()
+    task = (await scheduler.list_tasks())[0]
+    accounts = {a["account_id"]: a for a in await scheduler.list_accounts()}
+
+    assert task["status"] == "manual_submit_required"
+    assert task["account_id"] == "FLOW-002"
+    assert task["assigned_account_id"] == "FLOW-002"
+    assert task["worker_job_id"] == "job-manual"
+    assert task["error_code"] == "UPSTREAM_UNUSUAL_ACTIVITY"
+    assert task["lease_owner"] is None
+    assert task["lease_expires_at"] is None
+    assert accounts["FLOW-002"]["status"] == "low_credits"
+    assert accounts["FLOW-002"]["current_task_id"] is None
+    assert accounts["FLOW-002"]["lock_owner"] is None
+    assert getattr(scheduler.worker_client, "submits", []) == []
+    await scheduler.recover_tasks()
+    accounts = {a["account_id"]: a for a in await scheduler.list_accounts()}
+    assert accounts["FLOW-002"]["current_task_id"] is None
+    assert getattr(scheduler.worker_client, "submits", []) == []
     await scheduler.stop()
 
 
