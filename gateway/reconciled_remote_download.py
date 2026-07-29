@@ -35,7 +35,7 @@ from .reconciled_remote_download_preflight import (
     _validate_fencing,
     _validate_poll_result,
 )
-from .worker_client import WorkerClient, WorkerSubmitError
+from .worker_client import WorkerClient, WorkerRemoteMediaFetchError
 
 
 EXPECTED_CAPABILITY_SHA = "83100858c42fa22785e9cafb78157af39ad2f61a0bb2a78ae52debd10e2c19b9"
@@ -184,6 +184,49 @@ async def _download(args: argparse.Namespace, worker_client: Any | None) -> dict
             "download_manifest": manifest,
             "download_result": "downloaded",
         })
+        return result
+    except WorkerRemoteMediaFetchError as exc:
+        worker_error = dict(exc.response)
+        final = output["final"]
+        temp = output["temp"]
+        get_media_count = worker_error.get("get_media_call_count")
+        if get_media_count is None:
+            try:
+                get_media_count = int(worker_error.get("headers", {}).get("x-get-media-call-count"))
+            except Exception:
+                get_media_count = None
+        failure_manifest = {
+            "ok": False,
+            "result": "worker_error",
+            "task_id": args.task_id,
+            "account_id": ACCOUNT_ID,
+            "job_id": JOB_ID,
+            "project_id": PROJECT_ID,
+            "output_media_id": OUTPUT_MEDIA_ID,
+            "worker_http_status": exc.status_code,
+            "worker_error_code": worker_error.get("error_code"),
+            "worker_error_class": worker_error.get("error_class"),
+            "worker_error_stage": worker_error.get("stage"),
+            "worker_error_message": worker_error.get("error_message_sanitized") or str(exc)[:300],
+            "worker_error_details": worker_error,
+            "worker_response_body_length": worker_error.get("worker_response_body_length"),
+            "worker_response_body_sha256": worker_error.get("worker_response_body_sha256"),
+            "worker_response_truncated": worker_error.get("worker_response_truncated"),
+            "get_media_call_count": get_media_count,
+            "retry_safe": worker_error.get("retry_safe"),
+            "submit_called": False,
+            "poll_called": False,
+            "download_called": False,
+            "network_calls_performed": 1,
+            "file_writes_performed": False,
+            "database_writes_performed": False,
+            "final_file_created": final.exists(),
+            "temp_file_created": temp.exists(),
+            "code_head": _git_head(),
+        }
+        if getattr(args, "result_manifest", None):
+            _write_manifest(Path(args.result_manifest), failure_manifest)
+        result.update(failure_manifest)
         return result
     except Exception as exc:
         result.update({

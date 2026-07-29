@@ -14,6 +14,7 @@ from agent.services.reconciled_encoded_video_fetch import (
     fetch_reconciled_encoded_video_once,
     validate_mp4_bytes,
 )
+from gateway.worker_client import WorkerRemoteMediaFetchError, _safe_worker_error
 
 
 TASK_ID = "3d98ece6-4ace-4dc6-817c-979d23881bc3"
@@ -178,6 +179,29 @@ class FakeWorker:
         return {"content": self.data, "headers": {"x-get-media-call-count": "1"}}
 
 
+class FailingWorker:
+    def __init__(self, response):
+        self.calls = 0
+        self.response = response
+
+    async def fetch_reconciled_encoded_video_once(self, *_args):
+        self.calls += 1
+        raise WorkerRemoteMediaFetchError(409, "Worker encoded video fetch failed: HTTP 409", self.response)
+
+
+class FakeResponse:
+    def __init__(self, status_code, content, json_data=None, json_error=False):
+        self.status_code = status_code
+        self.content = content
+        self._json_data = json_data
+        self._json_error = json_error
+
+    def json(self):
+        if self._json_error:
+            raise ValueError("not json")
+        return self._json_data
+
+
 def test_execute_writes_mp4_manifest_once(monkeypatch, tmp_path):
     gw, ag, poll, cap, poll_sha, cap_sha, fp = _setup(tmp_path, monkeypatch)
     monkeypatch.setattr(download, "_inspect_worker", lambda _url: {"health": {"status": "ok", "extension_connected": True}, "extension_connected": True, "route_available": True, "blocking_reasons": []})
@@ -190,6 +214,83 @@ def test_execute_writes_mp4_manifest_once(monkeypatch, tmp_path):
     assert out.exists()
     assert manifest.exists()
     assert json.loads(manifest.read_text())["database_writes_performed"] is False
+
+
+def test_execute_surfaces_worker_409_without_worker_submit_error(monkeypatch, tmp_path):
+    gw, ag, poll, cap, poll_sha, cap_sha, fp = _setup(tmp_path, monkeypatch)
+    monkeypatch.setattr(download, "_inspect_worker", lambda _url: {"health": {"status": "ok", "extension_connected": True}, "extension_connected": True, "route_available": True, "blocking_reasons": []})
+    out = tmp_path / "out.mp4"
+    manifest = tmp_path / "failure.json"
+    response = {
+        "ok": False,
+        "error_code": "encoded_video_fingerprint_changed",
+        "error_class": "remote_media_validation_error",
+        "stage": "post_get_media_fingerprint_validation",
+        "error_message_sanitized": "Encoded video fingerprint changed",
+        "get_media_call_count": 1,
+        "retry_safe": False,
+        "expected_encoded_video_length": 3408328,
+        "actual_encoded_video_length": 3409000,
+        "expected_encoded_video_sha256": "expected",
+        "actual_encoded_video_sha256": "actual",
+    }
+    fake = FailingWorker(response)
+    result = download.download_reconciled_remote_result(_args(gw, ag, poll, cap, out, execute=True, poll_sha=poll_sha, cap_sha=cap_sha, fp=fp, manifest=manifest), fake)
+    assert result["ok"] is False
+    assert result["result"] == "worker_error"
+    assert result["worker_http_status"] == 409
+    assert result["worker_error_code"] == "encoded_video_fingerprint_changed"
+    assert result["worker_error_stage"] == "post_get_media_fingerprint_validation"
+    assert result["get_media_call_count"] == 1
+    assert result["network_calls_performed"] == 1
+    assert result["file_writes_performed"] is False
+    assert result["database_writes_performed"] is False
+    assert fake.calls == 1
+    assert not out.exists()
+    written = json.loads(manifest.read_text(encoding="utf-8"))
+    assert written["worker_error_code"] == "encoded_video_fingerprint_changed"
+
+
+def test_safe_worker_error_sanitizes_standard_json():
+    payload = {
+        "error_code": "encoded_video_fingerprint_changed",
+        "encodedVideo": "A" * 2000,
+        "base64": "BBBB",
+        "download_url": "https://example.test/video.mp4?X-Goog-Signature=secret&Expires=1",
+        "Authorization": "Bearer secret",
+        "expected_encoded_video_length": 10,
+        "actual_encoded_video_sha256": "abc",
+    }
+    body = json.dumps(payload).encode("utf-8")
+    safe = _safe_worker_error(FakeResponse(409, body, payload))
+    assert safe["error_code"] == "encoded_video_fingerprint_changed"
+    assert safe["encodedVideo"] == "redacted"
+    assert safe["base64"] == "redacted"
+    assert safe["Authorization"] == "redacted"
+    assert safe["download_url"]["query_parameter_names"] == ["Expires", "X-Goog-Signature"]
+    assert "secret" not in json.dumps(safe)
+    assert safe["expected_encoded_video_length"] == 10
+    assert safe["actual_encoded_video_sha256"] == "abc"
+    assert safe["worker_response_body_length"] == len(body)
+    assert safe["worker_response_body_sha256"] == hashlib.sha256(body).hexdigest()
+
+
+def test_safe_worker_error_unwraps_fastapi_detail_and_text():
+    detail = {"detail": {"error_code": "encoded_video_missing", "get_media_call_count": 1}}
+    safe = _safe_worker_error(FakeResponse(409, json.dumps(detail).encode("utf-8"), detail))
+    assert safe["error_code"] == "encoded_video_missing"
+    assert safe["get_media_call_count"] == 1
+    text_safe = _safe_worker_error(FakeResponse(409, b"<html>Conflict</html>", json_error=True))
+    assert text_safe["error_code"] == "worker_non_json_error"
+    assert text_safe["worker_response_body_sha256"] == hashlib.sha256(b"<html>Conflict</html>").hexdigest()
+
+
+def test_safe_worker_error_truncates_large_body():
+    body = b"x" * (70 * 1024)
+    safe = _safe_worker_error(FakeResponse(500, body, json_error=True))
+    assert safe["worker_response_truncated"] is True
+    assert safe["worker_response_body_length"] == len(body)
+    assert safe["worker_response_body_sha256"] == hashlib.sha256(body).hexdigest()
 
 
 def test_existing_file_blocks_before_remote(monkeypatch, tmp_path):
