@@ -68,6 +68,11 @@ class WorkerClient:
         async with httpx.AsyncClient(timeout=120.0) as client:
             return (await client.post(f"{worker.api_url}/api/test/omni-video/{worker_job_id}/retry-download")).raise_for_status().json()
 
+    async def query_omni_video_remote_status_once(self, worker, worker_job_id, project_id, output_media_id):
+        payload = {"project_id": project_id, "output_media_id": output_media_id}
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            return (await client.post(f"{worker.api_url}/api/test/omni-video/{worker_job_id}/query-remote-status-once", json=payload)).raise_for_status().json()
+
     async def list_manual_flow_results(self, worker, project_id, after=None, exclude_media_ids=None):
         params = {}
         if after:

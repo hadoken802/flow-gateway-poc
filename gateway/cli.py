@@ -94,6 +94,22 @@ def main(argv: list[str] | None = None) -> int:
     bind_remote.add_argument("--confirm-output-media-id")
     bind_remote.add_argument("--confirm-candidate-sha256")
     bind_remote.add_argument("--allow-real-database", action="store_true")
+    poll_remote = subparsers.add_parser("poll-reconciled-remote-result")
+    poll_remote.add_argument("--task-id", required=True)
+    poll_remote.add_argument("--gateway-db", required=True)
+    poll_remote.add_argument("--agent-db", required=True)
+    poll_remote.add_argument("--worker-base-url")
+    poll_remote.add_argument("--execute", action="store_true")
+    poll_remote.add_argument("--confirm-task-id")
+    poll_remote.add_argument("--confirm-project-id")
+    poll_remote.add_argument("--confirm-account-id")
+    poll_remote.add_argument("--confirm-job-id")
+    poll_remote.add_argument("--confirm-output-media-id")
+    poll_remote.add_argument("--confirm-generation-attempt", type=int)
+    poll_remote.add_argument("--confirm-lock-version", type=int)
+    poll_remote.add_argument("--confirm-lease-version", type=int)
+    poll_remote.add_argument("--allow-real-remote-query", action="store_true")
+    poll_remote.add_argument("--result-file")
     args = parser.parse_args(argv)
 
     if args.command == "run-video-once":
@@ -139,6 +155,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "bind-reconciled-remote-result":
         from .remote_result_binding import bind_reconciled_remote_result
         result = bind_reconciled_remote_result(args)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0 if result.get("ok") else 1
+    if args.command == "poll-reconciled-remote-result":
+        from .reconciled_remote_poll import poll_reconciled_remote_result
+        result = poll_reconciled_remote_result(args)
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0 if result.get("ok") else 1
     return 2

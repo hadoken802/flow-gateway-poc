@@ -27,6 +27,7 @@ from agent.services.omni_client import (
     response_shape,
     unwrap_response,
 )
+from agent.services.remote_status_query import query_bound_remote_status_once
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/test/omni-video", tags=["omni-test"])
@@ -82,6 +83,11 @@ class OmniVideoResumeRequest(BaseModel):
     resume_attempt_id: str | None = None
     request_batch_id: str | None = None
     extension_request_id: str | None = None
+
+
+class BoundRemoteStatusQueryRequest(BaseModel):
+    project_id: str
+    output_media_id: str
 
 
 @router.post("")
@@ -249,6 +255,23 @@ async def get_omni_video(job_id: str):
     if not job:
         raise HTTPException(404, "Job not found")
     return _public_job(job)
+
+
+@router.post("/{job_id}/query-remote-status-once")
+async def query_omni_video_remote_status_once(job_id: str, body: BoundRemoteStatusQueryRequest):
+    job = await crud.get_omni_test_job(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    if job.get("status") != "remote_reconciled_bound":
+        raise HTTPException(409, "Job is not a reconciled remote binding")
+    if job.get("project_id") != body.project_id:
+        raise HTTPException(409, "project_id mismatch")
+    if job.get("output_media_id") != body.output_media_id:
+        raise HTTPException(409, "output_media_id mismatch")
+    return await query_bound_remote_status_once(
+        project_id=body.project_id,
+        output_media_id=body.output_media_id,
+    )
 
 
 async def _submit_existing_input_media(
