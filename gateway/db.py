@@ -1,5 +1,6 @@
 """Gateway SQLite connection and schema."""
 import aiosqlite
+from pathlib import Path
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS flow_accounts (
@@ -103,6 +104,15 @@ async def connect(db_path):
     except Exception:
         await db.execute("ROLLBACK")
         raise
+    return db
+
+
+async def connect_readonly(db_path):
+    path = Path(db_path).resolve()
+    uri_path = str(path).replace("\\", "/")
+    db = await aiosqlite.connect(f"file:{uri_path}?mode=ro", uri=True, isolation_level=None)
+    db.row_factory = aiosqlite.Row
+    await db.execute("PRAGMA query_only=ON")
     return db
 
 

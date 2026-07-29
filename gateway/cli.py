@@ -73,6 +73,8 @@ def main(argv: list[str] | None = None) -> int:
     reconcile_unknown = subparsers.add_parser("reconcile-submission-unknown")
     reconcile_unknown.add_argument("--task-id", required=True)
     reconcile_unknown.add_argument("--gateway-db", required=True)
+    reconcile_unknown.add_argument("--execute", action="store_true")
+    reconcile_unknown.add_argument("--confirm-task-id")
     resolve_unknown = subparsers.add_parser("resolve-submission-unknown")
     resolve_unknown.add_argument("--task-id", required=True)
     resolve_unknown.add_argument("--resolution", required=True, choices=["confirmed-rejected", "confirmed-not-started"])

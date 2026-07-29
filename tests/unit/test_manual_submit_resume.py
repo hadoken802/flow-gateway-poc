@@ -98,7 +98,7 @@ def args(db_path, task_id="task-2", execute=False, confirm=None, user_confirmed=
 
 
 def reconcile_args(db_path, task_id="task-2"):
-    return argparse.Namespace(task_id=task_id, gateway_db=str(db_path))
+    return argparse.Namespace(task_id=task_id, gateway_db=str(db_path), execute=False, confirm_task_id=None)
 
 
 def resolve_args(db_path, resolution="confirmed-not-started", execute=False, confirm=None):
@@ -463,8 +463,36 @@ async def test_reconcile_submission_unknown_is_read_only_and_marks_local_candida
     assert result["ok"] is True
     assert result["submit_called"] is False
     assert result["actual_remote_project_results"]["state"] == "remote_query_unavailable"
+    assert result["remote_query_available"] is False
+    assert result["allowed_resolutions"] == []
+    assert result["recommended_action"] == "keep_submission_unknown"
     assert result["local_manual_candidates"]["source"] == "agent_local_request_table"
     assert before == after
+
+
+@pytest.mark.asyncio
+async def test_reconcile_uses_readonly_connection_without_migration(tmp_path):
+    import sqlite3
+
+    db_path = tmp_path / "legacy-gateway.db"
+    con = sqlite3.connect(db_path)
+    con.execute("CREATE TABLE flow_accounts(account_id TEXT PRIMARY KEY, status TEXT, current_task_id TEXT, lock_owner TEXT, lock_version INTEGER, lock_expires_at TEXT)")
+    con.execute("CREATE TABLE flow_tasks(task_id TEXT PRIMARY KEY, status TEXT, account_id TEXT, project_id TEXT, worker_job_id TEXT, generation_attempts INTEGER, lease_owner TEXT, lease_version INTEGER, error_code TEXT)")
+    con.execute("INSERT INTO flow_accounts VALUES('FLOW-002','busy','task-2','owner',1,'later')")
+    con.execute("INSERT INTO flow_tasks VALUES('task-2','submission_unknown','FLOW-002','project-2','old-job',2,'owner',1,'WorkerSubmitError')")
+    con.commit()
+    con.close()
+    before = db_path.read_bytes()
+    result = await _reconcile_submission_unknown(reconcile_args(db_path), FakeClient(), Provider())
+    after = db_path.read_bytes()
+    assert result["ok"] is True
+    assert before == after
+    con = sqlite3.connect(db_path)
+    try:
+        cols = {row[1] for row in con.execute("PRAGMA table_info(flow_tasks)").fetchall()}
+    finally:
+        con.close()
+    assert "remote_submission_state" not in cols
 
 
 @pytest.mark.asyncio

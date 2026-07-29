@@ -22,9 +22,18 @@ def resolve_submission_unknown(args: argparse.Namespace) -> dict[str, Any]:
 async def _reconcile_submission_unknown(args: argparse.Namespace, worker_client: WorkerClient | None = None, worker_provider=None) -> dict[str, Any]:
     task_id = str(args.task_id).strip()
     db_path = Path(args.gateway_db).resolve()
+    if bool(getattr(args, "execute", False)):
+        return {
+            "ok": False,
+            "task_id": task_id,
+            "gateway_db": str(db_path),
+            "execute": True,
+            "reason_code": "reconcile_execute_not_implemented",
+            "submit_called": False,
+        }
     client = worker_client or WorkerClient()
     provider = worker_provider or RuntimeRegistryWorkerProvider()
-    db = await gateway_db.connect(db_path)
+    db = await gateway_db.connect_readonly(db_path)
     try:
         task = await crud.get_task(db, task_id)
         if not task:
@@ -42,21 +51,52 @@ async def _reconcile_submission_unknown(args: argparse.Namespace, worker_client:
                 local_candidates.update(await client.list_manual_flow_results(worker, task.get("project_id"), after=task.get("submission_started_at"), exclude_media_ids={task.get("output_media_id")}))
             except Exception as exc:
                 local_candidates.update({"error": str(exc)[:300], "candidate_count": None})
+        local_count = local_candidates.get("candidate_count")
+        remote_query = {
+            "available": False,
+            "state": "remote_query_unavailable",
+            "reason": "No reliable Google Flow project-history query is implemented; local candidates are not remote evidence.",
+        }
+        classification = _classify(task, worker_job, remote_query)
         return {
             "ok": task.get("status") == "submission_unknown",
             "task_id": task_id,
             "gateway_db": str(db_path),
-            "status": task.get("status"),
+            "task_status": task.get("status"),
+            "classification": classification,
+            "reconciliation_status": "blocked_remote_query_unavailable",
+            "remote_submission_state": task.get("remote_submission_state") or worker_job.get("remote_submission_state"),
+            "remote_query_available": remote_query["available"],
+            "remote_query_reason": remote_query["state"],
+            "local_candidate_count": local_count,
             "account": _account_summary(account or {}),
             "task": _task_summary(task),
             "worker_job": _job_summary(worker_job),
-            "local_manual_candidates": local_candidates,
-            "actual_remote_project_results": {
-                "state": "remote_query_unavailable",
-                "reason": "No reliable Google Flow project-history query is implemented; local candidates are not remote evidence.",
+            "agent_job_evidence": _job_summary(worker_job),
+            "extension_evidence": {
+                "extension_request_id": task.get("extension_request_id") or worker_job.get("extension_request_id"),
+                "available": False,
+                "reason": "No persisted extension request log row is implemented; live service worker requestLog may be ephemeral.",
             },
+            "credits_evidence": {
+                "gateway_account_credits": account.get("credits") if account else None,
+                "note": "Credits are auxiliary evidence only and do not prove remote submission state.",
+            },
+            "project_id": task.get("project_id"),
+            "request_batch_id": task.get("request_batch_id") or task.get("upstream_batch_id") or worker_job.get("request_batch_id"),
+            "extension_request_id": task.get("extension_request_id") or worker_job.get("extension_request_id"),
+            "operation_name": task.get("operation_name") or worker_job.get("operation_name"),
+            "workflow_id": task.get("workflow_id") or worker_job.get("workflow_id"),
+            "upstream_batch_id": task.get("upstream_batch_id") or worker_job.get("upstream_batch_id"),
+            "output_media_id": task.get("output_media_id") or worker_job.get("output_media_id"),
+            "processing": False,
+            "completed": False,
+            "failed": False,
+            "local_manual_candidates": local_candidates,
+            "actual_remote_project_results": remote_query,
             "resolution_allowed": False,
-            "allowed_resolutions": ["confirmed-rejected", "confirmed-not-started"],
+            "allowed_resolutions": [],
+            "recommended_action": "keep_submission_unknown",
             "submit_called": False,
         }
     finally:
@@ -157,3 +197,12 @@ def _job_summary(job: dict) -> dict:
         "remote_submission_state", "error_code",
     ]
     return {key: job.get(key) for key in keys}
+
+
+def _classify(task: dict, worker_job: dict, remote_query: dict) -> str:
+    state = task.get("remote_submission_state") or worker_job.get("remote_submission_state")
+    if state == "accepted_persist_failed":
+        return "accepted_response_identifiers_lost"
+    if task.get("status") == "submission_unknown" and not remote_query.get("available"):
+        return "submission_unknown_remote_query_unavailable"
+    return "not_submission_unknown" if task.get("status") != "submission_unknown" else "submission_unknown"
