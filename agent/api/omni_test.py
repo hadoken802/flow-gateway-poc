@@ -28,6 +28,7 @@ from agent.services.omni_client import (
     unwrap_response,
 )
 from agent.services.remote_status_query import query_bound_remote_status_once
+from agent.services.remote_media_capability import query_download_capability_once
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/test/omni-video", tags=["omni-test"])
@@ -271,6 +272,25 @@ async def query_omni_video_remote_status_once(job_id: str, body: BoundRemoteStat
     return await query_bound_remote_status_once(
         project_id=body.project_id,
         output_media_id=body.output_media_id,
+    )
+
+
+@router.post("/{job_id}/query-download-capability-once")
+async def query_omni_video_download_capability_once(job_id: str, body: BoundRemoteStatusQueryRequest):
+    job = await crud.get_omni_test_job(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    if job.get("status") != "remote_reconciled_completed_download_unverified":
+        raise HTTPException(409, "Job is not a reconciled completed download-unverified result")
+    if job.get("project_id") != body.project_id:
+        raise HTTPException(409, "project_id mismatch")
+    if job.get("output_media_id") != body.output_media_id:
+        raise HTTPException(409, "output_media_id mismatch")
+    if job.get("video_path") or job.get("completed_at"):
+        raise HTTPException(409, "Job already has local completion fields")
+    return await query_download_capability_once(
+        client=get_flow_client(),
+        media_id=body.output_media_id,
     )
 
 

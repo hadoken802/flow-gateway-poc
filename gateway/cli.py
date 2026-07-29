@@ -133,6 +133,24 @@ def main(argv: list[str] | None = None) -> int:
     prepare_download.add_argument("--agent-db", required=True)
     prepare_download.add_argument("--worker-base-url", required=True)
     prepare_download.add_argument("--output-dir", required=True)
+    media_cap = subparsers.add_parser("query-reconciled-download-capability-once")
+    media_cap.add_argument("--task-id", required=True)
+    media_cap.add_argument("--poll-result-file", required=True)
+    media_cap.add_argument("--gateway-db", required=True)
+    media_cap.add_argument("--agent-db", required=True)
+    media_cap.add_argument("--worker-base-url", required=True)
+    media_cap.add_argument("--execute", action="store_true")
+    media_cap.add_argument("--confirm-task-id")
+    media_cap.add_argument("--confirm-project-id")
+    media_cap.add_argument("--confirm-account-id")
+    media_cap.add_argument("--confirm-job-id")
+    media_cap.add_argument("--confirm-output-media-id")
+    media_cap.add_argument("--confirm-generation-attempt", type=int)
+    media_cap.add_argument("--confirm-lock-version", type=int)
+    media_cap.add_argument("--confirm-lease-version", type=int)
+    media_cap.add_argument("--confirm-poll-result-sha256")
+    media_cap.add_argument("--allow-real-media-query", action="store_true")
+    media_cap.add_argument("--result-file")
     args = parser.parse_args(argv)
 
     if args.command == "run-video-once":
@@ -193,6 +211,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "prepare-reconciled-remote-download":
         from .reconciled_remote_download_preflight import prepare_reconciled_remote_download
         result = prepare_reconciled_remote_download(args)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0 if result.get("ok") else 1
+    if args.command == "query-reconciled-download-capability-once":
+        from .reconciled_download_capability_query import query_reconciled_download_capability_once
+        result = query_reconciled_download_capability_once(args)
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0 if result.get("ok") else 1
     return 2
