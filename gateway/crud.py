@@ -2,6 +2,8 @@
 import uuid
 from datetime import datetime, timedelta, timezone
 
+from . import scheduler_kernel
+
 
 LEASE_SECONDS = 15 * 60
 
@@ -44,9 +46,44 @@ async def get_account(db, account_id):
     return dict(row) if row else None
 
 
+async def update_account_controls(db, account_id, **fields):
+    allowed = {
+        "manual_paused",
+        "manual_pause_reason",
+        "cooldown_until",
+        "cooldown_reason",
+        "account_weight",
+        "credits",
+        "credits_total",
+        "quota_source",
+        "quota_confidence",
+        "health_score",
+    }
+    updates = {key: value for key, value in fields.items() if key in allowed}
+    if not updates:
+        return await get_account(db, account_id)
+    sets = ["updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')"]
+    values = []
+    for key, value in updates.items():
+        sets.append(f"{key}=?")
+        values.append(value)
+    if "credits" in updates:
+        sets.append("quota_updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')")
+        if "credits_total" not in updates:
+            sets.append("credits_total=?")
+            values.append(updates["credits"])
+    values.append(account_id)
+    await db.execute(f"UPDATE flow_accounts SET {', '.join(sets)} WHERE account_id=?", tuple(values))
+    await db.commit()
+    return await get_account(db, account_id)
+
+
 async def create_task(db, payload):
     task_id = str(uuid.uuid4())
     idempotency_key = payload.get("idempotency_key") or f"storyboard:{task_id}:attempt:1"
+    estimated_quota_cost = int(payload.get("estimated_quota_cost") or 15)
+    priority = int(payload.get("priority") or 0)
+    not_before = payload.get("not_before")
     await db.commit()
     await db.execute("BEGIN IMMEDIATE")
     try:
@@ -62,13 +99,22 @@ async def create_task(db, payload):
             return item
         await db.execute(
             """
-            INSERT INTO flow_tasks(task_id, idempotency_key, project_id, image_path, prompt, duration, aspect_ratio, preferred_account_id)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO flow_tasks(task_id, idempotency_key, project_id, image_path, prompt, duration, aspect_ratio,
+              preferred_account_id, priority, not_before, queue_status, state, estimated_quota_cost)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 'queued', ?)
             """,
             (
                 task_id, idempotency_key, payload.get("project_id"), payload["image_path"],
                 payload["prompt"], payload["duration"], payload["aspect_ratio"], payload.get("preferred_account_id"),
+                priority, not_before, estimated_quota_cost,
             ),
+        )
+        await scheduler_kernel.record_state_event(
+            db,
+            task_id=task_id,
+            old_state=None,
+            new_state="queued",
+            reason="task_created",
         )
         await db.commit()
     except Exception:
@@ -113,77 +159,25 @@ async def count_tasks(db, statuses=None):
 
 
 async def assign_task(db, task_id, account_id, runtime_instance_id, credit_cost, lease_seconds=LEASE_SECONDS):
-    await db.commit()
-    await db.execute("BEGIN IMMEDIATE")
-    try:
-        cursor = await db.execute(
-            """
-            SELECT * FROM flow_accounts
-            WHERE account_id=? AND enabled=1 AND status='ready'
-              AND credits>=? AND current_task_id IS NULL
-            """,
-            (account_id, credit_cost),
-        )
-        account = await cursor.fetchone()
-        if not account:
-            await db.commit()
-            return None
-        cursor = await db.execute(
-            """
-            SELECT * FROM flow_tasks
-            WHERE task_id=? AND status='queued' AND (preferred_account_id IS NULL OR preferred_account_id=?)
-            """,
-            (task_id, account_id),
-        )
-        task = await cursor.fetchone()
-        if not task:
-            await db.commit()
-            return None
-        task_id = task["task_id"]
-        owner = str(uuid.uuid4())
-        deadline = lease_deadline(lease_seconds)
-        cursor = await db.execute(
-            """
-            UPDATE flow_tasks
-            SET status='leased', assigned_account_id=?, account_id=?, assigned_runtime_instance_id=?,
-                lease_owner=?, lease_version=lease_version+1, lease_expires_at=?,
-                heartbeat_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
-                assigned_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
-                updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-            WHERE task_id=? AND status='queued'
-            """,
-            (account_id, account_id, runtime_instance_id, owner, deadline, task_id),
-        )
-        if cursor.rowcount != 1:
-            await db.execute("ROLLBACK")
-            return None
-        cursor = await db.execute(
-            """
-            UPDATE flow_accounts
-            SET status='busy', current_task_id=?, lock_owner=?,
-                lock_version=lock_version+1, lock_expires_at=?, last_heartbeat_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
-                last_assigned_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
-                updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
-            WHERE account_id=? AND current_task_id IS NULL
-            """,
-            (task_id, owner, deadline, account_id),
-        )
-        if cursor.rowcount != 1:
-            await db.execute("ROLLBACK")
-            return None
-        await db.commit()
-        return await get_task(db, task_id)
-    except Exception:
-        await db.execute("ROLLBACK")
-        raise
+    return await scheduler_kernel.acquire_account_lease(
+        db,
+        task_id=task_id,
+        account_id=account_id,
+        worker_id=runtime_instance_id,
+        quota_cost=credit_cost,
+        lease_seconds=lease_seconds,
+    )
 
 
 async def assign_next_task(db, account_id, runtime_instance_id, credit_cost, lease_seconds=LEASE_SECONDS):
     cursor = await db.execute(
         """
         SELECT task_id FROM flow_tasks
-        WHERE status='queued' AND (preferred_account_id IS NULL OR preferred_account_id=?)
-        ORDER BY created_at, task_id LIMIT 1
+        WHERE status='queued' AND COALESCE(state, status)='queued'
+          AND (not_before IS NULL OR not_before <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+          AND (preferred_account_id IS NULL OR preferred_account_id=?)
+          AND COALESCE(manual_paused, 0)=0
+        ORDER BY priority DESC, created_at, task_id LIMIT 1
         """,
         (account_id,),
     )
@@ -214,6 +208,9 @@ async def guarded_update_task(db, task_id, lease_owner, lease_version, status=No
     if status is not None:
         sets.append("status=?")
         values.append(status)
+        sets.append("state=?")
+        values.append(scheduler_kernel.state_for_status(status))
+        sets.append("state_version=state_version+1")
     for key, value in fields.items():
         sets.append(f"{key}=?")
         values.append(value)
@@ -229,12 +226,22 @@ async def guarded_update_task(db, task_id, lease_owner, lease_version, status=No
     await db.commit()
     if cursor.rowcount != 1:
         return None
+    if status is not None:
+        await scheduler_kernel.record_state_event(
+            db,
+            task_id=task_id,
+            old_state=None,
+            new_state=scheduler_kernel.state_for_status(status),
+            reason="guarded_update_task",
+            lease_id=lease_owner,
+        )
+        await db.commit()
     return await get_task(db, task_id)
 
 
 async def guarded_transition(db, task_id, lease_owner, lease_version, from_status, to_status, **fields):
-    sets = ["status=?", "updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')"]
-    values = [to_status]
+    sets = ["status=?", "state=?", "state_version=state_version+1", "updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')"]
+    values = [to_status, scheduler_kernel.state_for_status(to_status)]
     for key, value in fields.items():
         if isinstance(value, tuple) and len(value) == 2 and value[0] == "increment":
             sets.append(f"{key}={key}+?")
@@ -254,6 +261,15 @@ async def guarded_transition(db, task_id, lease_owner, lease_version, from_statu
     await db.commit()
     if cursor.rowcount != 1:
         return None
+    await scheduler_kernel.record_state_event(
+        db,
+        task_id=task_id,
+        old_state=scheduler_kernel.state_for_status(from_status),
+        new_state=scheduler_kernel.state_for_status(to_status),
+        reason="guarded_transition",
+        lease_id=lease_owner,
+    )
+    await db.commit()
     return await get_task(db, task_id)
 
 
@@ -286,6 +302,15 @@ async def heartbeat(db, task_id, account_id, lease_owner, lease_version, lock_ve
         if cursor.rowcount != 1:
             await db.execute("ROLLBACK")
             return False
+        if lease_owner:
+            await db.execute(
+                """
+                UPDATE account_leases
+                SET heartbeat_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), expires_at=?
+                WHERE lease_id=? AND status='active'
+                """,
+                (deadline, lease_owner),
+            )
         await db.commit()
         return True
     except Exception:
@@ -387,6 +412,13 @@ async def ensure_active_lease(db, task_id, account_id, lease_seconds=LEASE_SECON
         if cursor.rowcount != 1:
             await db.execute("ROLLBACK")
             return None
+        await db.execute(
+            """
+            INSERT OR IGNORE INTO account_leases(lease_id, account_id, task_id, worker_id, expires_at, status)
+            VALUES(?, ?, ?, NULL, ?, 'active')
+            """,
+            (owner, account_id, task_id, deadline),
+        )
         cursor = await db.execute(
             """
             UPDATE flow_accounts
@@ -410,13 +442,23 @@ async def ensure_active_lease(db, task_id, account_id, lease_seconds=LEASE_SECON
 
 
 async def update_task_status(db, task_id, status, **fields):
-    sets = ["status=?", "updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')"]
-    values = [status]
+    sets = ["status=?", "state=?", "state_version=state_version+1", "updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')"]
+    values = [status, scheduler_kernel.state_for_status(status)]
     for key, value in fields.items():
         sets.append(f"{key}=?")
         values.append(value)
     values.append(task_id)
     await db.execute(f"UPDATE flow_tasks SET {', '.join(sets)} WHERE task_id=?", tuple(values))
+    await db.commit()
+    await scheduler_kernel.record_state_event(
+        db,
+        task_id=task_id,
+        old_state=None,
+        new_state=scheduler_kernel.state_for_status(status),
+        reason="update_task_status",
+        error_category=fields.get("last_error_category") or fields.get("error_category"),
+        error_code=fields.get("error_code") or fields.get("last_error_code"),
+    )
     await db.commit()
     return await get_task(db, task_id)
 
@@ -438,8 +480,8 @@ async def guarded_release_account(db, task_id, account_id, expected_lease_owner,
     await db.commit()
     await db.execute("BEGIN IMMEDIATE")
     try:
-        sets = ["status=?", "updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')"]
-        values = [status]
+        sets = ["status=?", "state=?", "state_version=state_version+1", "updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')"]
+        values = [status, scheduler_kernel.state_for_status(status)]
         for key, value in fields.items():
             sets.append(f"{key}=?")
             values.append(value)
@@ -455,19 +497,75 @@ async def guarded_release_account(db, task_id, account_id, expected_lease_owner,
         if cursor.rowcount != 1:
             await db.execute("ROLLBACK")
             return None
+        quota_release = status in {"failed", "failed_before_remote_submit", "cancelled", "manual_review", "manual_submit_required", "download_failed"}
+        quota_consume = status == "completed"
+        reserved = 0
+        if expected_lease_owner:
+            await db.execute(
+                "UPDATE account_leases SET status=? WHERE lease_id=? AND status='active'",
+                ("completed" if quota_consume else "released", expected_lease_owner),
+            )
+            cursor = await db.execute(
+                "SELECT COALESCE(SUM(amount),0) FROM quota_ledger WHERE lease_id=? AND entry_type='reserve' AND status='active'",
+                (expected_lease_owner,),
+            )
+            reserved = int((await cursor.fetchone())[0] or 0)
+            if reserved and quota_release:
+                await db.execute(
+                    "INSERT OR IGNORE INTO quota_ledger(ledger_id, account_id, task_id, lease_id, entry_type, amount, status) VALUES(?, ?, ?, ?, 'release', ?, 'posted')",
+                    (str(uuid.uuid4()), account_id, task_id, expected_lease_owner, reserved),
+                )
+            if reserved and quota_consume:
+                await db.execute(
+                    "INSERT OR IGNORE INTO quota_ledger(ledger_id, account_id, task_id, lease_id, entry_type, amount, status) VALUES(?, ?, ?, ?, 'consume', ?, 'posted')",
+                    (str(uuid.uuid4()), account_id, task_id, expected_lease_owner, reserved),
+                )
         cursor = await db.execute(
             """
             UPDATE flow_accounts
             SET current_task_id=NULL, lock_owner=NULL, lock_expires_at=NULL,
                 status=CASE WHEN COALESCE(credits, 0) >= 15 THEN 'ready' ELSE 'low_credits' END,
+                reserved_credits=MAX(reserved_credits-?,0),
+                consumed_credits=consumed_credits+?,
+                success_count=success_count+?,
+                failure_count=failure_count+?,
+                consecutive_failures=CASE WHEN ? THEN 0 ELSE consecutive_failures+1 END,
+                health_score=MIN(100, MAX(0, health_score+?)),
+                last_success_at=CASE WHEN ? THEN strftime('%Y-%m-%dT%H:%M:%SZ', 'now') ELSE last_success_at END,
+                last_failure_at=CASE WHEN ? THEN last_failure_at ELSE strftime('%Y-%m-%dT%H:%M:%SZ', 'now') END,
                 updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
             WHERE account_id=? AND current_task_id=? AND lock_owner=? AND lock_version=?
             """,
-            (account_id, task_id, expected_lease_owner, expected_lock_version),
+            (
+                reserved if (expected_lease_owner and (quota_release or quota_consume)) else 0,
+                reserved if quota_consume else 0,
+                1 if quota_consume else 0,
+                0 if quota_consume else 1,
+                1 if quota_consume else 0,
+                2 if quota_consume else -10,
+                1 if quota_consume else 0,
+                1 if quota_consume else 0,
+                account_id,
+                task_id,
+                expected_lease_owner,
+                expected_lock_version,
+            ),
         )
         if cursor.rowcount != 1:
             await db.execute("ROLLBACK")
             return None
+        await db.commit()
+        await scheduler_kernel.record_state_event(
+            db,
+            task_id=task_id,
+            old_state=None,
+            new_state=scheduler_kernel.state_for_status(status),
+            reason=f"release:{status}",
+            error_category=fields.get("last_error_category") or fields.get("error_category"),
+            error_code=fields.get("error_code"),
+            account_id=account_id,
+            lease_id=expected_lease_owner,
+        )
         await db.commit()
         return await get_task(db, task_id)
     except Exception:
@@ -521,7 +619,8 @@ async def complete_task(db, task_id, account_id, credit_cost, video_path):
         await db.execute(
             """
             UPDATE flow_tasks
-            SET status='completed', video_path=?, completed_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
+            SET status='completed', state='completed', state_version=state_version+1,
+                video_path=?, completed_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
                 updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
             WHERE task_id=?
             """,
@@ -531,12 +630,16 @@ async def complete_task(db, task_id, account_id, credit_cost, video_path):
             """
             UPDATE flow_accounts
             SET credits=MAX(COALESCE(credits, 0)-?, 0), current_task_id=NULL,
+                lock_owner=NULL, lock_expires_at=NULL,
+                reserved_credits=MAX(reserved_credits-?,0),
+                consumed_credits=consumed_credits+?,
                 status=CASE WHEN MAX(COALESCE(credits, 0)-?, 0) >= ? THEN 'ready' ELSE 'low_credits' END,
                 updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
             WHERE account_id=? AND current_task_id=?
             """,
-            (credit_cost, credit_cost, credit_cost, account_id, task_id),
+            (credit_cost, credit_cost, credit_cost, credit_cost, credit_cost, account_id, task_id),
         )
+        await db.execute("UPDATE account_leases SET status='completed' WHERE task_id=? AND account_id=? AND status='active'", (task_id, account_id))
         await db.commit()
     except Exception:
         await db.execute("ROLLBACK")
@@ -550,7 +653,8 @@ async def complete_real_task(db, task_id, account_id, video_path, remaining_cred
         await db.execute(
             """
             UPDATE flow_tasks
-            SET status='completed', video_path=?, remaining_credits=?, error_code=NULL, error_message=NULL,
+            SET status='completed', state='completed', state_version=state_version+1,
+                video_path=?, remaining_credits=?, error_code=NULL, error_message=NULL,
                 completed_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
                 updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
             WHERE task_id=?

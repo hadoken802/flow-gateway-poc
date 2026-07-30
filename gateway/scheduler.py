@@ -6,6 +6,7 @@ import uuid
 from pathlib import Path
 
 from . import crud
+from . import scheduler_kernel
 from .config import GatewaySettings
 from .db import connect
 from .models import ACTIVE_TASK_STATUSES
@@ -188,10 +189,18 @@ class GatewayScheduler:
             await self.db.execute(
                 """
                 UPDATE flow_accounts
-                SET current_task_id=NULL
+                SET current_task_id=NULL, lock_owner=NULL, lock_expires_at=NULL
                 WHERE current_task_id IN (
                     SELECT task_id FROM flow_tasks WHERE status='queued'
                 )
+                """
+            )
+            await self.db.execute(
+                """
+                UPDATE account_leases
+                SET status='released'
+                WHERE status='active'
+                  AND task_id IN (SELECT task_id FROM flow_tasks WHERE status='queued')
                 """
             )
             await self.db.commit()
@@ -359,6 +368,10 @@ class GatewayScheduler:
         if status["active_count"] >= self.settings.max_concurrency:
             return
         accounts = await crud.list_accounts(self.db)
+        for account in accounts:
+            today_count, total_count = await scheduler_kernel.usage_counts(self.db, account["account_id"])
+            account["_task_count_today"] = today_count
+            account["_total_task_count"] = total_count
         while status["active_count"] < self.settings.max_concurrency:
             next_task = self._next_schedulable_task(await crud.list_tasks(self.db))
             if not next_task:
@@ -400,43 +413,88 @@ class GatewayScheduler:
         states = {account["account_id"]: account for account in account_states or []}
         preferred_account_id = task.get("preferred_account_id")
         eligible = []
+        diagnostics = []
         for worker in snapshot.workers:
+            candidate = {
+                "account_id": worker.account_id,
+                "api_url": worker.api_url,
+                "selected": False,
+                "score": None,
+                "reason": None,
+            }
             if self.settings.allowed_account_ids and worker.account_id not in self.settings.allowed_account_ids:
+                candidate["reason"] = "not_allowed"
+                diagnostics.append(candidate)
                 continue
             if preferred_account_id and worker.account_id != preferred_account_id:
+                candidate["reason"] = "not_preferred"
+                diagnostics.append(candidate)
                 continue
             account = states.get(worker.account_id)
-            if account and (account.get("status") != "ready" or account.get("current_task_id")):
+            if not account:
+                account = {
+                    "account_id": worker.account_id,
+                    "status": "ready",
+                    "credits": self.settings.omni_10s_credit_cost,
+                    "reserved_credits": 0,
+                    "health_score": 100,
+                    "account_weight": 1.0,
+                }
+            ok, reason = scheduler_kernel.account_is_schedulable(account)
+            if not ok:
+                candidate["reason"] = reason
+                diagnostics.append(candidate)
                 continue
-            eligible.append(worker)
-        eligible.sort(key=lambda worker: (
-            states.get(worker.account_id, {}).get("last_assigned_at") is not None,
-            states.get(worker.account_id, {}).get("last_assigned_at") or "",
-            worker.account_id,
-        ))
+            score = scheduler_kernel.score_account(
+                account,
+                task_count_today=int(account.get("_task_count_today") or 0),
+                total_task_count=int(account.get("_total_task_count") or 0),
+                required_credits=self.settings.omni_10s_credit_cost,
+            )
+            if score < -999999:
+                candidate["reason"] = "insufficient_available_credits"
+                candidate["score"] = score
+                diagnostics.append(candidate)
+                continue
+            candidate["score"] = score
+            candidate["reason"] = "eligible"
+            eligible.append((score, worker, candidate))
+            diagnostics.append(candidate)
+        eligible.sort(key=lambda item: (-item[0], states.get(item[1].account_id, {}).get("last_used_at") or "", item[1].account_id))
         if not eligible:
             return {
                 "result": "no_eligible_worker",
                 "ok": False,
                 "selection_reason": "no eligible runtime worker",
+                "candidates": diagnostics,
                 **snapshot.diagnostics(),
             }
-        selected = eligible[0]
+        _, selected, selected_diag = eligible[0]
+        selected_diag["selected"] = True
         return {
             "result": "worker_selected",
             "ok": True,
             "selected_account_id": selected.account_id,
             "selected_runtime_instance_id": selected.runtime_instance_id,
             "selected_worker_api_endpoint": selected.api_url,
-            "selection_reason": "least recently assigned eligible account",
+            "selection_reason": "weighted least-used eligible account",
             "selection_function": "GatewayScheduler.select_worker",
+            "candidates": diagnostics,
             **snapshot.diagnostics(),
         }
 
     def _next_schedulable_task(self, tasks: list[dict]) -> dict | None:
-        for task in tasks:
-            if task.get("status") == "queued":
-                return task
+        now = crud.utc_now()
+        queued = [
+            task for task in tasks
+            if task.get("status") == "queued"
+            and (task.get("state") in {None, "queued"} or task.get("state") == "queued")
+            and not int(task.get("manual_paused") or 0)
+            and (not task.get("not_before") or task.get("not_before") <= now)
+        ]
+        queued.sort(key=lambda task: (-int(task.get("priority") or 0), task.get("created_at") or "", task.get("task_id") or ""))
+        if queued:
+            return queued[0]
         return None
 
     def dispatch_dry_run(self, task_id: str = "DRYRUN-001") -> dict:

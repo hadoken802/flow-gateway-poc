@@ -7,6 +7,7 @@ import sys
 import uvicorn
 from fastapi import FastAPI, HTTPException
 
+from . import crud
 from .config import GatewaySettings
 from .instance_lock import GatewayInstanceLock, GatewayInstanceLockError
 from .scheduler import GatewayScheduler
@@ -62,6 +63,89 @@ async def pool_status():
 @app.get("/api/pool/accounts")
 async def pool_accounts():
     return await scheduler.list_accounts()
+
+
+@app.post("/api/pool/accounts/{account_id}/pause")
+async def pause_account(account_id: str, payload: dict | None = None):
+    payload = payload or {}
+    account = await crud.update_account_controls(
+        scheduler.db,
+        account_id,
+        manual_paused=1,
+        manual_pause_reason=payload.get("reason") or "manual_pause",
+    )
+    if not account:
+        raise HTTPException(404, "Account not found")
+    return account
+
+
+@app.post("/api/pool/accounts/{account_id}/resume")
+async def resume_account(account_id: str):
+    account = await crud.update_account_controls(
+        scheduler.db,
+        account_id,
+        manual_paused=0,
+        manual_pause_reason=None,
+    )
+    if not account:
+        raise HTTPException(404, "Account not found")
+    return account
+
+
+@app.post("/api/pool/accounts/{account_id}/cooldown")
+async def set_account_cooldown(account_id: str, payload: dict):
+    account = await crud.update_account_controls(
+        scheduler.db,
+        account_id,
+        cooldown_until=payload.get("cooldown_until"),
+        cooldown_reason=payload.get("reason") or "manual_cooldown",
+    )
+    if not account:
+        raise HTTPException(404, "Account not found")
+    return account
+
+
+@app.post("/api/pool/accounts/{account_id}/cooldown/clear")
+async def clear_account_cooldown(account_id: str):
+    account = await crud.update_account_controls(
+        scheduler.db,
+        account_id,
+        cooldown_until=None,
+        cooldown_reason=None,
+    )
+    if not account:
+        raise HTTPException(404, "Account not found")
+    return account
+
+
+@app.post("/api/pool/accounts/{account_id}/weight")
+async def set_account_weight(account_id: str, payload: dict):
+    try:
+        weight = float(payload.get("account_weight"))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "account_weight must be a number") from None
+    account = await crud.update_account_controls(scheduler.db, account_id, account_weight=weight)
+    if not account:
+        raise HTTPException(404, "Account not found")
+    return account
+
+
+@app.post("/api/pool/accounts/{account_id}/credits")
+async def calibrate_account_credits(account_id: str, payload: dict):
+    credits = payload.get("credits")
+    if isinstance(credits, bool) or not isinstance(credits, int) or credits < 0:
+        raise HTTPException(400, "credits must be a non-negative integer")
+    account = await crud.update_account_controls(
+        scheduler.db,
+        account_id,
+        credits=credits,
+        credits_total=credits,
+        quota_source=payload.get("source") or "manual_calibration",
+        quota_confidence=payload.get("confidence") or "manual",
+    )
+    if not account:
+        raise HTTPException(404, "Account not found")
+    return account
 
 
 @app.get("/api/pool/tasks")

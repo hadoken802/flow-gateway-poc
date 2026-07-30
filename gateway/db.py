@@ -88,6 +88,69 @@ CREATE TABLE IF NOT EXISTS gateway_schema_version (
     version INTEGER PRIMARY KEY,
     applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
+
+CREATE TABLE IF NOT EXISTS task_state_events (
+    event_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    old_state TEXT,
+    new_state TEXT NOT NULL,
+    reason TEXT,
+    error_category TEXT,
+    error_code TEXT,
+    account_id TEXT,
+    worker_id TEXT,
+    lease_id TEXT,
+    attempt_type TEXT,
+    attempt_number INTEGER,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS account_leases (
+    lease_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    worker_id TEXT,
+    acquired_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    heartbeat_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    expires_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active'
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_account_lease
+ON account_leases(account_id)
+WHERE status='active';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_task_lease
+ON account_leases(task_id)
+WHERE status='active';
+
+CREATE TABLE IF NOT EXISTS quota_ledger (
+    ledger_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    lease_id TEXT,
+    entry_type TEXT NOT NULL,
+    amount INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    UNIQUE(task_id, lease_id, entry_type, status)
+);
+
+CREATE TABLE IF NOT EXISTS task_attempts (
+    attempt_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    attempt_type TEXT NOT NULL,
+    attempt_number INTEGER NOT NULL,
+    account_id TEXT,
+    worker_id TEXT,
+    lease_id TEXT,
+    started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    finished_at TEXT,
+    result TEXT,
+    error_category TEXT,
+    error_code TEXT,
+    UNIQUE(task_id, attempt_type, attempt_number)
+);
 """
 
 
@@ -157,6 +220,24 @@ async def _migrate(db):
         "remote_http_status": "INTEGER",
         "remote_submission_state": "TEXT",
         "remote_result_query_state": "TEXT",
+        "priority": "INTEGER NOT NULL DEFAULT 0",
+        "queue_status": "TEXT NOT NULL DEFAULT 'queued'",
+        "state": "TEXT",
+        "state_version": "INTEGER NOT NULL DEFAULT 0",
+        "assigned_worker_id": "TEXT",
+        "active_lease_id": "TEXT",
+        "not_before": "TEXT",
+        "started_at": "TEXT",
+        "generation_attempt_count": "INTEGER NOT NULL DEFAULT 0",
+        "generation_max_attempts": "INTEGER NOT NULL DEFAULT 1",
+        "download_attempt_count": "INTEGER NOT NULL DEFAULT 0",
+        "download_max_attempts": "INTEGER NOT NULL DEFAULT 2",
+        "estimated_quota_cost": "INTEGER NOT NULL DEFAULT 15",
+        "reserved_quota_cost": "INTEGER NOT NULL DEFAULT 0",
+        "actual_quota_cost": "INTEGER NOT NULL DEFAULT 0",
+        "last_error_category": "TEXT",
+        "recovery_required": "INTEGER NOT NULL DEFAULT 0",
+        "manual_paused": "INTEGER NOT NULL DEFAULT 0",
     }
     for name, ddl in additions.items():
         if name not in columns:
@@ -168,7 +249,88 @@ async def _migrate(db):
         "lock_version": "INTEGER NOT NULL DEFAULT 0",
         "lock_expires_at": "TEXT",
         "last_heartbeat_at": "TEXT",
+        "credits_total": "INTEGER",
+        "reserved_credits": "INTEGER NOT NULL DEFAULT 0",
+        "consumed_credits": "INTEGER NOT NULL DEFAULT 0",
+        "quota_updated_at": "TEXT",
+        "quota_source": "TEXT",
+        "quota_confidence": "TEXT",
+        "health_score": "INTEGER NOT NULL DEFAULT 100",
+        "consecutive_failures": "INTEGER NOT NULL DEFAULT 0",
+        "success_count": "INTEGER NOT NULL DEFAULT 0",
+        "failure_count": "INTEGER NOT NULL DEFAULT 0",
+        "last_success_at": "TEXT",
+        "last_failure_at": "TEXT",
+        "cooldown_until": "TEXT",
+        "cooldown_reason": "TEXT",
+        "manual_paused": "INTEGER NOT NULL DEFAULT 0",
+        "manual_pause_reason": "TEXT",
+        "account_weight": "REAL NOT NULL DEFAULT 1.0",
+        "last_used_at": "TEXT",
     }
     for name, ddl in account_additions.items():
         if name not in account_columns:
             await db.execute(f"ALTER TABLE flow_accounts ADD COLUMN {name} {ddl}")
+    await db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS task_state_events (
+            event_id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            old_state TEXT,
+            new_state TEXT NOT NULL,
+            reason TEXT,
+            error_category TEXT,
+            error_code TEXT,
+            account_id TEXT,
+            worker_id TEXT,
+            lease_id TEXT,
+            attempt_type TEXT,
+            attempt_number INTEGER,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+        );
+        CREATE TABLE IF NOT EXISTS account_leases (
+            lease_id TEXT PRIMARY KEY,
+            account_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            worker_id TEXT,
+            acquired_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+            heartbeat_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+            expires_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active'
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_account_lease
+        ON account_leases(account_id)
+        WHERE status='active';
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_task_lease
+        ON account_leases(task_id)
+        WHERE status='active';
+        CREATE TABLE IF NOT EXISTS quota_ledger (
+            ledger_id TEXT PRIMARY KEY,
+            account_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            lease_id TEXT,
+            entry_type TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+            UNIQUE(task_id, lease_id, entry_type, status)
+        );
+        CREATE TABLE IF NOT EXISTS task_attempts (
+            attempt_id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            attempt_type TEXT NOT NULL,
+            attempt_number INTEGER NOT NULL,
+            account_id TEXT,
+            worker_id TEXT,
+            lease_id TEXT,
+            started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+            finished_at TEXT,
+            result TEXT,
+            error_category TEXT,
+            error_code TEXT,
+            UNIQUE(task_id, attempt_type, attempt_number)
+        );
+        """
+    )
+    await db.execute("UPDATE flow_tasks SET state=status WHERE state IS NULL")
+    await db.execute("UPDATE flow_accounts SET credits_total=credits WHERE credits_total IS NULL AND credits IS NOT NULL")
