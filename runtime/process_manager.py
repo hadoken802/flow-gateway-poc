@@ -400,7 +400,7 @@ class RuntimeManager:
         self.ownership_protector = ownership_protector
 
     def open_login(self, account_id: str) -> RuntimeResult:
-        account = self._account_or_error(account_id)
+        account = self._registered_account_or_error(account_id)
         if isinstance(account, RuntimeResult):
             return account
         base = self._preflight(account, require_profile=True, require_chrome=True)
@@ -469,7 +469,7 @@ class RuntimeManager:
             return RuntimeResult("failed", account.account_id, False, str(error), {"rollback_completed": True})
 
     def start_worker_only(self, account_id: str) -> RuntimeResult:
-        account = self._account_or_error(account_id)
+        account = self._registered_account_or_error(account_id)
         if isinstance(account, RuntimeResult):
             return account
         base = self._preflight(account, require_profile=True, require_chrome=False)
@@ -796,6 +796,12 @@ class RuntimeManager:
             return RuntimeResult("account_not_found", account_id, False)
         if not account.enabled:
             return RuntimeResult("account_disabled", account_id, False)
+        return account
+
+    def _registered_account_or_error(self, account_id: str) -> AccountRecord | RuntimeResult:
+        account = self.registry.get(account_id)
+        if not account:
+            return RuntimeResult("account_not_found", account_id, False)
         return account
 
     def _preflight(self, account: AccountRecord, require_profile: bool, require_chrome: bool) -> RuntimeResult | None:

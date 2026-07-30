@@ -127,3 +127,23 @@ def test_v1_routes_are_registered():
     assert "/api/v1/nodes" in paths
     assert "/api/v1/nodes/{account_id}/refresh-session" in paths
     assert "/" in paths
+
+
+def test_account_node_add_form_maps_fields_and_reports_results():
+    from gateway.main import TASK_CENTER_HTML
+
+    assert 'id="nodeAccountId"' in TASK_CENTER_HTML
+    assert 'id="nodeDisplayName"' in TASK_CENTER_HTML
+    assert 'id="nodeWorkerHost"' in TASK_CENTER_HTML
+    assert 'value="127.0.0.1"' in TASK_CENTER_HTML
+    assert 'id="nodeWorkerPort"' in TASK_CENTER_HTML
+    assert 'id="nodeCdpHost"' in TASK_CENTER_HTML
+    assert 'id="nodeCdpPort"' in TASK_CENTER_HTML
+    assert 'id="nodeEnabled" type="checkbox"' in TASK_CENTER_HTML
+    assert "worker_host:(nodeWorkerHost.value||'127.0.0.1').trim()" in TASK_CENTER_HTML
+    assert "cdp_host:(nodeCdpHost.value||'127.0.0.1').trim()" in TASK_CENTER_HTML
+    assert "enabled:nodeEnabled.checked" in TASK_CENTER_HTML
+    assert "POST /api/v1/nodes succeeded" in TASK_CENTER_HTML
+    assert "POST /api/v1/nodes returned duplicate" in TASK_CENTER_HTML
+    assert "POST /api/v1/nodes failed" in TASK_CENTER_HTML
+    assert "await loadNodes();" in TASK_CENTER_HTML

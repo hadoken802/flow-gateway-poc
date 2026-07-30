@@ -501,11 +501,14 @@ TASK_CENTER_HTML = """
   <section>
     <h2>Account Nodes</h2>
     <div class="row">
-      <input id="nodeAccountId" placeholder="FLOW-004">
-      <input id="nodeWorkerPort" placeholder="worker port">
-      <input id="nodeCdpPort" placeholder="cdp port">
-      <input id="nodeDisplayName" placeholder="display name">
-      <button class="primary" onclick="addNode()">Add Node</button>
+      <input id="nodeAccountId" placeholder="Account ID">
+      <input id="nodeDisplayName" placeholder="Display Name">
+      <input id="nodeWorkerHost" placeholder="Worker Host" value="127.0.0.1">
+      <input id="nodeWorkerPort" placeholder="Worker Port">
+      <input id="nodeCdpHost" placeholder="CDP Host" value="127.0.0.1">
+      <input id="nodeCdpPort" placeholder="CDP Port">
+      <label><input id="nodeEnabled" type="checkbox"> Enabled</label>
+      <button id="addNodeButton" type="button" class="primary" onclick="addNode()">Add Node</button>
       <button onclick="loadNodeExample()">Load Node Example</button>
       <button onclick="importNodes()">Import Nodes</button>
     </div>
@@ -558,10 +561,54 @@ async function loadNodes(){
   nodesTable.innerHTML='<tr><th>account</th><th>worker</th><th>cdp</th><th>pids</th><th>runtime</th><th>extension</th><th>oauth/quota</th><th>credits</th><th>current task</th><th>enabled</th><th>paused/cooldown</th><th>error</th><th>actions</th></tr>'+
     rows.map(n=>`<tr>${td(n.account_id)}${td(`${n.worker_host}:${n.worker_port}`)}${td(`${n.cdp_host}:${n.cdp_port}`)}${td(`worker ${n.worker_pid||''}<br>chrome ${n.chrome_pid||''}`)}${td(n.worker_status)}${td(n.extension_status)}${td(`${n.oauth_status||''}<br>${n.quota_confidence||''}`)}${td(n.credits)}${td(n.current_task_id)}${td(n.enabled)}${td(`${n.manual_paused?'paused':''}<br>${n.cooldown_until||''}`)}${td(n.last_gateway_error||n.last_error||'')}<td><button onclick="startNode('${n.account_id}')">start</button> <button onclick="stopNode('${n.account_id}')">stop</button> <button onclick="restartNode('${n.account_id}')">restart</button> <button onclick="refreshNodeSession('${n.account_id}')">refresh session</button> <button onclick="enableNode('${n.account_id}')">enable</button> <button onclick="disableNode('${n.account_id}')">disable</button> <button onclick="editNode('${n.account_id}',${n.worker_port},${n.cdp_port})">edit ports</button> <button onclick="nodeDetail('${n.account_id}')">diagnostics</button></td></tr>`).join('');
 }
+function showNodeResult(message, isError){
+  nodeResult.className=isError?'error':'ok';
+  nodeResult.textContent=message;
+}
 async function addNode(){
-  const payload={account_id:nodeAccountId.value,worker_port:Number(nodeWorkerPort.value),cdp_port:Number(nodeCdpPort.value),display_name:nodeDisplayName.value||nodeAccountId.value,enabled:false};
-  nodeResult.textContent=JSON.stringify(await api('/api/v1/nodes',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}),null,2);
-  await loadNodes();
+  const button=document.getElementById('addNodeButton');
+  const payload={
+    account_id:nodeAccountId.value.trim(),
+    display_name:(nodeDisplayName.value||nodeAccountId.value).trim(),
+    worker_host:(nodeWorkerHost.value||'127.0.0.1').trim(),
+    worker_port:Number(nodeWorkerPort.value),
+    cdp_host:(nodeCdpHost.value||'127.0.0.1').trim(),
+    cdp_port:Number(nodeCdpPort.value),
+    enabled:nodeEnabled.checked
+  };
+  if(!payload.account_id || !payload.worker_port || !payload.cdp_port){
+    showNodeResult('Missing required fields: account_id, worker_port, cdp_port', true);
+    return;
+  }
+  button.disabled=true;
+  const oldText=button.textContent;
+  button.textContent='Adding...';
+  showNodeResult('Submitting node...', false);
+  try{
+    const r=await fetch('/api/v1/nodes',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const text=await r.text();
+    let data; try{data=JSON.parse(text)}catch(_){data={raw:text}}
+    if(!r.ok){
+      showNodeResult(`POST /api/v1/nodes failed: HTTP ${r.status}\n${JSON.stringify(data,null,2)}`, true);
+      return;
+    }
+    if(data.result==='duplicate'){
+      showNodeResult(`POST /api/v1/nodes returned duplicate for ${payload.account_id}\n${JSON.stringify(data,null,2)}`, true);
+    }else{
+      showNodeResult(`POST /api/v1/nodes succeeded: ${payload.account_id}\n${JSON.stringify(data,null,2)}`, false);
+      nodeAccountId.value='';
+      nodeDisplayName.value='';
+      nodeWorkerPort.value='';
+      nodeCdpPort.value='';
+      nodeEnabled.checked=false;
+    }
+    await loadNodes();
+  }catch(e){
+    showNodeResult(`POST /api/v1/nodes failed before response\n${e.message}`, true);
+  }finally{
+    button.disabled=false;
+    button.textContent=oldText;
+  }
 }
 async function loadNodeExample(){const e=await api('/api/v1/docs/examples'); nodeImportContent.value=e.nodes.csv;}
 async function importNodes(){
