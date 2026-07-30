@@ -159,6 +159,41 @@ async def test_node_list_merges_runtime_registry_and_gateway_account(gateway_db,
     assert listed[0]["quota_confidence"] == "live"
 
 
+@pytest.mark.asyncio
+async def test_delete_node_removes_orphan_gateway_account(gateway_db, registry):
+    from gateway import crud, nodes
+
+    scheduler = FakeScheduler(gateway_db)
+    await nodes.create_node(scheduler, {"account_id": "FLOW-UI-TEST", "worker_port": 8199, "cdp_port": 9399}, registry)
+
+    result = await nodes.delete_node(scheduler, "FLOW-UI-TEST", registry)
+
+    assert result["gateway_account_cleanup"]["result"] == "deleted"
+    assert await crud.get_account(gateway_db, "FLOW-UI-TEST") is None
+
+
+@pytest.mark.asyncio
+async def test_delete_orphan_account_refuses_history_references(gateway_db):
+    from gateway import crud
+
+    await _upsert_gateway_account(gateway_db, "FLOW-UI-TEST", 8199, status="offline", credits=None, confidence=None, enabled=False)
+    await crud.create_task(
+        gateway_db,
+        {
+            "idempotency_key": "ui-test-history",
+            "image_path": "D:/img.png",
+            "prompt": "p",
+            "preferred_account_id": "FLOW-UI-TEST",
+        },
+    )
+
+    result = await crud.delete_orphan_account(gateway_db, "FLOW-UI-TEST", known_registry_account_ids=set())
+
+    assert result["ok"] is False
+    assert result["result"] == "has_history"
+    assert await crud.get_account(gateway_db, "FLOW-UI-TEST") is not None
+
+
 def test_dynamic_concurrency_counts_only_live_ready_accounts():
     from gateway.config import GatewaySettings
     from gateway.scheduler import GatewayScheduler

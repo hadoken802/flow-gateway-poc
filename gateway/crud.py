@@ -63,6 +63,43 @@ async def get_account(db, account_id):
     return dict(row) if row else None
 
 
+async def account_history_counts(db, account_id):
+    task_cursor = await db.execute(
+        "SELECT COUNT(*) FROM flow_tasks WHERE account_id=? OR assigned_account_id=? OR preferred_account_id=?",
+        (account_id, account_id, account_id),
+    )
+    task_count = int((await task_cursor.fetchone())[0])
+    lease_cursor = await db.execute("SELECT COUNT(*) FROM account_leases WHERE account_id=?", (account_id,))
+    lease_count = int((await lease_cursor.fetchone())[0])
+    quota_cursor = await db.execute("SELECT COUNT(*) FROM quota_ledger WHERE account_id=?", (account_id,))
+    quota_count = int((await quota_cursor.fetchone())[0])
+    attempt_cursor = await db.execute("SELECT COUNT(*) FROM task_attempts WHERE account_id=?", (account_id,))
+    attempt_count = int((await attempt_cursor.fetchone())[0])
+    event_cursor = await db.execute("SELECT COUNT(*) FROM task_state_events WHERE account_id=?", (account_id,))
+    event_count = int((await event_cursor.fetchone())[0])
+    return {
+        "flow_tasks": task_count,
+        "account_leases": lease_count,
+        "quota_ledger": quota_count,
+        "task_attempts": attempt_count,
+        "task_state_events": event_count,
+    }
+
+
+async def delete_orphan_account(db, account_id, *, known_registry_account_ids):
+    account = await get_account(db, account_id)
+    if not account:
+        return {"ok": False, "account_id": account_id, "result": "not_found"}
+    if account_id in set(known_registry_account_ids):
+        return {"ok": False, "account_id": account_id, "result": "in_registry"}
+    counts = await account_history_counts(db, account_id)
+    if any(counts.values()):
+        return {"ok": False, "account_id": account_id, "result": "has_history", "history_counts": counts}
+    await db.execute("DELETE FROM flow_accounts WHERE account_id=?", (account_id,))
+    await db.commit()
+    return {"ok": True, "account_id": account_id, "result": "deleted", "history_counts": counts}
+
+
 async def update_account_controls(db, account_id, **fields):
     allowed = {
         "manual_paused",

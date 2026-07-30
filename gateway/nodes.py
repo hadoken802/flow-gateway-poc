@@ -121,8 +121,13 @@ async def delete_node(scheduler, account_id: str, registry: AccountRegistry | No
         return None
     await set_node_enabled(scheduler, account_id, False, registry)
     removed = registry.remove_account(account_id)
+    cleanup = await crud.delete_orphan_account(
+        scheduler.db,
+        account_id,
+        known_registry_account_ids={account.account_id for account in registry.list_accounts()},
+    )
     await scheduler.async_refresh_worker_snapshot()
-    return {"ok": removed, "account_id": account_id, "profile_deleted": False, "history_deleted": False}
+    return {"ok": removed, "account_id": account_id, "profile_deleted": False, "history_deleted": False, "gateway_account_cleanup": cleanup}
 
 
 async def runtime_action(scheduler, account_id: str, action: str, registry: AccountRegistry | None = None, manager: RuntimeManager | None = None) -> dict | None:
