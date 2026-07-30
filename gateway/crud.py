@@ -16,21 +16,38 @@ def lease_deadline(seconds: float = LEASE_SECONDS) -> str:
     return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-async def upsert_account(db, worker, status="offline", credits=None, last_error=None):
+async def upsert_account(db, worker, status="offline", credits=None, last_error=None, quota_source=None, quota_confidence=None):
     await db.execute(
         """
-        INSERT INTO flow_accounts(account_id, api_url, enabled, status, credits, last_error)
-        VALUES(?, ?, ?, ?, ?, ?)
+        INSERT INTO flow_accounts(account_id, api_url, enabled, status, credits, credits_total, last_error, quota_source, quota_confidence)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(account_id) DO UPDATE SET
           api_url=excluded.api_url,
           enabled=excluded.enabled,
           status=excluded.status,
           credits=excluded.credits,
+          credits_total=COALESCE(excluded.credits_total, flow_accounts.credits_total),
           last_error=excluded.last_error,
+          quota_updated_at=CASE
+            WHEN excluded.quota_confidence='live' THEN strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+            ELSE flow_accounts.quota_updated_at
+          END,
+          quota_source=COALESCE(excluded.quota_source, flow_accounts.quota_source),
+          quota_confidence=COALESCE(excluded.quota_confidence, flow_accounts.quota_confidence),
           last_health_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
           updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
         """,
-        (worker.account_id, worker.api_url, int(worker.enabled), status, credits, last_error),
+        (
+            worker.account_id,
+            worker.api_url,
+            int(worker.enabled),
+            status,
+            credits,
+            credits,
+            last_error,
+            quota_source,
+            quota_confidence,
+        ),
     )
     await db.commit()
 

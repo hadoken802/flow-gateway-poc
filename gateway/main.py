@@ -49,7 +49,7 @@ async def lifespan(_app):
         instance_lock.release()
 
 
-app = FastAPI(title="Flow Gateway Dry Run", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Flow Gateway V3 Task Center", version="0.3.0", lifespan=lifespan)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -374,33 +374,33 @@ TASK_CENTER_HTML = """
 <header><h1>Flow Gateway Task Center</h1></header>
 <main>
   <section>
-    <h2>总览</h2>
+    <h2>Overview</h2>
     <div class="grid" id="metrics"></div>
   </section>
   <section>
-    <h2>批量导入</h2>
+    <h2>Batch Import</h2>
     <div class="row">
       <select id="importFormat"><option value="csv">CSV</option><option value="json">JSON</option></select>
       <input id="importFile" type="file" accept=".csv,.json" onchange="loadImportFile()">
-      <button onclick="loadExample()">载入示例</button>
-      <button class="primary" onclick="importTasks()">导入任务</button>
+      <button onclick="loadExample()">Load Example</button>
+      <button class="primary" onclick="importTasks()">Import Tasks</button>
     </div>
     <textarea id="importContent"></textarea>
     <pre id="importResult"></pre>
   </section>
   <section>
-    <h2>任务列表</h2>
+    <h2>Tasks</h2>
     <div class="row">
       <input id="filterStatus" placeholder="status">
       <input id="filterBatch" placeholder="batch_id">
       <input id="filterAccount" placeholder="account_id">
-      <button onclick="loadTasks()">刷新</button>
-      <button onclick="exportTasks()">导出结果</button>
+      <button onclick="loadTasks()">Refresh</button>
+      <button onclick="exportTasks()">Export</button>
     </div>
     <div style="overflow:auto"><table id="tasks"></table></div>
   </section>
   <section>
-    <h2>账号池</h2>
+    <h2>Accounts</h2>
     <div style="overflow:auto"><table id="accounts"></table></div>
   </section>
 </main>
@@ -415,14 +415,14 @@ async function refresh(){
 }
 async function loadAccounts(){
   const rows=await api('/api/v1/accounts');
-  accounts.innerHTML='<tr><th>账号</th><th>状态</th><th>credits</th><th>reserved</th><th>health</th><th>current_task</th><th>cooldown</th><th>weight</th><th>操作</th></tr>'+
+  accounts.innerHTML='<tr><th>account</th><th>status</th><th>credits</th><th>reserved</th><th>health</th><th>current_task</th><th>cooldown</th><th>weight</th><th>actions</th></tr>'+
     rows.map(a=>`<tr>${td(a.account_id)}${td(a.status)}${td(a.credits)}${td(a.reserved_credits)}${td(a.health_score)}${td(a.current_task_id)}${td(a.cooldown_until)}${td(a.account_weight)}<td><button onclick="pauseAccount('${a.account_id}')">pause</button> <button onclick="resumeAccount('${a.account_id}')">resume</button> <button onclick="cooldownAccount('${a.account_id}')">cooldown</button> <button onclick="clearCooldown('${a.account_id}')">clear</button> <button onclick="setWeight('${a.account_id}')">weight</button> <button onclick="setCredits('${a.account_id}')">credits</button></td></tr>`).join('');
 }
 async function loadTasks(){
   const q=new URLSearchParams(); if(filterStatus.value) q.set('status',filterStatus.value); if(filterBatch.value) q.set('batch_id',filterBatch.value); if(filterAccount.value) q.set('account_id',filterAccount.value);
   const rows=await api('/api/v1/tasks?'+q.toString());
-  tasks.innerHTML='<tr><th>task_id</th><th>external</th><th>batch</th><th>状态</th><th>账号</th><th>job</th><th>project</th><th>gen</th><th>dl</th><th>priority</th><th>输出</th><th>错误</th><th>操作</th></tr>'+
-    rows.map(t=>`<tr>${td(`<code>${t.task_id}</code>`)}${td(t.external_task_id)}${td(t.batch_id)}${td(t.status)}${td(t.assigned_account_id||t.account_id)}${td(t.worker_job_id)}${td(t.project_id)}${td(t.generation_attempts)}${td(t.download_attempts)}${td(t.priority)}${td(t.video_path||((t.output_directory||'')+'\\\\'+(t.output_filename||'')))}${td(t.error_code||t.last_error_category||'')}<td><button onclick="detail('${t.task_id}')">详情</button> <button onclick="pauseTask('${t.task_id}')">暂停</button> <button onclick="resumeTask('${t.task_id}')">恢复</button> <button onclick="cancelTask('${t.task_id}')">取消</button> <button onclick="priorityTask('${t.task_id}')">优先级</button> <button onclick="requeueTask('${t.task_id}')">重排</button> <button onclick="retryDownload('${t.task_id}')">retry download</button> <button onclick="reconcileTask('${t.task_id}')">reconcile</button> <button onclick="manualTask('${t.task_id}')">need manual</button></td></tr>`).join('');
+  tasks.innerHTML='<tr><th>task_id</th><th>external</th><th>batch</th><th>status</th><th>account</th><th>job</th><th>project</th><th>gen</th><th>dl</th><th>priority</th><th>output</th><th>error</th><th>actions</th></tr>'+
+    rows.map(t=>`<tr>${td(`<code>${t.task_id}</code>`)}${td(t.external_task_id)}${td(t.batch_id)}${td(t.status)}${td(t.assigned_account_id||t.account_id)}${td(t.worker_job_id)}${td(t.project_id)}${td(t.generation_attempts)}${td(t.download_attempts)}${td(t.priority)}${td(t.video_path||((t.output_directory||'')+'/'+(t.output_filename||'')))}${td(t.error_code||t.last_error_category||'')}<td><button onclick="detail('${t.task_id}')">detail</button> <button onclick="pauseTask('${t.task_id}')">pause</button> <button onclick="resumeTask('${t.task_id}')">resume</button> <button onclick="cancelTask('${t.task_id}')">cancel</button> <button onclick="priorityTask('${t.task_id}')">priority</button> <button onclick="requeueTask('${t.task_id}')">requeue</button> <button onclick="retryDownload('${t.task_id}')">retry download</button> <button onclick="reconcileTask('${t.task_id}')">reconcile</button> <button onclick="manualTask('${t.task_id}')">need manual</button></td></tr>`).join('');
 }
 async function loadExample(){const e=await api('/api/v1/docs/examples'); importContent.value=importFormat.value==='csv'?e.csv:JSON.stringify(e.json,null,2);}
 async function loadImportFile(){const f=importFile.files[0]; if(!f) return; importContent.value=await f.text(); importFormat.value=f.name.toLowerCase().endsWith('.json')?'json':'csv';}
@@ -430,7 +430,7 @@ async function importTasks(){try{const format=importFormat.value; const content=
 async function pauseAccount(id){await api(`/api/pool/accounts/${id}/pause`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}); await refresh()}
 async function resumeAccount(id){await api(`/api/pool/accounts/${id}/resume`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}); await refresh()}
 async function cooldownAccount(id){const seconds=prompt('cooldown seconds','300'); if(!seconds) return; await api(`/api/pool/accounts/${id}/cooldown`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({seconds:Number(seconds),reason:'task_center'})}); await refresh()}
-async function clearCooldown(id){await api(`/api/pool/accounts/${id}/clear-cooldown`,{method:'POST'}); await refresh()}
+async function clearCooldown(id){await api(`/api/pool/accounts/${id}/cooldown/clear`,{method:'POST'}); await refresh()}
 async function setWeight(id){const weight=prompt('account weight','1'); if(!weight) return; await api(`/api/pool/accounts/${id}/weight`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({account_weight:Number(weight)})}); await refresh()}
 async function setCredits(id){const credits=prompt('credits'); if(!credits) return; await api(`/api/pool/accounts/${id}/credits`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({credits:Number(credits),source:'task_center'})}); await refresh()}
 async function pauseTask(id){await api(`/api/v1/tasks/${id}/pause`,{method:'POST'}); await loadTasks()}

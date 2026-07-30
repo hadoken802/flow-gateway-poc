@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -26,7 +28,7 @@ class GatewayInstanceLock:
         if self.lock_path.exists():
             existing = self._read()
             pid = int(existing.get("server_pid") or existing.get("launcher_pid") or 0)
-            if pid and _pid_exists(pid):
+            if pid and _pid_exists(pid) and _pid_listens_on_port(pid, self.port):
                 raise GatewayInstanceLockError("gateway_instance_already_running")
             try:
                 self.lock_path.unlink()
@@ -67,8 +69,35 @@ class GatewayInstanceLock:
 def _pid_exists(pid: int) -> bool:
     if pid <= 0:
         return False
+    if sys.platform == "win32":
+        import ctypes
+
+        SYNCHRONIZE = 0x00100000
+        handle = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, False, int(pid))
+        if handle:
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+        return False
     try:
         os.kill(pid, 0)
         return True
-    except OSError:
+    except (OSError, SystemError):
         return False
+
+
+def _pid_listens_on_port(pid: int, port: int) -> bool:
+    if pid <= 0 or port <= 0:
+        return False
+    if sys.platform == "win32":
+        try:
+            output = subprocess.check_output(["netstat", "-ano"], text=True, timeout=3)
+        except Exception:
+            return True
+        needle = f":{int(port)}"
+        pid_text = str(int(pid))
+        for line in output.splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and needle in parts[1] and parts[3].upper() == "LISTENING" and parts[-1] == pid_text:
+                return True
+        return False
+    return True

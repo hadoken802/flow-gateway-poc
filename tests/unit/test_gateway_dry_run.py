@@ -188,6 +188,32 @@ async def test_missing_worker_credits_preserve_previous_value_and_status():
 
 
 @pytest.mark.asyncio
+async def test_missing_worker_credits_restore_last_known_total():
+    from gateway.config import GatewaySettings
+
+    FakeWorkerClient.generate_calls = 0
+    settings = GatewaySettings(db_path=local_db("missing_credits_restore_total"))
+    states = {"FLOW-001": {"credits": 1050}, "FLOW-002": {"credits": 50}, "FLOW-003": {"credits": 1035}}
+    scheduler = make_scheduler(settings, FakeWorkerClient(states))
+    await scheduler.start()
+    await scheduler.db.execute(
+        "UPDATE flow_accounts SET credits=NULL, credits_total=1035, quota_confidence='live' WHERE account_id='FLOW-003'"
+    )
+    await scheduler.db.commit()
+
+    states["FLOW-003"] = {"credits": None, "credits_error": "credits_missing"}
+    await scheduler.refresh_workers()
+
+    accounts = {a["account_id"]: a for a in await scheduler.list_accounts()}
+    assert accounts["FLOW-003"]["credits"] == 1035
+    assert accounts["FLOW-003"]["credits_total"] == 1035
+    assert accounts["FLOW-003"]["status"] == "ready"
+    assert accounts["FLOW-003"]["last_error"] == "credits_missing"
+    assert accounts["FLOW-003"]["quota_confidence"] == "stale"
+    await scheduler.stop()
+
+
+@pytest.mark.asyncio
 async def test_missing_worker_credits_do_not_restore_low_credits_to_ready():
     from gateway.config import GatewaySettings
 

@@ -25,6 +25,8 @@ GEMINI.md
 .tmp/
 data/
 logs/
+backups/
+diagnostics/
 test_inputs/
 tmp_multi_storyboard_input/
 tmp_multi_storyboard_runs/

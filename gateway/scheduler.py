@@ -145,7 +145,10 @@ class GatewayScheduler:
                     credits = info.get("credits")
                     account = await crud.get_account(self.db, worker.account_id)
                     stored_credits = (account or {}).get("credits")
+                    last_known_credits = stored_credits if stored_credits is not None else (account or {}).get("credits_total")
                     write_credits = credits if credits is not None else stored_credits
+                    if write_credits is None:
+                        write_credits = last_known_credits
                     if info.get("status") == "offline":
                         status = "offline"
                     elif not info.get("extension_connected") or not info.get("flow_key_present"):
@@ -154,7 +157,7 @@ class GatewayScheduler:
                         status = "low_credits"
                     elif credits is None and account and account.get("status") == "low_credits":
                         status = "low_credits"
-                    elif credits is None and stored_credits is not None and stored_credits < self.settings.omni_10s_credit_cost:
+                    elif credits is None and last_known_credits is not None and last_known_credits < self.settings.omni_10s_credit_cost:
                         status = "low_credits"
                     else:
                         status = "busy" if account and account.get("current_task_id") else "ready"
@@ -164,6 +167,8 @@ class GatewayScheduler:
                         status=status,
                         credits=write_credits,
                         last_error=info.get("credits_error") if credits is None else None,
+                        quota_source=info.get("credits_source") if credits is not None else info.get("credits_error"),
+                        quota_confidence="live" if credits is not None else "stale",
                     )
                     if status in {"ready", "busy"} and self.settings.dry_run:
                         recovery_task = await crud.get_waiting_recovery_task_for_account(self.db, worker.account_id)
