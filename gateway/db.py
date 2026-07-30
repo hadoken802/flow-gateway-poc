@@ -238,6 +238,13 @@ async def _migrate(db):
         "last_error_category": "TEXT",
         "recovery_required": "INTEGER NOT NULL DEFAULT 0",
         "manual_paused": "INTEGER NOT NULL DEFAULT 0",
+        "external_task_id": "TEXT",
+        "batch_id": "TEXT",
+        "output_directory": "TEXT",
+        "output_filename": "TEXT",
+        "metadata_json": "TEXT",
+        "generation_parameters_json": "TEXT",
+        "pause_requested": "INTEGER NOT NULL DEFAULT 0",
     }
     for name, ddl in additions.items():
         if name not in columns:

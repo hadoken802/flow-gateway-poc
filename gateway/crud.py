@@ -84,6 +84,8 @@ async def create_task(db, payload):
     estimated_quota_cost = int(payload.get("estimated_quota_cost") or 15)
     priority = int(payload.get("priority") or 0)
     not_before = payload.get("not_before")
+    duration = int(payload.get("duration") or payload.get("seconds") or 10)
+    aspect_ratio = payload.get("aspect_ratio") or "9:16"
     await db.commit()
     await db.execute("BEGIN IMMEDIATE")
     try:
@@ -100,13 +102,17 @@ async def create_task(db, payload):
         await db.execute(
             """
             INSERT INTO flow_tasks(task_id, idempotency_key, project_id, image_path, prompt, duration, aspect_ratio,
-              preferred_account_id, priority, not_before, queue_status, state, estimated_quota_cost)
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 'queued', ?)
+              preferred_account_id, priority, not_before, queue_status, state, estimated_quota_cost,
+              external_task_id, batch_id, output_directory, output_filename, metadata_json, generation_parameters_json)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 'queued', ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 task_id, idempotency_key, payload.get("project_id"), payload["image_path"],
-                payload["prompt"], payload["duration"], payload["aspect_ratio"], payload.get("preferred_account_id"),
+                payload["prompt"], duration, aspect_ratio, payload.get("preferred_account_id"),
                 priority, not_before, estimated_quota_cost,
+                payload.get("external_task_id"), payload.get("batch_id"),
+                payload.get("output_directory"), payload.get("output_filename"),
+                payload.get("metadata_json"), payload.get("generation_parameters_json"),
             ),
         )
         await scheduler_kernel.record_state_event(
@@ -130,10 +136,127 @@ async def list_tasks(db):
     return [dict(row) for row in await cursor.fetchall()]
 
 
+async def list_tasks_filtered(db, *, batch_id=None, status=None, account_id=None, error_category=None):
+    where = []
+    values = []
+    if batch_id:
+        where.append("batch_id=?")
+        values.append(batch_id)
+    if status:
+        where.append("status=?")
+        values.append(status)
+    if account_id:
+        where.append("(assigned_account_id=? OR account_id=?)")
+        values.extend([account_id, account_id])
+    if error_category:
+        where.append("last_error_category=?")
+        values.append(error_category)
+    sql = "SELECT * FROM flow_tasks"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY created_at, task_id"
+    cursor = await db.execute(sql, tuple(values))
+    return [dict(row) for row in await cursor.fetchall()]
+
+
 async def get_task(db, task_id):
     cursor = await db.execute("SELECT * FROM flow_tasks WHERE task_id=?", (task_id,))
     row = await cursor.fetchone()
     return dict(row) if row else None
+
+
+async def list_batches(db):
+    cursor = await db.execute(
+        """
+        SELECT batch_id,
+               COUNT(*) AS task_count,
+               SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS completed_count,
+               SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed_count,
+               MIN(created_at) AS created_at,
+               MAX(updated_at) AS updated_at
+        FROM flow_tasks
+        WHERE batch_id IS NOT NULL
+        GROUP BY batch_id
+        ORDER BY created_at DESC, batch_id
+        """
+    )
+    return [dict(row) for row in await cursor.fetchall()]
+
+
+async def set_task_manual_pause(db, task_id, paused: bool):
+    cursor = await db.execute(
+        """
+        UPDATE flow_tasks
+        SET manual_paused=?, pause_requested=?,
+            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+        WHERE task_id=?
+        """,
+        (1 if paused else 0, 1 if paused else 0, task_id),
+    )
+    await db.commit()
+    return await get_task(db, task_id) if cursor.rowcount == 1 else None
+
+
+async def cancel_queued_task(db, task_id):
+    cursor = await db.execute(
+        """
+        UPDATE flow_tasks
+        SET status='cancelled', state='cancelled', state_version=state_version+1,
+            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+        WHERE task_id=? AND status='queued'
+        """,
+        (task_id,),
+    )
+    await db.commit()
+    if cursor.rowcount != 1:
+        return None
+    await scheduler_kernel.record_state_event(
+        db,
+        task_id=task_id,
+        old_state="queued",
+        new_state="cancelled",
+        reason="task_cancelled_by_api",
+    )
+    await db.commit()
+    return await get_task(db, task_id)
+
+
+async def update_task_priority(db, task_id, priority: int):
+    cursor = await db.execute(
+        """
+        UPDATE flow_tasks
+        SET priority=?, updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+        WHERE task_id=? AND status='queued'
+        """,
+        (priority, task_id),
+    )
+    await db.commit()
+    return await get_task(db, task_id) if cursor.rowcount == 1 else None
+
+
+async def requeue_task(db, task_id):
+    cursor = await db.execute(
+        """
+        UPDATE flow_tasks
+        SET status='queued', state='queued', state_version=state_version+1,
+            manual_paused=0, pause_requested=0,
+            updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+        WHERE task_id=? AND status IN ('failed','download_failed','retry_wait','need_manual','manual_review')
+        """,
+        (task_id,),
+    )
+    await db.commit()
+    if cursor.rowcount != 1:
+        return None
+    await scheduler_kernel.record_state_event(
+        db,
+        task_id=task_id,
+        old_state=None,
+        new_state="queued",
+        reason="task_requeued_by_api",
+    )
+    await db.commit()
+    return await get_task(db, task_id)
 
 
 async def get_waiting_recovery_task_for_account(db, account_id):

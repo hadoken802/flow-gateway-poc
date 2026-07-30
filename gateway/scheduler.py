@@ -383,6 +383,8 @@ class GatewayScheduler:
             "accounts_busy": sum(1 for account in accounts if account["status"] == "busy"),
             "accounts_low_credits": sum(1 for account in accounts if account["status"] == "low_credits"),
             "accounts_offline": sum(1 for account in accounts if account["status"] == "offline"),
+            "accounts_paused": sum(1 for account in accounts if int(account.get("manual_paused") or 0)),
+            "accounts_cooldown": sum(1 for account in accounts if account.get("cooldown_until")),
         }
 
     async def schedule_once(self):

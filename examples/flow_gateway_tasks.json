@@ -1,0 +1,21 @@
+{
+  "batch_id": "example-batch",
+  "tasks": [
+    {
+      "external_task_id": "demo-001",
+      "prompt": "A short cinematic product reveal.",
+      "input_media_path": "test_inputs\\sample.png",
+      "output_directory": "outputs\\demo",
+      "output_filename": "demo-001.mp4",
+      "priority": 10,
+      "estimated_quota_cost": 15,
+      "metadata": {
+        "source": "example"
+      },
+      "generation_parameters": {
+        "duration": 10,
+        "aspect_ratio": "9:16"
+      }
+    }
+  ]
+}

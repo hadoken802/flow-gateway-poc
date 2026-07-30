@@ -5,12 +5,14 @@ import logging
 import sys
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import HTMLResponse
 
 from . import crud
 from .config import GatewaySettings
 from .instance_lock import GatewayInstanceLock, GatewayInstanceLockError
 from .scheduler import GatewayScheduler
+from . import task_center
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s", force=True)
 logger = logging.getLogger(__name__)
@@ -48,6 +50,11 @@ async def lifespan(_app):
 
 
 app = FastAPI(title="Flow Gateway Dry Run", version="0.1.0", lifespan=lifespan)
+
+
+@app.get("/", response_class=HTMLResponse)
+async def task_center_page():
+    return TASK_CENTER_HTML
 
 
 @app.get("/health")
@@ -176,6 +183,271 @@ async def create_tasks(payload: dict):
         return {"tasks": await scheduler.create_tasks(tasks)}
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/v1/tasks")
+async def v1_create_task(payload: dict):
+    task = await create_task(payload)
+    return {
+        "task_id": task["task_id"],
+        "batch_id": task.get("batch_id"),
+        "idempotency_key": task["idempotency_key"],
+        "status": task["status"],
+        "duplicate": bool(task.get("reused")),
+        "created_at": task.get("created_at"),
+    }
+
+
+@app.post("/api/v1/tasks/import")
+async def v1_import_tasks(payload: dict):
+    try:
+        return await task_center.import_tasks(scheduler, payload)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/v1/tasks")
+async def v1_list_tasks(
+    status: str | None = Query(default=None),
+    batch_id: str | None = Query(default=None),
+    account_id: str | None = Query(default=None),
+    error_category: str | None = Query(default=None),
+):
+    return await task_center.list_tasks(
+        scheduler,
+        {
+            "status": status,
+            "batch_id": batch_id,
+            "account_id": account_id,
+            "error_category": error_category,
+        },
+    )
+
+
+@app.get("/api/v1/tasks/{task_id}")
+async def v1_task_detail(task_id: str):
+    detail = await task_center.task_detail(scheduler, task_id)
+    if not detail:
+        raise HTTPException(404, "Task not found")
+    return detail
+
+
+@app.post("/api/v1/tasks/{task_id}/pause")
+async def v1_pause_task(task_id: str):
+    task = await task_center.pause_task(scheduler, task_id)
+    if not task:
+        raise HTTPException(404, "Task not found")
+    return task
+
+
+@app.post("/api/v1/tasks/{task_id}/resume")
+async def v1_resume_task(task_id: str):
+    task = await task_center.resume_task(scheduler, task_id)
+    if not task:
+        raise HTTPException(404, "Task not found")
+    return task
+
+
+@app.post("/api/v1/tasks/{task_id}/cancel")
+async def v1_cancel_task(task_id: str):
+    task = await task_center.cancel_task(scheduler, task_id)
+    if not task:
+        raise HTTPException(409, "Only queued tasks can be cancelled")
+    return task
+
+
+@app.post("/api/v1/tasks/{task_id}/priority")
+async def v1_set_task_priority(task_id: str, payload: dict):
+    try:
+        priority = int(payload.get("priority"))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "priority must be an integer") from None
+    task = await task_center.set_priority(scheduler, task_id, priority)
+    if not task:
+        raise HTTPException(409, "Only queued tasks can change priority")
+    return task
+
+
+@app.post("/api/v1/tasks/{task_id}/requeue")
+async def v1_requeue_task(task_id: str):
+    task = await task_center.requeue_task(scheduler, task_id)
+    if not task:
+        raise HTTPException(409, "Task is not eligible for requeue")
+    return task
+
+
+@app.post("/api/v1/tasks/{task_id}/retry-download")
+async def v1_retry_download(task_id: str):
+    task = await scheduler.get_task(task_id)
+    if not task:
+        raise HTTPException(404, "Task not found")
+    if task.get("status") not in {"download_failed", "download_pending", "generated"}:
+        raise HTTPException(409, "Task is not eligible for retry-download")
+    return {"ok": True, "task_id": task_id, "planned_action": "scheduler_download_recovery", "submit_called": False}
+
+
+@app.post("/api/v1/tasks/{task_id}/reconcile")
+async def v1_reconcile_task(task_id: str):
+    task = await scheduler.get_task(task_id)
+    if not task:
+        raise HTTPException(404, "Task not found")
+    if task.get("status") != "submission_unknown":
+        raise HTTPException(409, "Task is not submission_unknown")
+    return {"ok": True, "task_id": task_id, "planned_action": "submission_unknown_reconcile", "submit_called": False}
+
+
+@app.post("/api/v1/tasks/{task_id}/need-manual")
+async def v1_mark_need_manual(task_id: str, payload: dict | None = None):
+    payload = payload or {}
+    task = await crud.update_task_status(
+        scheduler.db,
+        task_id,
+        "manual_review",
+        error_code=payload.get("error_code") or "NEED_MANUAL",
+        error_message=payload.get("error_message") or "Marked for manual review",
+        last_error_category="need_manual",
+    )
+    return task
+
+
+@app.get("/api/v1/batches")
+async def v1_batches():
+    return await crud.list_batches(scheduler.db)
+
+
+@app.get("/api/v1/batches/{batch_id}")
+async def v1_batch_detail(batch_id: str):
+    return await task_center.batch_detail(scheduler, batch_id)
+
+
+@app.get("/api/v1/accounts")
+async def v1_accounts():
+    return await scheduler.list_accounts()
+
+
+@app.get("/api/v1/system/status")
+async def v1_system_status():
+    status = await scheduler.pool_status()
+    return {
+        **status,
+        "gateway": await health(),
+        "workers": scheduler.worker_snapshot.diagnostics(),
+        "examples": task_center.examples(),
+    }
+
+
+@app.get("/api/v1/docs/examples")
+async def v1_examples():
+    return task_center.examples()
+
+
+TASK_CENTER_HTML = """
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Flow Gateway Task Center</title>
+  <style>
+    body{font-family:Segoe UI,Arial,sans-serif;margin:0;background:#f6f7f9;color:#1d2733}
+    header{background:#102033;color:white;padding:14px 20px}
+    main{padding:16px;display:grid;gap:16px}
+    section{background:white;border:1px solid #d7dde5;border-radius:6px;padding:14px}
+    h1{font-size:20px;margin:0} h2{font-size:16px;margin:0 0 10px}
+    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+    .metric{border:1px solid #e1e5ea;border-radius:6px;padding:10px}
+    .metric b{display:block;font-size:22px;margin-top:4px}
+    table{width:100%;border-collapse:collapse;font-size:13px}
+    th,td{border-bottom:1px solid #e5e9ef;padding:7px;text-align:left;vertical-align:top}
+    th{background:#f2f4f7}
+    input,select,textarea,button{font:inherit}
+    textarea{width:100%;min-height:130px}
+    button{border:1px solid #9aa7b5;background:#fff;border-radius:5px;padding:6px 10px;cursor:pointer}
+    button.primary{background:#0f5cc0;color:#fff;border-color:#0f5cc0}
+    .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+    .error{color:#a10000}
+    .ok{color:#087443}
+    code{background:#edf1f5;padding:1px 4px;border-radius:4px}
+  </style>
+</head>
+<body>
+<header><h1>Flow Gateway Task Center</h1></header>
+<main>
+  <section>
+    <h2>总览</h2>
+    <div class="grid" id="metrics"></div>
+  </section>
+  <section>
+    <h2>批量导入</h2>
+    <div class="row">
+      <select id="importFormat"><option value="csv">CSV</option><option value="json">JSON</option></select>
+      <input id="importFile" type="file" accept=".csv,.json" onchange="loadImportFile()">
+      <button onclick="loadExample()">载入示例</button>
+      <button class="primary" onclick="importTasks()">导入任务</button>
+    </div>
+    <textarea id="importContent"></textarea>
+    <pre id="importResult"></pre>
+  </section>
+  <section>
+    <h2>任务列表</h2>
+    <div class="row">
+      <input id="filterStatus" placeholder="status">
+      <input id="filterBatch" placeholder="batch_id">
+      <input id="filterAccount" placeholder="account_id">
+      <button onclick="loadTasks()">刷新</button>
+      <button onclick="exportTasks()">导出结果</button>
+    </div>
+    <div style="overflow:auto"><table id="tasks"></table></div>
+  </section>
+  <section>
+    <h2>账号池</h2>
+    <div style="overflow:auto"><table id="accounts"></table></div>
+  </section>
+</main>
+<script>
+async function api(path, options){const r=await fetch(path, options); if(!r.ok) throw new Error(await r.text()); return await r.json();}
+function td(v){return `<td>${v??''}</td>`}
+async function refresh(){
+  const s=await api('/api/v1/system/status');
+  const ms=[['queued',s.queued_count],['running',s.active_count],['completed',s.completed_count],['failed',s.failed_count],['ready accounts',s.accounts_ready],['cooldown',s.accounts_cooldown||0],['paused',s.accounts_paused||0]];
+  metrics.innerHTML=ms.map(m=>`<div class="metric">${m[0]}<b>${m[1]}</b></div>`).join('');
+  await loadAccounts(); await loadTasks();
+}
+async function loadAccounts(){
+  const rows=await api('/api/v1/accounts');
+  accounts.innerHTML='<tr><th>账号</th><th>状态</th><th>credits</th><th>reserved</th><th>health</th><th>current_task</th><th>cooldown</th><th>weight</th><th>操作</th></tr>'+
+    rows.map(a=>`<tr>${td(a.account_id)}${td(a.status)}${td(a.credits)}${td(a.reserved_credits)}${td(a.health_score)}${td(a.current_task_id)}${td(a.cooldown_until)}${td(a.account_weight)}<td><button onclick="pauseAccount('${a.account_id}')">pause</button> <button onclick="resumeAccount('${a.account_id}')">resume</button> <button onclick="cooldownAccount('${a.account_id}')">cooldown</button> <button onclick="clearCooldown('${a.account_id}')">clear</button> <button onclick="setWeight('${a.account_id}')">weight</button> <button onclick="setCredits('${a.account_id}')">credits</button></td></tr>`).join('');
+}
+async function loadTasks(){
+  const q=new URLSearchParams(); if(filterStatus.value) q.set('status',filterStatus.value); if(filterBatch.value) q.set('batch_id',filterBatch.value); if(filterAccount.value) q.set('account_id',filterAccount.value);
+  const rows=await api('/api/v1/tasks?'+q.toString());
+  tasks.innerHTML='<tr><th>task_id</th><th>external</th><th>batch</th><th>状态</th><th>账号</th><th>job</th><th>project</th><th>gen</th><th>dl</th><th>priority</th><th>输出</th><th>错误</th><th>操作</th></tr>'+
+    rows.map(t=>`<tr>${td(`<code>${t.task_id}</code>`)}${td(t.external_task_id)}${td(t.batch_id)}${td(t.status)}${td(t.assigned_account_id||t.account_id)}${td(t.worker_job_id)}${td(t.project_id)}${td(t.generation_attempts)}${td(t.download_attempts)}${td(t.priority)}${td(t.video_path||((t.output_directory||'')+'\\\\'+(t.output_filename||'')))}${td(t.error_code||t.last_error_category||'')}<td><button onclick="detail('${t.task_id}')">详情</button> <button onclick="pauseTask('${t.task_id}')">暂停</button> <button onclick="resumeTask('${t.task_id}')">恢复</button> <button onclick="cancelTask('${t.task_id}')">取消</button> <button onclick="priorityTask('${t.task_id}')">优先级</button> <button onclick="requeueTask('${t.task_id}')">重排</button> <button onclick="retryDownload('${t.task_id}')">retry download</button> <button onclick="reconcileTask('${t.task_id}')">reconcile</button> <button onclick="manualTask('${t.task_id}')">need manual</button></td></tr>`).join('');
+}
+async function loadExample(){const e=await api('/api/v1/docs/examples'); importContent.value=importFormat.value==='csv'?e.csv:JSON.stringify(e.json,null,2);}
+async function loadImportFile(){const f=importFile.files[0]; if(!f) return; importContent.value=await f.text(); importFormat.value=f.name.toLowerCase().endsWith('.json')?'json':'csv';}
+async function importTasks(){try{const format=importFormat.value; const content=importContent.value; importResult.textContent=JSON.stringify(await api('/api/v1/tasks/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({format,content})}),null,2); await refresh();}catch(e){importResult.textContent=e.message}}
+async function pauseAccount(id){await api(`/api/pool/accounts/${id}/pause`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}); await refresh()}
+async function resumeAccount(id){await api(`/api/pool/accounts/${id}/resume`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}); await refresh()}
+async function cooldownAccount(id){const seconds=prompt('cooldown seconds','300'); if(!seconds) return; await api(`/api/pool/accounts/${id}/cooldown`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({seconds:Number(seconds),reason:'task_center'})}); await refresh()}
+async function clearCooldown(id){await api(`/api/pool/accounts/${id}/clear-cooldown`,{method:'POST'}); await refresh()}
+async function setWeight(id){const weight=prompt('account weight','1'); if(!weight) return; await api(`/api/pool/accounts/${id}/weight`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({account_weight:Number(weight)})}); await refresh()}
+async function setCredits(id){const credits=prompt('credits'); if(!credits) return; await api(`/api/pool/accounts/${id}/credits`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({credits:Number(credits),source:'task_center'})}); await refresh()}
+async function pauseTask(id){await api(`/api/v1/tasks/${id}/pause`,{method:'POST'}); await loadTasks()}
+async function resumeTask(id){await api(`/api/v1/tasks/${id}/resume`,{method:'POST'}); await loadTasks()}
+async function cancelTask(id){await api(`/api/v1/tasks/${id}/cancel`,{method:'POST'}); await loadTasks()}
+async function priorityTask(id){const priority=prompt('priority'); if(priority===null) return; await api(`/api/v1/tasks/${id}/priority`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({priority:Number(priority)})}); await loadTasks()}
+async function requeueTask(id){await api(`/api/v1/tasks/${id}/requeue`,{method:'POST'}); await loadTasks()}
+async function retryDownload(id){alert(JSON.stringify(await api(`/api/v1/tasks/${id}/retry-download`,{method:'POST'}),null,2))}
+async function reconcileTask(id){alert(JSON.stringify(await api(`/api/v1/tasks/${id}/reconcile`,{method:'POST'}),null,2))}
+async function manualTask(id){await api(`/api/v1/tasks/${id}/need-manual`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({error_code:'NEED_MANUAL',error_message:'Marked from task center'})}); await loadTasks()}
+async function detail(id){alert(JSON.stringify(await api(`/api/v1/tasks/${id}`),null,2))}
+async function exportTasks(){const rows=await api('/api/v1/tasks'); const blob=new Blob([JSON.stringify(rows,null,2)],{type:'application/json'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='flow-gateway-tasks.json'; a.click();}
+refresh();
+</script>
+</body>
+</html>
+"""
 
 
 if __name__ == "__main__":

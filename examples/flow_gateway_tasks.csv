@@ -1,0 +1,2 @@
+external_task_id,prompt,input_media_path,output_directory,output_filename,priority,estimated_quota_cost,metadata
+demo-001,"A short cinematic product reveal.",test_inputs\sample.png,outputs\demo,demo-001.mp4,10,15,"{""source"":""example""}"
