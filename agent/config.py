@@ -46,7 +46,7 @@ EXTENSION_WS_MAX_SIZE_BYTES = int(os.environ.get("EXTENSION_WS_MAX_SIZE_BYTES", 
 
 # ─── Google Flow API ────────────────────────────────────────
 GOOGLE_FLOW_API = "https://aisandbox-pa.googleapis.com"
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "AIzaSyBtrm0o5ab1c-Ec8ZuLcGt3oJAA5VWt3pY")
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 RECAPTCHA_SITE_KEY = os.environ.get("RECAPTCHA_SITE_KEY", "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV")
 
 # ─── Worker ──────────────────────────────────────────────────

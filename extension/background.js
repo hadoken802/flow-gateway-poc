@@ -9,7 +9,7 @@ const DEFAULT_ACCOUNT_ID = '';
 const DEFAULT_AGENT_WS_URL = '';
 const KEEPALIVE_INTERVAL_MS = 20000;
 // NOTE: This is a browser-restricted public API key — safe to ship in extension bundles.
-const API_KEY = 'AIzaSyBtrm0o5ab1c-Ec8ZuLcGt3oJAA5VWt3pY';
+const API_KEY = '';
 
 let ws = null;
 let reconnectTimer = null;
