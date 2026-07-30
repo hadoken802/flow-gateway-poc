@@ -181,8 +181,24 @@ async def check_login_and_enable(scheduler, account_id: str, registry: AccountRe
         "flow_key_present": bool(runtime.get("flow_key_present") or runtime.get("token_captured") or runtime.get("flow_key_captured")),
         "quota_live": bool(node and node.get("quota_confidence") == "live" and node.get("credits") is not None),
     }
+    if all(checks[key] for key in ("chrome_cdp_online", "worker_online", "extension_connected", "account_match", "ownership_verified")):
+        credits = await _read_worker_credits(registry.get(account_id))
+        if credits.get("ok"):
+            checks["flow_key_present"] = True
+            record = registry.get(account_id)
+            await crud.upsert_account(
+                scheduler.db,
+                WorkerConfig(record.account_id, f"http://127.0.0.1:{record.worker_api_port}", bool(record.enabled), record.runtime_instance_id),
+                status="ready",
+                credits=credits["credits"],
+                quota_source="credits",
+                quota_confidence="live",
+            )
+            node = await get_node(scheduler, account_id, registry, manager)
+            checks["quota_live"] = bool(node and node.get("quota_confidence") == "live" and node.get("credits") is not None)
     ok = all(checks.values())
     if ok:
+        registry.update_account(account_id, status="login_verified")
         enabled = await set_node_enabled(scheduler, account_id, True, registry)
         return {"ok": True, "result": "enabled", "checks": checks, "refresh": refreshed, "node": enabled}
     return {
@@ -195,6 +211,21 @@ async def check_login_and_enable(scheduler, account_id: str, registry: AccountRe
         "cdp_port": node.get("cdp_port") if node else None,
         "node": node,
     }
+
+
+async def _read_worker_credits(account) -> dict:
+    if not account:
+        return {"ok": False, "error": "account_not_found"}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            response = await client.get(f"http://127.0.0.1:{account.worker_api_port}/api/flow/credits")
+            data = response.json()
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)[:300]}
+    if response.status_code >= 400:
+        return {"ok": False, "status_code": response.status_code, "error": data}
+    credits = data.get("credits") if isinstance(data, dict) else None
+    return {"ok": isinstance(credits, int), "credits": credits, "response": data}
 
 
 async def patch_node(scheduler, account_id: str, payload: dict, registry: AccountRegistry | None = None) -> dict | None:

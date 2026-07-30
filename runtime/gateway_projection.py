@@ -183,6 +183,7 @@ class ReadOnlyRuntimeStatusProvider:
             "worker_process_alive": worker_alive,
             "worker_health_reachable": worker_health_reachable,
             "extension_connected": extension_connected,
+            "flow_key_present": bool(worker_health.get("flow_key_present")),
             "account_match": account_match,
             "chrome_ownership_verified": chrome_ownership,
             "worker_ownership_verified": worker_ownership,

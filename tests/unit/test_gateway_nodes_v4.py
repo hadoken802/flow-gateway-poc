@@ -329,7 +329,8 @@ async def test_check_login_enable_requires_live_quota(gateway_db, registry):
 
     scheduler = FakeScheduler(gateway_db)
     manager = FakeManager(registry)
-    await nodes.create_node(scheduler, {"account_id": "FLOW-007", "worker_port": 8107, "extension_ws_port": 9206, "cdp_port": 9306}, registry)
+    await nodes.create_node(scheduler, {"account_id": "FLOW-007", "worker_port": 18107, "extension_ws_port": 19206, "cdp_port": 19306}, registry)
+    manager.status_payload["flow_key_present"] = False
 
     result = await nodes.check_login_and_enable(scheduler, "FLOW-007", registry, manager)
 
@@ -339,16 +340,21 @@ async def test_check_login_enable_requires_live_quota(gateway_db, registry):
 
 
 @pytest.mark.asyncio
-async def test_check_login_enable_turns_on_live_node(gateway_db, registry):
+async def test_check_login_enable_turns_on_live_node(gateway_db, registry, monkeypatch):
     from gateway import nodes
 
     scheduler = FakeScheduler(gateway_db)
     manager = FakeManager(registry)
-    await nodes.create_node(scheduler, {"account_id": "FLOW-007", "worker_port": 8107, "extension_ws_port": 9206, "cdp_port": 9306}, registry)
-    await _upsert_gateway_account(gateway_db, "FLOW-007", 8107, credits=1000, confidence="live", enabled=False)
+    await nodes.create_node(scheduler, {"account_id": "FLOW-007", "worker_port": 18107, "extension_ws_port": 19206, "cdp_port": 19306}, registry)
+
+    async def fake_read_worker_credits(account):
+        return {"ok": True, "credits": 1000}
+
+    monkeypatch.setattr(nodes, "_read_worker_credits", fake_read_worker_credits)
 
     result = await nodes.check_login_and_enable(scheduler, "FLOW-007", registry, manager)
 
     assert result["ok"] is True
     assert result["result"] == "enabled"
     assert registry.get("FLOW-007").enabled is True
+    assert registry.get("FLOW-007").status == "login_verified"
