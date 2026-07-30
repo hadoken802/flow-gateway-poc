@@ -101,6 +101,23 @@ def test_scheduler_select_worker_is_production_selection_function():
     assert result["selection_function"] == "GatewayScheduler.select_worker"
 
 
+def test_real_scheduler_excludes_stale_quota_by_default():
+    scheduler = GatewayScheduler(GatewaySettings(dry_run=False), worker_provider=FakeProvider([snapshot([
+        WorkerConfig("FLOW-001", "http://127.0.0.1:8101", True, "runtime-1"),
+        WorkerConfig("FLOW-002", "http://127.0.0.1:8102", True, "runtime-2"),
+    ])]))
+    result = scheduler.select_worker(
+        {"required_capability": "flow"},
+        account_states=[
+            {"account_id": "FLOW-001", "status": "ready", "credits": 1020, "reserved_credits": 0, "health_score": 100, "account_weight": 1.0, "quota_confidence": "stale"},
+            {"account_id": "FLOW-002", "status": "ready", "credits": 1035, "reserved_credits": 0, "health_score": 100, "account_weight": 1.0, "quota_confidence": "live"},
+        ],
+    )
+    reasons = {candidate["account_id"]: candidate["reason"] for candidate in result["candidates"]}
+    assert result["selected_account_id"] == "FLOW-002"
+    assert reasons["FLOW-001"] == "quota_not_live"
+
+
 def test_dry_run_reuses_scheduler_selection_function_without_side_effects():
     provider = FakeProvider([snapshot([WorkerConfig("FLOW-024", "http://127.0.0.1:8121", True, "runtime-24")])])
     scheduler = GatewayScheduler(GatewaySettings(), worker_client=SubmitGuard(), worker_provider=provider)

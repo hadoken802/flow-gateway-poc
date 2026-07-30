@@ -78,6 +78,7 @@ class GatewaySettings:
     lease_duration_seconds: float = 15 * 60
     heartbeat_interval_seconds: float = 30.0
     lease_sweeper_interval_seconds: float = 30.0
+    allow_stale_quota_scheduling: bool = False
 
     @classmethod
     def from_env(cls) -> "GatewaySettings":
@@ -99,6 +100,7 @@ class GatewaySettings:
             lease_duration_seconds=_positive_float("GATEWAY_LEASE_DURATION_SECONDS", 15 * 60),
             heartbeat_interval_seconds=_positive_float("GATEWAY_HEARTBEAT_INTERVAL_SECONDS", 30.0),
             lease_sweeper_interval_seconds=_positive_float("GATEWAY_LEASE_SWEEPER_INTERVAL_SECONDS", 30.0),
+            allow_stale_quota_scheduling=_bool("GATEWAY_ALLOW_STALE_QUOTA_SCHEDULING", False),
         )
 
 

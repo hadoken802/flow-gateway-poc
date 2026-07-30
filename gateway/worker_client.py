@@ -197,6 +197,9 @@ def parse_worker_credits_response(response) -> dict:
 def parse_worker_credits_payload(payload) -> dict:
     if not isinstance(payload, dict):
         return _credits_unavailable("credits_response_not_object")
+    oauth_error = _embedded_oauth_error(payload)
+    if oauth_error:
+        return _credits_unavailable(oauth_error)
     parsed = []
     invalid_fields = []
     for field in CREDIT_FIELDS:
@@ -223,6 +226,18 @@ def parse_worker_credits_payload(payload) -> dict:
         "credits_error": None,
         "credits_fields_present": present_fields,
     }
+
+
+def _embedded_oauth_error(payload: dict) -> str | None:
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return None
+    status = str(error.get("status") or "").upper()
+    message = str(error.get("message") or "").lower()
+    code = error.get("code")
+    if code == 401 or status == "UNAUTHENTICATED" or "invalid authentication credentials" in message:
+        return "oauth_unauthenticated"
+    return None
 
 
 def _credits_unavailable(error_code: str, present_fields=None, invalid_fields=None) -> dict:

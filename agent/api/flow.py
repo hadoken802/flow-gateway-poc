@@ -78,7 +78,29 @@ async def get_credits():
     result = await client.get_credits()
     if result.get("error"):
         raise HTTPException(502, result["error"])
-    return result.get("data", result)
+    payload = result.get("data", result)
+    oauth_error = _embedded_oauth_error(payload)
+    if oauth_error:
+        raise HTTPException(401, oauth_error)
+    return payload
+
+
+def _embedded_oauth_error(payload):
+    if not isinstance(payload, dict):
+        return None
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return None
+    status = str(error.get("status") or "").upper()
+    message = str(error.get("message") or "").lower()
+    code = error.get("code")
+    if code == 401 or status == "UNAUTHENTICATED" or "invalid authentication credentials" in message:
+        return {
+            "error_category": "oauth_unauthenticated",
+            "message": "Flow OAuth credentials are expired or invalid",
+            "flow_status": status or None,
+        }
+    return None
 
 
 @router.post("/generate-image")

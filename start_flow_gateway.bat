@@ -37,7 +37,7 @@ if %errorlevel%==0 (
 )
 
 echo Starting Flow Gateway Task Center...
-start "Flow Gateway" /min cmd /c ""%PYTHON%" -m gateway.main 1>>"%STDOUT_LOG%" 2>>"%STDERR_LOG%""
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -WindowStyle Hidden -FilePath '%PYTHON%' -ArgumentList '-m','gateway.main' -WorkingDirectory '%CD%' -RedirectStandardOutput '%CD%\%STDOUT_LOG%' -RedirectStandardError '%CD%\%STDERR_LOG%'"
 if errorlevel 1 (
   echo Failed to launch Gateway. See %STDERR_LOG%
   exit /b 1

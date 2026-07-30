@@ -478,6 +478,14 @@ class GatewayScheduler:
                 candidate["reason"] = reason
                 diagnostics.append(candidate)
                 continue
+            if (
+                not self.settings.dry_run
+                and not self.settings.allow_stale_quota_scheduling
+                and account.get("quota_confidence") != "live"
+            ):
+                candidate["reason"] = "quota_not_live"
+                diagnostics.append(candidate)
+                continue
             score = scheduler_kernel.score_account(
                 account,
                 task_count_today=int(account.get("_task_count_today") or 0),

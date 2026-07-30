@@ -88,3 +88,16 @@ def test_invalid_json_keeps_credits_unavailable():
     result = parse_worker_credits_response(response)
     assert result["credits"] is None
     assert result["credits_error"] == "credits_json_invalid"
+
+
+def test_embedded_oauth_error_is_not_successful_credits():
+    result = parse_worker_credits_payload({
+        "error": {
+            "code": 401,
+            "message": "Request had invalid authentication credentials.",
+            "status": "UNAUTHENTICATED",
+        }
+    })
+    assert result["credits"] is None
+    assert result["credits_available"] is False
+    assert result["credits_error"] == "oauth_unauthenticated"
