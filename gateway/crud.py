@@ -655,10 +655,23 @@ async def guarded_release_account(db, task_id, account_id, expected_lease_owner,
                     "INSERT OR IGNORE INTO quota_ledger(ledger_id, account_id, task_id, lease_id, entry_type, amount, status) VALUES(?, ?, ?, ?, 'release', ?, 'posted')",
                     (str(uuid.uuid4()), account_id, task_id, expected_lease_owner, reserved),
                 )
+                await db.execute(
+                    "UPDATE quota_ledger SET status='released' WHERE lease_id=? AND entry_type='reserve' AND status='active'",
+                    (expected_lease_owner,),
+                )
             if reserved and quota_consume:
                 await db.execute(
                     "INSERT OR IGNORE INTO quota_ledger(ledger_id, account_id, task_id, lease_id, entry_type, amount, status) VALUES(?, ?, ?, ?, 'consume', ?, 'posted')",
                     (str(uuid.uuid4()), account_id, task_id, expected_lease_owner, reserved),
+                )
+                await db.execute(
+                    "UPDATE quota_ledger SET status='consumed' WHERE lease_id=? AND entry_type='reserve' AND status='active'",
+                    (expected_lease_owner,),
+                )
+            if quota_release or quota_consume:
+                await db.execute(
+                    "UPDATE flow_tasks SET actual_quota_cost=?, active_lease_id=NULL WHERE task_id=?",
+                    (reserved if quota_consume else 0, task_id),
                 )
         cursor = await db.execute(
             """

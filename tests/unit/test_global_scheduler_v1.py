@@ -153,9 +153,16 @@ async def test_completed_and_account_release_are_fenced_same_transaction(tmp_pat
 
     assert completed["status"] == "completed"
     assert completed["lease_owner"] is None
+    assert completed["active_lease_id"] is None
+    assert completed["actual_quota_cost"] == 15
     released = await crud.get_account(db, "FLOW-001")
     assert released["current_task_id"] is None
     assert released["lock_owner"] is None
+    active_reserves = await (await db.execute(
+        "SELECT COUNT(*) FROM quota_ledger WHERE task_id=? AND entry_type='reserve' AND status='active'",
+        (task["task_id"],),
+    )).fetchone()
+    assert active_reserves[0] == 0
     await db.close()
 
 
