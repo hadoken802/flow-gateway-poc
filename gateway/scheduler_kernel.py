@@ -91,6 +91,19 @@ class RetryPolicy:
     manual_required: bool
 
 
+@dataclass(frozen=True)
+class RecoveryDecision:
+    lease_id: str
+    task_id: str
+    account_id: str
+    old_state: str
+    action: str
+    new_status: str | None
+    release_quota: bool
+    consume_quota: bool
+    reason: str
+
+
 RETRY_POLICIES = {
     "transient_network": RetryPolicy(True, "generation", 2, 60, False, 2, 0, False),
     "gateway_timeout": RetryPolicy(True, "reconcile", 1, 0, False, 1, 0, False),
@@ -494,3 +507,196 @@ async def release_account_lease(
     except Exception:
         await db.execute("ROLLBACK")
         raise
+
+
+def recovery_decision_for(task: dict, lease: dict) -> RecoveryDecision:
+    state = task.get("state") or state_for_status(task.get("status"))
+    status = task.get("status")
+    if state == "queued" or status == "queued":
+        return RecoveryDecision(lease["lease_id"], task["task_id"], lease["account_id"], state, "release_to_queued", "queued", True, False, "queued_with_active_lease")
+    if state in {"reserving", "leased"} or status in {"leased", "assigning", "project_create_pending"}:
+        return RecoveryDecision(lease["lease_id"], task["task_id"], lease["account_id"], state, "release_to_queued", "queued", True, False, "lease_expired_before_external_submit")
+    if state == "submitting" or status in {"project_create_in_progress", "submit_pending", "submit_in_progress", "project_created"}:
+        return RecoveryDecision(lease["lease_id"], task["task_id"], lease["account_id"], state, "submission_unknown", "submission_unknown", False, False, "lease_expired_during_submit")
+    if state == "submission_unknown" or status == "submission_unknown":
+        return RecoveryDecision(lease["lease_id"], task["task_id"], lease["account_id"], state, "reconcile_submission_unknown", "submission_unknown", False, False, "submission_unknown_reconcile")
+    if state in {"submitted", "generating"} or status in {"submitted", "processing"}:
+        return RecoveryDecision(lease["lease_id"], task["task_id"], lease["account_id"], state, "recover_polling", "processing", False, False, "lease_expired_during_generation")
+    if state in {"generated", "downloading"} or status in {"download_pending", "downloading"}:
+        return RecoveryDecision(lease["lease_id"], task["task_id"], lease["account_id"], state, "recover_download", "download_pending", False, False, "lease_expired_during_download")
+    if state == "completed" or status == "completed":
+        return RecoveryDecision(lease["lease_id"], task["task_id"], lease["account_id"], state, "cleanup_completed", None, False, True, "completed_with_active_lease")
+    return RecoveryDecision(lease["lease_id"], task["task_id"], lease["account_id"], state, "need_manual", "manual_review", False, False, "terminal_or_unknown_expired_lease")
+
+
+async def claim_expired_lease(db, *, lease_id: str, recovery_owner: str, now: str | None = None):
+    now = now or utc_now()
+    cursor = await db.execute(
+        """
+        UPDATE account_leases
+        SET status='recovering'
+        WHERE lease_id=? AND status='active' AND expires_at<=?
+        """,
+        (lease_id, now),
+    )
+    if cursor.rowcount != 1:
+        return None
+    cursor = await db.execute(
+        """
+        SELECT l.*, t.status AS task_status, t.state AS task_state, t.state_version, t.worker_job_id,
+               t.project_id, t.workflow_id, t.output_media_id, t.upstream_batch_id
+        FROM account_leases l
+        JOIN flow_tasks t ON t.task_id=l.task_id
+        WHERE l.lease_id=?
+        """,
+        (lease_id,),
+    )
+    row = await cursor.fetchone()
+    return dict(row) if row else None
+
+
+async def recover_expired_lease(db, *, lease_id: str, recovery_owner: str, now: str | None = None):
+    await db.commit()
+    await db.execute("BEGIN IMMEDIATE")
+    try:
+        claimed = await claim_expired_lease(db, lease_id=lease_id, recovery_owner=recovery_owner, now=now)
+        if not claimed:
+            await db.commit()
+            return {"ok": False, "result": "not_claimed", "lease_id": lease_id}
+        task = {
+            "task_id": claimed["task_id"],
+            "status": claimed["task_status"],
+            "state": claimed["task_state"],
+            "state_version": claimed["state_version"],
+            "worker_job_id": claimed.get("worker_job_id"),
+            "project_id": claimed.get("project_id"),
+            "workflow_id": claimed.get("workflow_id"),
+            "output_media_id": claimed.get("output_media_id"),
+            "upstream_batch_id": claimed.get("upstream_batch_id"),
+        }
+        decision = recovery_decision_for(task, claimed)
+        cursor = await db.execute(
+            "SELECT COALESCE(SUM(amount),0) FROM quota_ledger WHERE lease_id=? AND entry_type='reserve' AND status='active'",
+            (lease_id,),
+        )
+        reserved = int((await cursor.fetchone())[0] or 0)
+        if decision.new_status:
+            new_state = state_for_status(decision.new_status)
+            await db.execute(
+                """
+                UPDATE flow_tasks
+                SET status=?, state=?, state_version=state_version+1, active_lease_id=NULL,
+                    lease_owner=NULL, lease_expires_at=NULL, recovery_required=?,
+                    last_error_category=COALESCE(last_error_category, ?),
+                    last_error_code=COALESCE(last_error_code, ?),
+                    updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                WHERE task_id=? AND state_version=?
+                """,
+                (
+                    decision.new_status,
+                    new_state,
+                    1 if decision.action in {"submission_unknown", "reconcile_submission_unknown", "need_manual"} else 0,
+                    "submission_result_unknown" if decision.action in {"submission_unknown", "reconcile_submission_unknown"} else None,
+                    decision.reason,
+                    decision.task_id,
+                    task["state_version"],
+                ),
+            )
+        else:
+            await db.execute(
+                """
+                UPDATE flow_tasks
+                SET active_lease_id=NULL, lease_owner=NULL, lease_expires_at=NULL,
+                    updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                WHERE task_id=? AND state_version=?
+                """,
+                (decision.task_id, task["state_version"]),
+            )
+        if decision.release_quota and reserved:
+            await db.execute(
+                "INSERT OR IGNORE INTO quota_ledger(ledger_id, account_id, task_id, lease_id, entry_type, amount, status) VALUES(?, ?, ?, ?, 'release', ?, 'posted')",
+                (str(uuid.uuid4()), decision.account_id, decision.task_id, lease_id, reserved),
+            )
+        if decision.consume_quota and reserved:
+            await db.execute(
+                "INSERT OR IGNORE INTO quota_ledger(ledger_id, account_id, task_id, lease_id, entry_type, amount, status) VALUES(?, ?, ?, ?, 'consume', ?, 'posted')",
+                (str(uuid.uuid4()), decision.account_id, decision.task_id, lease_id, reserved),
+            )
+        await db.execute(
+            """
+            UPDATE flow_accounts
+            SET current_task_id=NULL, lock_owner=NULL, lock_expires_at=NULL,
+                reserved_credits=MAX(reserved_credits-?, 0),
+                status=CASE WHEN COALESCE(credits, 0) >= 15 THEN 'ready' ELSE 'low_credits' END,
+                updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+            WHERE account_id=? AND current_task_id=?
+            """,
+            (reserved if decision.release_quota or decision.consume_quota else 0, decision.account_id, decision.task_id),
+        )
+        await db.execute("UPDATE account_leases SET status=? WHERE lease_id=?", ("expired" if decision.action != "cleanup_completed" else "completed", lease_id))
+        await record_state_event(
+            db,
+            task_id=decision.task_id,
+            old_state=decision.old_state,
+            new_state=state_for_status(decision.new_status) if decision.new_status else decision.old_state,
+            reason=decision.reason,
+            error_category="submission_result_unknown" if decision.action in {"submission_unknown", "reconcile_submission_unknown"} else None,
+            error_code=decision.reason,
+            account_id=decision.account_id,
+            lease_id=lease_id,
+        )
+        await db.commit()
+        return {"ok": True, "result": decision.action, "lease_id": lease_id, "task_id": decision.task_id}
+    except Exception:
+        await db.execute("ROLLBACK")
+        raise
+
+
+async def sweep_expired_leases(db, *, recovery_owner: str, now: str | None = None, limit: int = 50):
+    now = now or utc_now()
+    cursor = await db.execute(
+        "SELECT lease_id FROM account_leases WHERE status='active' AND expires_at<=? ORDER BY expires_at LIMIT ?",
+        (now, limit),
+    )
+    lease_ids = [row[0] for row in await cursor.fetchall()]
+    results = []
+    for lease_id in lease_ids:
+        results.append(await recover_expired_lease(db, lease_id=lease_id, recovery_owner=recovery_owner, now=now))
+    return results
+
+
+async def quota_consistency_report(db):
+    accounts = []
+    for row in await (await db.execute("SELECT * FROM flow_accounts ORDER BY account_id")).fetchall():
+        account = dict(row)
+        cursor = await db.execute(
+            """
+            SELECT COALESCE(SUM(CASE
+              WHEN entry_type IN ('reserve','freeze') AND status='active' THEN amount
+              WHEN entry_type='release' AND status='posted' THEN -amount
+              ELSE 0 END),0)
+            FROM quota_ledger WHERE account_id=?
+            """,
+            (account["account_id"],),
+        )
+        ledger_reserved = max(int((await cursor.fetchone())[0] or 0), 0)
+        accounts.append({
+            "account_id": account["account_id"],
+            "reserved_credits": int(account.get("reserved_credits") or 0),
+            "ledger_reserved_credits": ledger_reserved,
+            "reserved_non_negative": int(account.get("reserved_credits") or 0) >= 0,
+            "matches_ledger": int(account.get("reserved_credits") or 0) == ledger_reserved,
+        })
+    duplicate_account = int((await (await db.execute("SELECT COUNT(*) FROM (SELECT account_id FROM account_leases WHERE status='active' GROUP BY account_id HAVING COUNT(*)>1)")).fetchone())[0])
+    duplicate_task = int((await (await db.execute("SELECT COUNT(*) FROM (SELECT task_id FROM account_leases WHERE status='active' GROUP BY task_id HAVING COUNT(*)>1)")).fetchone())[0])
+    completed_active = int((await (await db.execute("SELECT COUNT(*) FROM account_leases l JOIN flow_tasks t ON t.task_id=l.task_id WHERE l.status='active' AND t.status='completed'")).fetchone())[0])
+    return {
+        "accounts": accounts,
+        "duplicate_active_account_leases": duplicate_account,
+        "duplicate_active_task_leases": duplicate_task,
+        "completed_tasks_with_active_lease": completed_active,
+        "ok": all(item["reserved_non_negative"] and item["matches_ledger"] for item in accounts)
+        and duplicate_account == 0
+        and duplicate_task == 0
+        and completed_active == 0,
+    }

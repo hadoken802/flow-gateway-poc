@@ -60,6 +60,7 @@ def test_parse_result_raw_is_attached(sample_image_success):
 @pytest.mark.asyncio
 async def test_apply_scene_result_generate_image_sets_fields_and_cascades(sample_uuid, mocker):
     mock_update = mocker.patch("agent.sdk.services.result_handler.crud.update_scene", new_callable=AsyncMock)
+    mocker.patch("agent.sdk.services.result_handler.crud.get_scene", new_callable=AsyncMock, return_value=None)
     result = GenerationResult(success=True, media_id=sample_uuid, url="https://example.com/img.jpg")
 
     await apply_scene_result("scene-001", "GENERATE_IMAGE", "VERTICAL", result)
@@ -78,6 +79,7 @@ async def test_apply_scene_result_generate_image_sets_fields_and_cascades(sample
 @pytest.mark.asyncio
 async def test_apply_scene_result_edit_image_same_cascade_as_generate(sample_uuid, mocker):
     mock_update = mocker.patch("agent.sdk.services.result_handler.crud.update_scene", new_callable=AsyncMock)
+    mocker.patch("agent.sdk.services.result_handler.crud.get_scene", new_callable=AsyncMock, return_value=None)
     result = GenerationResult(success=True, media_id=sample_uuid, url="https://example.com/img.jpg")
 
     await apply_scene_result("scene-001", "EDIT_IMAGE", "VERTICAL", result)
@@ -146,6 +148,7 @@ async def test_apply_scene_result_skips_when_result_failed(mocker):
 @pytest.mark.asyncio
 async def test_apply_scene_result_horizontal_orientation_uses_correct_prefix(sample_uuid, mocker):
     mock_update = mocker.patch("agent.sdk.services.result_handler.crud.update_scene", new_callable=AsyncMock)
+    mocker.patch("agent.sdk.services.result_handler.crud.get_scene", new_callable=AsyncMock, return_value=None)
     result = GenerationResult(success=True, media_id=sample_uuid, url="https://example.com/img.jpg")
 
     await apply_scene_result("scene-001", "GENERATE_IMAGE", "HORIZONTAL", result)

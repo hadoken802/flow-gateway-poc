@@ -247,3 +247,104 @@ async def test_download_failed_attempt_policy_does_not_increment_generation(tmp_
         assert current["download_attempt_count"] == 1
     finally:
         await db.close()
+
+
+@pytest.mark.asyncio
+async def test_sweeper_recovers_expired_leased_task_once_across_connections(tmp_path):
+    path = tmp_path / "gateway.db"
+    db1 = await connect(path)
+    db2 = await connect(path)
+    try:
+        await add_account(db1, "FLOW-001", 100)
+        task = await crud.create_task(db1, payload("expired-leased"))
+        leased = await crud.assign_task(db1, task["task_id"], "FLOW-001", "rt-1", 15, lease_seconds=1)
+        await db1.execute("UPDATE account_leases SET expires_at='2000-01-01T00:00:00Z' WHERE lease_id=?", (leased["lease_owner"],))
+        await db1.execute("UPDATE flow_tasks SET lease_expires_at='2000-01-01T00:00:00Z' WHERE task_id=?", (task["task_id"],))
+        await db1.commit()
+        results = await asyncio.gather(
+            scheduler_kernel.recover_expired_lease(db1, lease_id=leased["lease_owner"], recovery_owner="a", now="2026-01-01T00:00:00Z"),
+            scheduler_kernel.recover_expired_lease(db2, lease_id=leased["lease_owner"], recovery_owner="b", now="2026-01-01T00:00:00Z"),
+        )
+        assert sum(1 for item in results if item["ok"]) == 1
+        current = await crud.get_task(db1, task["task_id"])
+        account = await crud.get_account(db1, "FLOW-001")
+        assert current["status"] == "queued"
+        assert account["current_task_id"] is None
+        assert account["reserved_credits"] == 0
+    finally:
+        await db1.close()
+        await db2.close()
+
+
+@pytest.mark.asyncio
+async def test_sweeper_moves_expired_submitting_to_submission_unknown_without_submit(tmp_path):
+    db = await connect(tmp_path / "gateway.db")
+    try:
+        await add_account(db, "FLOW-001", 100)
+        task = await crud.create_task(db, payload("expired-submit"))
+        leased = await crud.assign_task(db, task["task_id"], "FLOW-001", "rt-1", 15, lease_seconds=1)
+        await crud.guarded_update_task(db, task["task_id"], leased["lease_owner"], leased["lease_version"], "submit_in_progress", project_id="project-1")
+        await db.execute("UPDATE account_leases SET expires_at='2000-01-01T00:00:00Z' WHERE lease_id=?", (leased["lease_owner"],))
+        await db.commit()
+        result = await scheduler_kernel.recover_expired_lease(db, lease_id=leased["lease_owner"], recovery_owner="r", now="2026-01-01T00:00:00Z")
+        assert result["result"] == "submission_unknown"
+        current = await crud.get_task(db, task["task_id"])
+        assert current["status"] == "submission_unknown"
+        assert current["project_id"] == "project-1"
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_completed_expired_lease_cleanup_does_not_double_consume(tmp_path):
+    db = await connect(tmp_path / "gateway.db")
+    try:
+        await add_account(db, "FLOW-001", 100)
+        task = await crud.create_task(db, payload("completed-cleanup"))
+        leased = await crud.assign_task(db, task["task_id"], "FLOW-001", "rt-1", 15, lease_seconds=1)
+        account = await crud.get_account(db, "FLOW-001")
+        await crud.guarded_complete_real_task(db, task["task_id"], "FLOW-001", leased["lease_owner"], leased["lease_version"], account["lock_version"], "D:/ok.mp4", 85)
+        first_consumed = (await crud.get_account(db, "FLOW-001"))["consumed_credits"]
+        await scheduler_kernel.recover_expired_lease(db, lease_id=leased["lease_owner"], recovery_owner="r", now="2999-01-01T00:00:00Z")
+        second_consumed = (await crud.get_account(db, "FLOW-001"))["consumed_credits"]
+        assert first_consumed == second_consumed
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_same_idempotency_key_returns_one_task(tmp_path):
+    path = tmp_path / "gateway.db"
+    dbs = [await connect(path) for _ in range(20)]
+    try:
+        async def create(db):
+            return await crud.create_task(db, payload("same-concurrent"))
+        results = await asyncio.gather(*(create(db) for db in dbs))
+        task_ids = {item["task_id"] for item in results}
+        assert len(task_ids) == 1
+        rows = await (await dbs[0].execute("SELECT COUNT(*) FROM flow_tasks WHERE idempotency_key='same-concurrent'")).fetchone()
+        events = await (await dbs[0].execute("SELECT COUNT(*) FROM task_state_events WHERE new_state='queued'")).fetchone()
+        assert rows[0] == 1
+        assert events[0] == 1
+    finally:
+        for db in dbs:
+            await db.close()
+
+
+@pytest.mark.asyncio
+async def test_quota_consistency_checker_reports_clean_ledger(tmp_path):
+    db = await connect(tmp_path / "gateway.db")
+    try:
+        await add_account(db, "FLOW-001", 100)
+        task = await crud.create_task(db, payload("quota-clean"))
+        leased = await crud.assign_task(db, task["task_id"], "FLOW-001", "rt-1", 15)
+        report = await scheduler_kernel.quota_consistency_report(db)
+        assert report["ok"] is True
+        assert report["accounts"][0]["reserved_credits"] == 15
+        account = await crud.get_account(db, "FLOW-001")
+        await crud.guarded_release_account(db, task["task_id"], "FLOW-001", leased["lease_owner"], leased["lease_version"], account["lock_version"], "failed", error_code="x")
+        report = await scheduler_kernel.quota_consistency_report(db)
+        assert report["ok"] is True
+        assert report["accounts"][0]["reserved_credits"] == 0
+    finally:
+        await db.close()

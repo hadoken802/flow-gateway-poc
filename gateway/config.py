@@ -77,6 +77,7 @@ class GatewaySettings:
     startup_timeout_seconds: float = 60.0
     lease_duration_seconds: float = 15 * 60
     heartbeat_interval_seconds: float = 30.0
+    lease_sweeper_interval_seconds: float = 30.0
 
     @classmethod
     def from_env(cls) -> "GatewaySettings":
@@ -97,6 +98,7 @@ class GatewaySettings:
             startup_timeout_seconds=_positive_float("GATEWAY_STARTUP_TIMEOUT_SECONDS", 60.0),
             lease_duration_seconds=_positive_float("GATEWAY_LEASE_DURATION_SECONDS", 15 * 60),
             heartbeat_interval_seconds=_positive_float("GATEWAY_HEARTBEAT_INTERVAL_SECONDS", 30.0),
+            lease_sweeper_interval_seconds=_positive_float("GATEWAY_LEASE_SWEEPER_INTERVAL_SECONDS", 30.0),
         )
 
 

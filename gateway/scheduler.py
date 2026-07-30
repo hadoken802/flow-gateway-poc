@@ -41,6 +41,7 @@ class GatewayScheduler:
         self._dry_tasks: dict[str, asyncio.Task] = {}
         self._real_tasks: dict[str, asyncio.Task] = {}
         self._heartbeat_tasks: dict[str, asyncio.Task] = {}
+        self._lease_sweeper_task = None
         self._fencing_lost: set[str] = set()
         self._stopping = False
         self.assignment_history: list[tuple[str, str]] = []
@@ -98,10 +99,12 @@ class GatewayScheduler:
         self._audit("refresh_workers_completed")
         self.startup_stage = "recover_tasks"
         self._audit("recover_tasks_started")
+        await self.sweep_expired_leases_once(reason="startup")
         await self.recover_tasks()
         self._audit("recover_tasks_completed")
         self.startup_stage = "scheduler_loop_start"
         self._runner_task = asyncio.create_task(self._run_loop())
+        self._lease_sweeper_task = asyncio.create_task(self._lease_sweeper_loop())
         self._audit("scheduler_loop_started")
         self.startup_stage = "completed"
 
@@ -111,6 +114,12 @@ class GatewayScheduler:
             self._runner_task.cancel()
             try:
                 await self._runner_task
+            except asyncio.CancelledError:
+                pass
+        if self._lease_sweeper_task:
+            self._lease_sweeper_task.cancel()
+            try:
+                await self._lease_sweeper_task
             except asyncio.CancelledError:
                 pass
         for task in list(self._dry_tasks.values()):
@@ -184,7 +193,7 @@ class GatewayScheduler:
             return
         if self.settings.dry_run:
             for task in tasks:
-                if task["status"] in {"assigning", "submitted", "processing", "waiting_recovery"}:
+                if task["status"] in {"assigning", "reserving", "leased", "submitting", "submitted", "processing", "waiting_recovery"}:
                     await crud.update_task_status(self.db, task["task_id"], "queued")
             await self.db.execute(
                 """
@@ -320,6 +329,23 @@ class GatewayScheduler:
                     self._last_worker_refresh = asyncio.get_running_loop().time()
             await self.schedule_once()
             await asyncio.sleep(0.05)
+
+    async def _lease_sweeper_loop(self):
+        while not self._stopping:
+            await asyncio.sleep(self.settings.lease_sweeper_interval_seconds)
+            await self.sweep_expired_leases_once(reason="periodic")
+
+    async def sweep_expired_leases_once(self, reason="manual"):
+        if not self.db:
+            return []
+        results = await scheduler_kernel.sweep_expired_leases(
+            self.db,
+            recovery_owner=self.scheduler_instance_id,
+        )
+        if results:
+            self._audit("lease_sweeper_completed", reason=reason, recovered=sum(1 for item in results if item.get("ok")), results=results)
+            await self.schedule_once()
+        return results
 
     async def create_task(self, payload):
         if not self.settings.dry_run and self.settings.canary_only:

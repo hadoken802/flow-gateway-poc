@@ -20,6 +20,8 @@ from agent.sdk.services.result_handler import parse_result, apply_scene_result, 
 
 logger = logging.getLogger(__name__)
 
+_retry_state: dict[str, float] = {}
+
 _API_CALL_TYPES = {"GENERATE_IMAGE", "REGENERATE_IMAGE", "EDIT_IMAGE",
                    "GENERATE_VIDEO", "REGENERATE_VIDEO", "GENERATE_VIDEO_REFS", "UPSCALE_VIDEO",
                    "GENERATE_CHARACTER_IMAGE", "REGENERATE_CHARACTER_IMAGE",
@@ -412,6 +414,9 @@ async def _recover_entity_not_found(req: dict) -> bool:
 
 
 async def _handle_failure(rid: str, req: dict, result: dict, retry_after: dict = None):
+    if retry_after is None:
+        retry_after = _retry_state
+
     error_msg = result.get("error")
     if not error_msg:
         data = result.get("data", {})

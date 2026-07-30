@@ -1,6 +1,25 @@
 """Shared pytest fixtures for Flow Kit tests."""
 
+from unittest.mock import patch
+
 import pytest
+
+
+@pytest.fixture
+def mocker():
+    """Small pytest-mock compatible patch fixture used by legacy unit tests."""
+    patches = []
+
+    class _Mocker:
+        def patch(self, target, *args, **kwargs):
+            patcher = patch(target, *args, **kwargs)
+            patches.append(patcher)
+            return patcher.start()
+
+    yield _Mocker()
+
+    for patcher in reversed(patches):
+        patcher.stop()
 
 
 @pytest.fixture
