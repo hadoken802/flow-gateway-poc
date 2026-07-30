@@ -2,16 +2,19 @@
   {
     "account_id": "FLOW-001",
     "api_url": "http://127.0.0.1:8101",
-    "enabled": true
+    "enabled": true,
+    "runtime_instance_id": "1952ae93-3d0b-41e1-a4a2-6f2ff2bb2609"
   },
   {
     "account_id": "FLOW-002",
     "api_url": "http://127.0.0.1:8102",
-    "enabled": true
+    "enabled": true,
+    "runtime_instance_id": "302b7183-9d78-498e-aa30-8dd66a7c1a30"
   },
   {
     "account_id": "FLOW-003",
     "api_url": "http://127.0.0.1:8103",
-    "enabled": true
+    "enabled": true,
+    "runtime_instance_id": "a6b9b1f0-ec34-4344-ad25-46de874a0ce1"
   }
 ]

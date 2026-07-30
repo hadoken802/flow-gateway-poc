@@ -18,11 +18,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("list")
+    for name in ("start-all-workers", "stop-all-workers", "status-all-workers"):
+        sub.add_parser(name)
 
     show = sub.add_parser("show")
     show.add_argument("account_id")
 
-    for name in ("open-login", "start-one", "status", "stop-one"):
+    for name in ("open-login", "start-one", "start-worker-only", "status", "stop-one", "stop-worker-only"):
         parser_one = sub.add_parser(name)
         parser_one.add_argument("account_id")
 
@@ -66,6 +68,24 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps([asdict(account) for account in registry.list_accounts()], ensure_ascii=False, indent=2))
         return 0
 
+    if args.command in {"start-all-workers", "stop-all-workers", "status-all-workers"}:
+        manager = RuntimeManager(registry)
+        results = []
+        for account in registry.list_accounts():
+            if args.command == "start-all-workers":
+                if not account.enabled:
+                    results.append({"account_id": account.account_id, "result": "skipped_disabled", "ok": True})
+                    continue
+                result = manager.start_worker_only(account.account_id)
+            elif args.command == "stop-all-workers":
+                result = manager.stop_worker_only(account.account_id)
+            else:
+                result = manager.status(account.account_id)
+            results.append(result.to_dict() if hasattr(result, "to_dict") else result)
+        ok = all(item.get("ok") or item.get("result") in {"already_running", "already_stopped", "skipped_disabled", "running"} for item in results)
+        print(json.dumps({"ok": ok, "results": results}, ensure_ascii=False, indent=2))
+        return 0 if ok else 1
+
     if args.command == "show":
         account = registry.get(args.account_id)
         if not account:
@@ -74,7 +94,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(asdict(account), ensure_ascii=False, indent=2))
         return 0
 
-    if args.command in {"open-login", "start-one", "status", "stop-one"}:
+    if args.command in {"open-login", "start-one", "start-worker-only", "status", "stop-one", "stop-worker-only"}:
         manager = RuntimeManager(registry)
         result = getattr(manager, args.command.replace("-", "_"))(args.account_id)
         print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))

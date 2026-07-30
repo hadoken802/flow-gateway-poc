@@ -28,7 +28,8 @@ class GatewayInstanceLock:
         if self.lock_path.exists():
             existing = self._read()
             pid = int(existing.get("server_pid") or existing.get("launcher_pid") or 0)
-            if pid and _pid_exists(pid) and _pid_listens_on_port(pid, self.port):
+            existing_port = int(existing.get("gateway_port") or 0)
+            if pid and _pid_exists(pid) and (not existing_port or _pid_listens_on_port(pid, existing_port)):
                 raise GatewayInstanceLockError("gateway_instance_already_running")
             try:
                 self.lock_path.unlink()

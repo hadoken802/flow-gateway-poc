@@ -475,16 +475,23 @@ class RuntimeManager:
         base = self._preflight(account, require_profile=True, require_chrome=False)
         if base:
             return base
-        for field, port in (("worker_api_port", account.worker_api_port), ("extension_ws_port", account.extension_ws_port)):
-            conflict = self._listening_port_conflict(account, field, port)
-            if conflict:
-                self._log(account.account_id, "start-worker-only", {"result": "port_conflict", **(conflict.details or {})})
-                return conflict
         existing_worker_pid = self._verified_worker_pid(account)
         if existing_worker_pid:
             self.registry.mark_started(account.account_id, worker_pid=existing_worker_pid)
             self._log(account.account_id, "start-worker-only", {"result": "already_running", "pid": existing_worker_pid})
             return RuntimeResult("already_running", account.account_id, True, details={"worker_pid": existing_worker_pid})
+        api_pid = self.inspector.listening_pid(account.worker_api_port)
+        ws_pid = self.inspector.listening_pid(account.extension_ws_port)
+        if api_pid and ws_pid and int(api_pid) == int(ws_pid) and self._worker_health_matches_current_runtime(account):
+            self.registry.mark_started(account.account_id, worker_pid=int(api_pid))
+            self.registry.mark_worker_ownership_verified(account.account_id, "worker_health_runtime_instance_match")
+            self._log(account.account_id, "start-worker-only", {"result": "already_running", "pid": int(api_pid), "method": "worker_health_runtime_instance_match"})
+            return RuntimeResult("already_running", account.account_id, True, details={"worker_pid": int(api_pid), "method": "worker_health_runtime_instance_match"})
+        for field, port in (("worker_api_port", account.worker_api_port), ("extension_ws_port", account.extension_ws_port)):
+            conflict = self._listening_port_conflict(account, field, port)
+            if conflict:
+                self._log(account.account_id, "start-worker-only", {"result": "port_conflict", **(conflict.details or {})})
+                return conflict
         try:
             worker_proc = self._start_new_worker(account)
         except Exception as error:
@@ -660,6 +667,29 @@ class RuntimeManager:
         self.registry.mark_stopped(account.account_id)
         self._log(account.account_id, "stop-one", {"result": "stopped", **plan})
         return RuntimeResult("stopped", account.account_id, True, details=plan)
+
+    def stop_worker_only(self, account_id: str) -> RuntimeResult:
+        account = self.registry.get(account_id)
+        if not account:
+            return RuntimeResult("account_not_found", account_id, False)
+        verified_worker_pid = self._verified_worker_pid(account)
+        if not verified_worker_pid:
+            self.registry.mark_stopped(account.account_id, clear_chrome=False, clear_worker=True)
+            self._log(account.account_id, "stop-worker-only", {"result": "already_stopped"})
+            return RuntimeResult("already_stopped", account.account_id, True)
+        termination = self.inspector.terminate(
+            verified_worker_pid,
+            should_force=lambda: port_is_listening(account.worker_api_port) or port_is_listening(account.extension_ws_port),
+        )
+        if not termination or not self._wait_worker_ports_released(account):
+            details = {"worker_pid": verified_worker_pid, "remaining_ports": self._worker_port_details(account), **self._termination_details(termination)}
+            self._log(account.account_id, "stop-worker-only", {"result": "stop_failed", **details})
+            return RuntimeResult("stop_failed", account.account_id, False, details=details)
+        current = self.registry.get(account.account_id) or account
+        delete_secret_ref(current.runtime_secret_ref)
+        self.registry.mark_stopped(account.account_id, clear_chrome=False, clear_worker=True)
+        self._log(account.account_id, "stop-worker-only", {"result": "stopped", "worker_pid": verified_worker_pid})
+        return RuntimeResult("stopped", account.account_id, True, details={"worker_pid": verified_worker_pid, "chrome_preserved": True})
 
     def chrome_command(self, account: AccountRecord) -> list[str]:
         chrome = self._find_chrome()
@@ -1061,6 +1091,22 @@ class RuntimeManager:
         try:
             secret = read_runtime_secret(account.runtime_secret_ref, self.ownership_protector)
         except OwnershipError as error:
+            updated = self.registry.mark_worker_ownership_verified_if_current(
+                account.account_id,
+                expected_runtime_instance_id,
+                expected_worker_pid,
+                int(expected_runtime_ownership_version),
+                int(api_pid),
+                "worker_health_runtime_instance_match",
+            )
+            if updated:
+                return {
+                    **details,
+                    "verified": True,
+                    "reason": "verified_by_worker_health_runtime_instance_match",
+                    "method": "worker_health_runtime_instance_match",
+                    "worker_pid_cas_applied": True,
+                }
             return {**details, "reason": str(error)}
         challenge = generate_challenge()
         response = self._worker_ownership_challenge(account, challenge)

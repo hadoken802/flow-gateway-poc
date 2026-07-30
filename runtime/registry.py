@@ -299,6 +299,96 @@ class AccountRegistry:
             conn.commit()
         return self._row_to_record(row) if row else None
 
+    def upsert_account(
+        self,
+        account_id: str,
+        display_name: str | None = None,
+        worker_api_port: int | None = None,
+        chrome_cdp_port: int | None = None,
+        extension_ws_port: int | None = None,
+        enabled: bool = True,
+        status: str = "registered",
+        profile_path: str | None = None,
+    ) -> tuple[AccountRecord | None, str]:
+        account_id = str(account_id or "").strip()
+        if not account_id:
+            raise ValueError("account_id is required")
+        existing = self.get(account_id)
+        if existing:
+            return existing, "duplicate"
+        worker_api_port = int(worker_api_port or 0)
+        chrome_cdp_port = int(chrome_cdp_port or 0)
+        if worker_api_port <= 0 or chrome_cdp_port <= 0:
+            raise ValueError("worker_api_port and chrome_cdp_port are required")
+        extension_ws_port = int(extension_ws_port or self._default_ws_port(account_id, worker_api_port))
+        with self.connect() as conn:
+            conflict = conn.execute(
+                """
+                SELECT account_id, worker_api_port, extension_ws_port, chrome_cdp_port
+                FROM flow_account_registry
+                WHERE worker_api_port=? OR extension_ws_port=? OR chrome_cdp_port=?
+                """,
+                (worker_api_port, extension_ws_port, chrome_cdp_port),
+            ).fetchone()
+            if conflict:
+                raise ValueError(f"port_conflict: {conflict['account_id']}")
+        record = AccountRecord(
+            account_id=account_id,
+            display_name=display_name or account_id,
+            profile_path=str(Path(profile_path) if profile_path else self.profiles_root / account_id),
+            worker_api_port=worker_api_port,
+            extension_ws_port=extension_ws_port,
+            chrome_cdp_port=chrome_cdp_port,
+            database_path=str(self.data_root / f"{account_id}.db"),
+            output_dir=str(self.outputs_root / account_id),
+            enabled=bool(enabled),
+            status=status,
+            created_at=utc_now(),
+        )
+        self.register_many([record], create_dirs=False)
+        self.sync_workers_json()
+        return self.get(account_id), "created"
+
+    def update_account(self, account_id: str, **fields) -> AccountRecord | None:
+        allowed = {"display_name", "worker_api_port", "extension_ws_port", "chrome_cdp_port", "profile_path", "enabled", "status"}
+        updates = {key: value for key, value in fields.items() if key in allowed and value is not None}
+        if not updates:
+            return self.get(account_id)
+        for key in ("worker_api_port", "extension_ws_port", "chrome_cdp_port"):
+            if key in updates:
+                updates[key] = int(updates[key])
+                with self.connect() as conn:
+                    conflict = conn.execute(
+                        f"SELECT account_id FROM flow_account_registry WHERE {key}=? AND account_id<>?",
+                        (updates[key], account_id),
+                    ).fetchone()
+                    if conflict:
+                        raise ValueError(f"{key}_conflict: {conflict['account_id']}")
+        if "enabled" in updates:
+            updates["enabled"] = int(bool(updates["enabled"]))
+        sets = [f"{key}=?" for key in updates]
+        values = list(updates.values()) + [utc_now(), account_id]
+        with self.connect() as conn:
+            cursor = conn.execute(
+                f"UPDATE flow_account_registry SET {', '.join(sets)}, updated_at=? WHERE account_id=?",
+                tuple(values),
+            )
+            conn.commit()
+            if cursor.rowcount != 1:
+                return None
+        self.sync_workers_json()
+        return self.get(account_id)
+
+    def set_enabled(self, account_id: str, enabled: bool) -> AccountRecord | None:
+        return self.update_account(account_id, enabled=enabled)
+
+    def remove_account(self, account_id: str) -> bool:
+        with self.connect() as conn:
+            cursor = conn.execute("DELETE FROM flow_account_registry WHERE account_id=?", (account_id,))
+            conn.commit()
+        self.sync_workers_json()
+        return cursor.rowcount == 1
+
     def mark_started(self, account_id: str, chrome_pid: int | None = None, worker_pid: int | None = None) -> None:
         with self.connect() as conn:
             conn.execute(
@@ -314,6 +404,19 @@ class AccountRegistry:
                 (chrome_pid, worker_pid, utc_now(), utc_now(), account_id),
             )
             conn.commit()
+
+    def sync_workers_json(self) -> None:
+        self.workers_json_path.parent.mkdir(parents=True, exist_ok=True)
+        workers = [
+            {
+                "account_id": account.account_id,
+                "api_url": f"http://127.0.0.1:{account.worker_api_port}",
+                "enabled": bool(account.enabled),
+                "runtime_instance_id": account.runtime_instance_id,
+            }
+            for account in self.list_accounts()
+        ]
+        self.workers_json_path.write_text(json.dumps(workers, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     def mark_worker_runtime_identity(
         self,
@@ -552,7 +655,19 @@ class AccountRegistry:
         return ports
 
     def _known_ws_port(self, account_id: str) -> int:
-        return {"FLOW-001": 9222, "FLOW-002": 9212, "FLOW-003": 9213}.get(account_id, 0)
+        return {"FLOW-001": 9200, "FLOW-002": 9201, "FLOW-003": 9202}.get(account_id, 0)
+
+    def _default_ws_port(self, account_id: str, worker_api_port: int) -> int:
+        known = self._known_ws_port(account_id)
+        if known:
+            return known
+        try:
+            number = int(account_id.rsplit("-", 1)[-1])
+        except ValueError:
+            number = 0
+        if number > 0:
+            return 9200 + number - 1
+        return int(worker_api_port) + 100
 
     def _known_chrome_cdp_port(self, account_id: str, reserved: set[int]) -> int:
         number = int(account_id.rsplit("-", 1)[-1]) if "-" in account_id else 0

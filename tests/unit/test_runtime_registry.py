@@ -42,7 +42,7 @@ def test_import_existing_workers_reports_unregistered_profile(tmp_path):
 
     assert [account.account_id for account in plan.accounts] == ["FLOW-001", "FLOW-002", "FLOW-003"]
     assert {account.worker_api_port for account in plan.accounts} == {8100, 8112, 8113}
-    assert {account.extension_ws_port for account in plan.accounts} == {9222, 9212, 9213}
+    assert {account.extension_ws_port for account in plan.accounts} == {9200, 9201, 9202}
     assert [issue.reason for issue in plan.issues] == ["profile_exists_unregistered"]
     assert plan.issues[0].account_id == "FLOW-004"
 

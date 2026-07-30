@@ -13,6 +13,7 @@ from .config import GatewaySettings
 from .instance_lock import GatewayInstanceLock, GatewayInstanceLockError
 from .scheduler import GatewayScheduler
 from . import task_center
+from . import nodes
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s", force=True)
 logger = logging.getLogger(__name__)
@@ -325,6 +326,99 @@ async def v1_accounts():
     return await scheduler.list_accounts()
 
 
+@app.get("/api/v1/nodes")
+async def v1_nodes():
+    return await nodes.list_nodes(scheduler)
+
+
+@app.post("/api/v1/nodes")
+async def v1_create_node(payload: dict):
+    try:
+        return await nodes.create_node(scheduler, payload)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/v1/nodes/import")
+async def v1_import_nodes(payload: dict):
+    return await nodes.import_nodes(scheduler, payload)
+
+
+@app.get("/api/v1/nodes/{account_id}")
+async def v1_get_node(account_id: str):
+    node = await nodes.get_node(scheduler, account_id)
+    if not node:
+        raise HTTPException(404, "Node not found")
+    return node
+
+
+@app.patch("/api/v1/nodes/{account_id}")
+async def v1_patch_node(account_id: str, payload: dict):
+    try:
+        node = await nodes.patch_node(scheduler, account_id, payload)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if not node:
+        raise HTTPException(404, "Node not found")
+    return node
+
+
+@app.post("/api/v1/nodes/{account_id}/start")
+async def v1_start_node(account_id: str):
+    result = await nodes.runtime_action(scheduler, account_id, "start")
+    if not result:
+        raise HTTPException(404, "Node not found")
+    return result
+
+
+@app.post("/api/v1/nodes/{account_id}/stop")
+async def v1_stop_node(account_id: str):
+    result = await nodes.runtime_action(scheduler, account_id, "stop")
+    if not result:
+        raise HTTPException(404, "Node not found")
+    return result
+
+
+@app.post("/api/v1/nodes/{account_id}/restart")
+async def v1_restart_node(account_id: str):
+    result = await nodes.runtime_action(scheduler, account_id, "restart")
+    if not result:
+        raise HTTPException(404, "Node not found")
+    return result
+
+
+@app.post("/api/v1/nodes/{account_id}/refresh-session")
+async def v1_refresh_node_session(account_id: str):
+    result = await nodes.refresh_session(scheduler, account_id)
+    if not result:
+        raise HTTPException(404, "Node not found")
+    return result
+
+
+@app.post("/api/v1/nodes/{account_id}/enable")
+async def v1_enable_node(account_id: str):
+    node = await nodes.set_node_enabled(scheduler, account_id, True)
+    if not node:
+        raise HTTPException(404, "Node not found")
+    return node
+
+
+@app.post("/api/v1/nodes/{account_id}/disable")
+async def v1_disable_node(account_id: str):
+    node = await nodes.set_node_enabled(scheduler, account_id, False)
+    if not node:
+        raise HTTPException(404, "Node not found")
+    return node
+
+
+@app.delete("/api/v1/nodes/{account_id}")
+async def v1_delete_node(account_id: str):
+    result = await nodes.delete_node(scheduler, account_id)
+    if not result:
+        raise HTTPException(404, "Node not found")
+    return result
+
+
 @app.get("/api/v1/system/status")
 async def v1_system_status():
     status = await scheduler.pool_status()
@@ -333,12 +427,13 @@ async def v1_system_status():
         "gateway": await health(),
         "workers": scheduler.worker_snapshot.diagnostics(),
         "examples": task_center.examples(),
+        "node_examples": nodes.examples(),
     }
 
 
 @app.get("/api/v1/docs/examples")
 async def v1_examples():
-    return task_center.examples()
+    return {**task_center.examples(), "nodes": nodes.examples()}
 
 
 TASK_CENTER_HTML = """
@@ -403,6 +498,21 @@ TASK_CENTER_HTML = """
     <h2>Accounts</h2>
     <div style="overflow:auto"><table id="accounts"></table></div>
   </section>
+  <section>
+    <h2>Account Nodes</h2>
+    <div class="row">
+      <input id="nodeAccountId" placeholder="FLOW-004">
+      <input id="nodeWorkerPort" placeholder="worker port">
+      <input id="nodeCdpPort" placeholder="cdp port">
+      <input id="nodeDisplayName" placeholder="display name">
+      <button class="primary" onclick="addNode()">Add Node</button>
+      <button onclick="loadNodeExample()">Load Node Example</button>
+      <button onclick="importNodes()">Import Nodes</button>
+    </div>
+    <textarea id="nodeImportContent" placeholder="CSV or JSON node config"></textarea>
+    <pre id="nodeResult"></pre>
+    <div style="overflow:auto"><table id="nodesTable"></table></div>
+  </section>
 </main>
 <script>
 async function api(path, options){const r=await fetch(path, options); if(!r.ok) throw new Error(await r.text()); return await r.json();}
@@ -411,7 +521,7 @@ async function refresh(){
   const s=await api('/api/v1/system/status');
   const ms=[['queued',s.queued_count],['running',s.active_count],['completed',s.completed_count],['failed',s.failed_count],['ready accounts',s.accounts_ready],['cooldown',s.accounts_cooldown||0],['paused',s.accounts_paused||0]];
   metrics.innerHTML=ms.map(m=>`<div class="metric">${m[0]}<b>${m[1]}</b></div>`).join('');
-  await loadAccounts(); await loadTasks();
+  await loadAccounts(); await loadTasks(); await loadNodes();
 }
 async function loadAccounts(){
   const rows=await api('/api/v1/accounts');
@@ -443,6 +553,31 @@ async function reconcileTask(id){alert(JSON.stringify(await api(`/api/v1/tasks/$
 async function manualTask(id){await api(`/api/v1/tasks/${id}/need-manual`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({error_code:'NEED_MANUAL',error_message:'Marked from task center'})}); await loadTasks()}
 async function detail(id){alert(JSON.stringify(await api(`/api/v1/tasks/${id}`),null,2))}
 async function exportTasks(){const rows=await api('/api/v1/tasks'); const blob=new Blob([JSON.stringify(rows,null,2)],{type:'application/json'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='flow-gateway-tasks.json'; a.click();}
+async function loadNodes(){
+  const rows=await api('/api/v1/nodes');
+  nodesTable.innerHTML='<tr><th>account</th><th>worker</th><th>cdp</th><th>pids</th><th>runtime</th><th>extension</th><th>oauth/quota</th><th>credits</th><th>current task</th><th>enabled</th><th>paused/cooldown</th><th>error</th><th>actions</th></tr>'+
+    rows.map(n=>`<tr>${td(n.account_id)}${td(`${n.worker_host}:${n.worker_port}`)}${td(`${n.cdp_host}:${n.cdp_port}`)}${td(`worker ${n.worker_pid||''}<br>chrome ${n.chrome_pid||''}`)}${td(n.worker_status)}${td(n.extension_status)}${td(`${n.oauth_status||''}<br>${n.quota_confidence||''}`)}${td(n.credits)}${td(n.current_task_id)}${td(n.enabled)}${td(`${n.manual_paused?'paused':''}<br>${n.cooldown_until||''}`)}${td(n.last_gateway_error||n.last_error||'')}<td><button onclick="startNode('${n.account_id}')">start</button> <button onclick="stopNode('${n.account_id}')">stop</button> <button onclick="restartNode('${n.account_id}')">restart</button> <button onclick="refreshNodeSession('${n.account_id}')">refresh session</button> <button onclick="enableNode('${n.account_id}')">enable</button> <button onclick="disableNode('${n.account_id}')">disable</button> <button onclick="editNode('${n.account_id}',${n.worker_port},${n.cdp_port})">edit ports</button> <button onclick="nodeDetail('${n.account_id}')">diagnostics</button></td></tr>`).join('');
+}
+async function addNode(){
+  const payload={account_id:nodeAccountId.value,worker_port:Number(nodeWorkerPort.value),cdp_port:Number(nodeCdpPort.value),display_name:nodeDisplayName.value||nodeAccountId.value,enabled:false};
+  nodeResult.textContent=JSON.stringify(await api('/api/v1/nodes',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}),null,2);
+  await loadNodes();
+}
+async function loadNodeExample(){const e=await api('/api/v1/docs/examples'); nodeImportContent.value=e.nodes.csv;}
+async function importNodes(){
+  const content=nodeImportContent.value;
+  const format=content.trim().startsWith('{')||content.trim().startsWith('[')?'json':'csv';
+  nodeResult.textContent=JSON.stringify(await api('/api/v1/nodes/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({format,content})}),null,2);
+  await loadNodes();
+}
+async function startNode(id){nodeResult.textContent=JSON.stringify(await api(`/api/v1/nodes/${id}/start`,{method:'POST'}),null,2); await refresh()}
+async function stopNode(id){nodeResult.textContent=JSON.stringify(await api(`/api/v1/nodes/${id}/stop`,{method:'POST'}),null,2); await refresh()}
+async function restartNode(id){nodeResult.textContent=JSON.stringify(await api(`/api/v1/nodes/${id}/restart`,{method:'POST'}),null,2); await refresh()}
+async function refreshNodeSession(id){nodeResult.textContent=JSON.stringify(await api(`/api/v1/nodes/${id}/refresh-session`,{method:'POST'}),null,2); await refresh()}
+async function enableNode(id){nodeResult.textContent=JSON.stringify(await api(`/api/v1/nodes/${id}/enable`,{method:'POST'}),null,2); await refresh()}
+async function disableNode(id){nodeResult.textContent=JSON.stringify(await api(`/api/v1/nodes/${id}/disable`,{method:'POST'}),null,2); await refresh()}
+async function editNode(id,oldWorker,oldCdp){const worker=prompt('worker port',oldWorker); if(!worker) return; const cdp=prompt('cdp port',oldCdp); if(!cdp) return; nodeResult.textContent=JSON.stringify(await api(`/api/v1/nodes/${id}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({worker_port:Number(worker),cdp_port:Number(cdp)})}),null,2); await refresh()}
+async function nodeDetail(id){nodeResult.textContent=JSON.stringify(await api(`/api/v1/nodes/${id}`),null,2)}
 refresh();
 </script>
 </body>

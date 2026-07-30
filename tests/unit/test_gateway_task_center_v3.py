@@ -124,4 +124,6 @@ def test_v1_routes_are_registered():
     assert "/api/v1/tasks/{task_id}/pause" in paths
     assert "/api/v1/tasks/{task_id}/retry-download" in paths
     assert "/api/v1/accounts" in paths
+    assert "/api/v1/nodes" in paths
+    assert "/api/v1/nodes/{account_id}/refresh-session" in paths
     assert "/" in paths

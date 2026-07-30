@@ -377,9 +377,12 @@ class GatewayScheduler:
     async def pool_status(self):
         tasks = await crud.list_tasks(self.db)
         accounts = await crud.list_accounts(self.db)
+        effective_max_concurrency = self.effective_max_concurrency_from_accounts(accounts)
         return {
             "dry_run": self.settings.dry_run,
-            "max_concurrency": self.settings.max_concurrency,
+            "max_concurrency": effective_max_concurrency,
+            "configured_max_concurrency": self.settings.max_concurrency,
+            "effective_max_concurrency": effective_max_concurrency,
             "active_count": sum(1 for task in tasks if task["status"] in ACTIVE_TASK_STATUSES),
             "queued_count": sum(1 for task in tasks if task["status"] == "queued"),
             "completed_count": sum(1 for task in tasks if task["status"] == "completed"),
@@ -392,20 +395,45 @@ class GatewayScheduler:
             "accounts_cooldown": sum(1 for account in accounts if account.get("cooldown_until")),
         }
 
+    def effective_max_concurrency_from_accounts(self, accounts: list[dict]) -> int:
+        usable = 0
+        now = crud.utc_now()
+        snapshot_account_ids = {worker.account_id for worker in self.worker_snapshot.workers}
+        for account in accounts:
+            if snapshot_account_ids and account.get("account_id") not in snapshot_account_ids:
+                continue
+            if not int(account.get("enabled", 1)):
+                continue
+            if int(account.get("manual_paused") or 0):
+                continue
+            if account.get("cooldown_until") and account.get("cooldown_until") > now:
+                continue
+            if account.get("status") not in {"ready", "busy"}:
+                continue
+            if (
+                not self.settings.dry_run
+                and not self.settings.allow_stale_quota_scheduling
+                and account.get("quota_confidence") != "live"
+            ):
+                continue
+            usable += 1
+        return min(int(self.settings.max_concurrency), usable)
+
     async def schedule_once(self):
         async with self.assignment_lock:
             await self._schedule_once_locked()
 
     async def _schedule_once_locked(self):
         status = await self.pool_status()
-        if status["active_count"] >= self.settings.max_concurrency:
+        if status["active_count"] >= status["effective_max_concurrency"]:
             return
         accounts = await crud.list_accounts(self.db)
         for account in accounts:
             today_count, total_count = await scheduler_kernel.usage_counts(self.db, account["account_id"])
             account["_task_count_today"] = today_count
             account["_total_task_count"] = total_count
-        while status["active_count"] < self.settings.max_concurrency:
+        status["effective_max_concurrency"] = self.effective_max_concurrency_from_accounts(accounts)
+        while status["active_count"] < status["effective_max_concurrency"]:
             next_task = self._next_schedulable_task(await crud.list_tasks(self.db))
             if not next_task:
                 return
@@ -416,7 +444,7 @@ class GatewayScheduler:
             account = next((item for item in accounts if item["account_id"] == account_id), None)
             if not account:
                 return
-            if status["active_count"] >= self.settings.max_concurrency:
+            if status["active_count"] >= status["effective_max_concurrency"]:
                 return
             lock = self.account_locks.get(account_id)
             if not lock:
