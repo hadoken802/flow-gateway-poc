@@ -32,10 +32,10 @@ def make_registry(tmp_path):
 
 def add_account(registry, account_id="FLOW-006"):
     ports = {
-        "FLOW-005": (8101, 9200, 9300),
-        "FLOW-006": (8102, 9201, 9304),
-        "FLOW-007": (8103, 9202, 9305),
-        "BAD": (8104, 9203, 9306),
+        "FLOW-005": (8101, 9200, 19300),
+        "FLOW-006": (8102, 9201, 19304),
+        "FLOW-007": (8103, 9202, 19305),
+        "BAD": (8104, 9203, 19306),
     }
     worker_api, extension_ws, chrome_cdp = ports[account_id]
     account = AccountRecord(
