@@ -90,6 +90,25 @@ class FakeRealWorkerClient(FakeWorkerClient):
         return self.jobs[worker_job_id]
 
 
+class SwitchAccountWorkerClient(FakeRealWorkerClient):
+    def __init__(self, states, output_dir, failures):
+        super().__init__(states, output_dir)
+        self.failures = failures
+
+    async def get_omni_video(self, worker, worker_job_id):
+        self.gets.append((worker.account_id, worker_job_id))
+        failure = self.failures.get(worker.account_id)
+        if failure:
+            return {
+                "job_id": worker_job_id,
+                "status": "failed",
+                "error_code": failure[0],
+                "error_message": failure[1],
+                "remaining_credits": self.states[worker.account_id]["credits"],
+            }
+        return self.jobs[worker_job_id]
+
+
 def local_db(name):
     path = RUN_ROOT / name / "gateway.db"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -111,6 +130,26 @@ def write_workers(path, account_ids):
         {"account_id": account_id, "api_url": f"http://127.0.0.1:{8100 + idx}", "enabled": True, "runtime_instance_id": f"runtime-{account_id}"}
         for idx, account_id in enumerate(account_ids)
     ]), encoding="utf-8")
+
+
+async def wait_for_task_status(scheduler, task_id, statuses, timeout=3.0):
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        task = await scheduler.get_task(task_id)
+        if task and task["status"] in statuses:
+            return task
+        await asyncio.sleep(0.02)
+    return await scheduler.get_task(task_id)
+
+
+async def create_unscheduled_task(scheduler, payload, generation_max_attempts=2):
+    from gateway import crud
+
+    async with scheduler.assignment_lock:
+        task = await crud.create_task(scheduler.db, payload)
+        await scheduler.db.execute("UPDATE flow_tasks SET generation_max_attempts=? WHERE task_id=?", (generation_max_attempts, task["task_id"]))
+        await scheduler.db.commit()
+    return await scheduler.get_task(task["task_id"])
 
 
 @pytest.mark.asyncio
@@ -1399,3 +1438,185 @@ def test_canary_script_uses_single_run_isolated_database():
     assert "flow024-real-canary-" in text
     assert "set GATEWAY_DB_PATH=%CANARY_RUN_DIR%\\gateway.db" in text
     assert "D:\\Codex\\projects\\flow_gateway_poc\\data\\gateway.db" not in text
+
+
+@pytest.mark.asyncio
+async def test_generation_failure_switches_to_second_account(monkeypatch):
+    from gateway.config import GatewaySettings
+    from gateway.scheduler_kernel import RETRY_POLICIES, RetryPolicy
+
+    monkeypatch.setitem(RETRY_POLICIES, "generation_failed", RetryPolicy(True, "generation", 1, 0, True, 10, 0, False))
+    workers = RUN_ROOT / "switch_generation_workers.json"
+    write_workers(workers, ["FLOW-001", "FLOW-002"])
+    client = SwitchAccountWorkerClient(
+        {"FLOW-001": {"credits": 100}, "FLOW-002": {"credits": 100}},
+        RUN_ROOT / "switch_generation_outputs",
+        {"FLOW-001": ("generation_failed_confirmed", "generation failed confirmed")},
+    )
+    scheduler = make_scheduler(GatewaySettings(db_path=local_db("switch_generation"), workers_path=workers, dry_run=False, real_submit_max_attempts=2, max_concurrency=2), client)
+    await scheduler.start()
+    try:
+        task = await create_unscheduled_task(scheduler, {"idempotency_key": "switch-generation", "image_path": "D:/img.png", "prompt": "p"}, generation_max_attempts=2)
+        await scheduler.schedule_once()
+        final = await wait_for_task_status(scheduler, task["task_id"], {"completed"})
+        accounts = {a["account_id"]: a for a in await scheduler.list_accounts()}
+
+        assert final["task_id"] == task["task_id"]
+        assert final["idempotency_key"] == "switch-generation"
+        assert final["assigned_account_id"] == "FLOW-002"
+        assert [item[0] for item in client.submits] == ["FLOW-001", "FLOW-002"]
+        assert accounts["FLOW-001"]["current_task_id"] is None
+        assert accounts["FLOW-001"]["reserved_credits"] == 0
+        assert accounts["FLOW-001"]["failure_count"] == 1
+        assert accounts["FLOW-001"]["consecutive_failures"] == 1
+        assert accounts["FLOW-001"]["health_score"] < 100
+    finally:
+        await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_generation_failure_without_other_account_stays_retry_wait_without_resubmitting(monkeypatch):
+    from gateway.config import GatewaySettings
+    from gateway.scheduler_kernel import RETRY_POLICIES, RetryPolicy
+
+    monkeypatch.setitem(RETRY_POLICIES, "generation_failed", RetryPolicy(True, "generation", 1, 300, True, 10, 0, False))
+    workers = RUN_ROOT / "switch_generation_no_b_workers.json"
+    write_workers(workers, ["FLOW-001"])
+    client = SwitchAccountWorkerClient(
+        {"FLOW-001": {"credits": 100}},
+        RUN_ROOT / "switch_generation_no_b_outputs",
+        {"FLOW-001": ("generation_failed_confirmed", "generation failed confirmed")},
+    )
+    scheduler = make_scheduler(GatewaySettings(db_path=local_db("switch_generation_no_b"), workers_path=workers, dry_run=False, real_submit_max_attempts=2), client)
+    await scheduler.start()
+    try:
+        task = await create_unscheduled_task(scheduler, {"idempotency_key": "switch-generation-no-b", "image_path": "D:/img.png", "prompt": "p"}, generation_max_attempts=2)
+        await scheduler.schedule_once()
+        retry = await wait_for_task_status(scheduler, task["task_id"], {"retry_wait"})
+        await scheduler.schedule_once()
+        current = await scheduler.get_task(task["task_id"])
+
+        assert retry["status"] == "retry_wait"
+        assert current["status"] == "retry_wait"
+        assert [item[0] for item in client.submits] == ["FLOW-001"]
+    finally:
+        await scheduler.stop()
+
+
+@pytest.mark.parametrize(
+    ("error_code", "message", "category"),
+    [
+        ("UPSTREAM_UNUSUAL_ACTIVITY", "recaptcha evaluation failed public_error_unusual_activity", "account_unusual_activity"),
+        ("PERMISSION_DENIED_403", "403 permission_denied", "authentication_expired"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_account_scoped_generation_errors_switch_account_and_degrade_failed_account(monkeypatch, error_code, message, category):
+    from gateway.config import GatewaySettings
+    from gateway.scheduler_kernel import RETRY_POLICIES, RetryPolicy
+
+    monkeypatch.setitem(RETRY_POLICIES, category, RetryPolicy(True, "generation", 1, 0, True, 40, 3600 if category == "account_unusual_activity" else 0, True))
+    workers = RUN_ROOT / f"{category}_workers.json"
+    write_workers(workers, ["FLOW-001", "FLOW-002"])
+    client = SwitchAccountWorkerClient(
+        {"FLOW-001": {"credits": 100}, "FLOW-002": {"credits": 100}},
+        RUN_ROOT / f"{category}_outputs",
+        {"FLOW-001": (error_code, message)},
+    )
+    scheduler = make_scheduler(GatewaySettings(db_path=local_db(category), workers_path=workers, dry_run=False, real_submit_max_attempts=2, max_concurrency=2), client)
+    await scheduler.start()
+    try:
+        task = await create_unscheduled_task(scheduler, {"idempotency_key": category, "image_path": "D:/img.png", "prompt": "p"}, generation_max_attempts=2)
+        await scheduler.schedule_once()
+        final = await wait_for_task_status(scheduler, task["task_id"], {"completed"})
+        account_a = {a["account_id"]: a for a in await scheduler.list_accounts()}["FLOW-001"]
+
+        assert final["assigned_account_id"] == "FLOW-002"
+        assert [item[0] for item in client.submits] == ["FLOW-001", "FLOW-002"]
+        if category == "account_unusual_activity":
+            assert account_a["cooldown_until"] is not None
+        else:
+            assert account_a["manual_paused"] == 1
+    finally:
+        await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_submission_unknown_does_not_switch_account_or_resubmit():
+    from gateway import crud
+    from gateway.config import GatewaySettings
+
+    workers = RUN_ROOT / "submission_unknown_no_switch_workers.json"
+    write_workers(workers, ["FLOW-001", "FLOW-002"])
+    client = FakeRealWorkerClient({"FLOW-001": {"credits": 100}, "FLOW-002": {"credits": 100}})
+    scheduler = make_scheduler(GatewaySettings(db_path=local_db("submission_unknown_no_switch"), workers_path=workers, dry_run=False, real_submit_max_attempts=2), client)
+    await scheduler.start()
+    try:
+        task = await create_unscheduled_task(scheduler, {"idempotency_key": "submission-unknown-no-switch", "image_path": "D:/img.png", "prompt": "p"}, generation_max_attempts=2)
+        leased = await crud.assign_task(scheduler.db, task["task_id"], "FLOW-001", "runtime-FLOW-001", 15)
+        await crud.guarded_update_task(scheduler.db, task["task_id"], leased["lease_owner"], leased["lease_version"], "submission_unknown", project_id="project-1")
+
+        await scheduler.recover_tasks()
+        await scheduler.schedule_once()
+        current = await scheduler.get_task(task["task_id"])
+
+        assert current["status"] == "submission_unknown"
+        assert current["assigned_account_id"] == "FLOW-001"
+        assert client.submits == []
+    finally:
+        await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_download_failed_does_not_increment_generation_or_resubmit():
+    from gateway import crud
+    from gateway.config import GatewaySettings
+
+    workers = RUN_ROOT / "download_failed_no_generation_workers.json"
+    write_workers(workers, ["FLOW-001", "FLOW-002"])
+    client = FakeRealWorkerClient({"FLOW-001": {"credits": 100}, "FLOW-002": {"credits": 100}})
+    scheduler = make_scheduler(GatewaySettings(db_path=local_db("download_failed_no_generation"), workers_path=workers, dry_run=False, real_submit_max_attempts=2), client)
+    await scheduler.start()
+    try:
+        task = await create_unscheduled_task(scheduler, {"idempotency_key": "download-failed-no-generation", "image_path": "D:/img.png", "prompt": "p"}, generation_max_attempts=2)
+        leased = await crud.assign_task(scheduler.db, task["task_id"], "FLOW-001", "runtime-FLOW-001", 15)
+        account = await crud.get_account(scheduler.db, "FLOW-001")
+        await crud.guarded_release_account(scheduler.db, task["task_id"], "FLOW-001", leased["lease_owner"], leased["lease_version"], account["lock_version"], "download_failed", error_code="missing_video_path")
+
+        await scheduler.schedule_once()
+        current = await scheduler.get_task(task["task_id"])
+
+        assert current["status"] == "download_failed"
+        assert current["generation_attempts"] == 0
+        assert client.submits == []
+    finally:
+        await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_generation_failure_does_not_block_other_batch_tasks(monkeypatch):
+    from gateway.config import GatewaySettings
+    from gateway.scheduler_kernel import RETRY_POLICIES, RetryPolicy
+
+    monkeypatch.setitem(RETRY_POLICIES, "generation_failed", RetryPolicy(True, "generation", 1, 300, True, 10, 0, False))
+    workers = RUN_ROOT / "batch_failure_continues_workers.json"
+    write_workers(workers, ["FLOW-001", "FLOW-002"])
+    client = SwitchAccountWorkerClient(
+        {"FLOW-001": {"credits": 100}, "FLOW-002": {"credits": 100}},
+        RUN_ROOT / "batch_failure_continues_outputs",
+        {"FLOW-001": ("generation_failed_confirmed", "generation failed confirmed")},
+    )
+    scheduler = make_scheduler(GatewaySettings(db_path=local_db("batch_failure_continues"), workers_path=workers, dry_run=False, real_submit_max_attempts=2, max_concurrency=2), client)
+    await scheduler.start()
+    try:
+        failed = await create_unscheduled_task(scheduler, {"idempotency_key": "batch-failed", "batch_id": "batch-a", "image_path": "D:/img.png", "prompt": "p", "priority": 10}, generation_max_attempts=2)
+        other = await create_unscheduled_task(scheduler, {"idempotency_key": "batch-other", "batch_id": "batch-a", "image_path": "D:/img.png", "prompt": "p", "priority": 0}, generation_max_attempts=1)
+        await scheduler.schedule_once()
+        final_other = await wait_for_task_status(scheduler, other["task_id"], {"completed"})
+        final_failed = await scheduler.get_task(failed["task_id"])
+
+        assert final_failed["status"] == "retry_wait"
+        assert final_other["status"] == "completed"
+        assert final_other["task_id"] == other["task_id"]
+    finally:
+        await scheduler.stop()

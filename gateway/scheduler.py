@@ -428,6 +428,7 @@ class GatewayScheduler:
         if status["active_count"] >= status["effective_max_concurrency"]:
             return
         accounts = await crud.list_accounts(self.db)
+        await self._promote_due_retries()
         for account in accounts:
             today_count, total_count = await scheduler_kernel.usage_counts(self.db, account["account_id"])
             account["_task_count_today"] = today_count
@@ -454,7 +455,7 @@ class GatewayScheduler:
                     self.db,
                     account_id,
                     selected.get("selected_runtime_instance_id"),
-                    self.settings.omni_10s_credit_cost,
+                    self._task_quota_cost(next_task),
                     self.settings.lease_duration_seconds,
                 )
                 if not task:
@@ -491,6 +492,10 @@ class GatewayScheduler:
                 candidate["reason"] = "not_preferred"
                 diagnostics.append(candidate)
                 continue
+            if self._should_skip_last_failed_account(task, worker.account_id):
+                candidate["reason"] = "previous_generation_failure"
+                diagnostics.append(candidate)
+                continue
             account = states.get(worker.account_id)
             if not account:
                 account = {
@@ -518,10 +523,10 @@ class GatewayScheduler:
                 account,
                 task_count_today=int(account.get("_task_count_today") or 0),
                 total_task_count=int(account.get("_total_task_count") or 0),
-                required_credits=self.settings.omni_10s_credit_cost,
+                required_credits=self._task_quota_cost(task),
             )
             if score < -999999:
-                candidate["reason"] = "insufficient_available_credits"
+                candidate["reason"] = "quota_insufficient"
                 candidate["score"] = score
                 diagnostics.append(candidate)
                 continue
@@ -565,6 +570,31 @@ class GatewayScheduler:
         if queued:
             return queued[0]
         return None
+
+    def _task_quota_cost(self, task: dict) -> int:
+        return int(task.get("estimated_quota_cost") or self.settings.omni_10s_credit_cost)
+
+    async def _promote_due_retries(self):
+        await self.db.execute(
+            """
+            UPDATE flow_tasks
+            SET status='queued', state='queued', state_version=state_version+1,
+                updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+            WHERE status='retry_wait'
+              AND (next_retry_at IS NULL OR next_retry_at <= strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            """
+        )
+        await self.db.commit()
+
+    def _should_skip_last_failed_account(self, task: dict, account_id: str) -> bool:
+        category = task.get("last_error_category")
+        policy = scheduler_kernel.RETRY_POLICIES.get(category or "")
+        return bool(
+            policy
+            and policy.switch_account
+            and task.get("assigned_account_id") == account_id
+            and int(task.get("generation_attempts") or 0) > 0
+        )
 
     def dispatch_dry_run(self, task_id: str = "DRYRUN-001") -> dict:
         snapshot = self.refresh_worker_snapshot()
@@ -930,10 +960,9 @@ class GatewayScheduler:
                     await self.schedule_once()
                     return
                 if mapped == "manual_review":
-                    async with self.assignment_lock:
-                        manual_status = "manual_submit_required" if _requires_manual_submit(result) else "manual_review"
-                        self._audit("account_released", task_id=task_id, account_id=account_id, release_reason=manual_status)
-                        if manual_status == "manual_submit_required":
+                    if _requires_manual_submit(result):
+                        async with self.assignment_lock:
+                            self._audit("account_released", task_id=task_id, account_id=account_id, release_reason="manual_submit_required")
                             account = await crud.get_account(self.db, account_id)
                             await crud.guarded_release_manual_submit_required(
                                 self.db,
@@ -944,17 +973,8 @@ class GatewayScheduler:
                                 int((account or {}).get("lock_version") or 0),
                                 remaining_credits=result.get("remaining_credits"),
                             )
-                        else:
-                            await crud.guarded_update_task(
-                                self.db,
-                                task_id,
-                                token["lease_owner"],
-                                token["lease_version"],
-                                manual_status,
-                                error_code=result.get("error_code"),
-                                error_message=result.get("error_message"),
-                                remaining_credits=result.get("remaining_credits"),
-                            )
+                    else:
+                        await self._handle_generation_failure(task_id, account_id, token, result)
                     return
                 async with self.assignment_lock:
                     await crud.guarded_update_task(self.db, task_id, token["lease_owner"], token["lease_version"], mapped)
@@ -1111,6 +1131,67 @@ class GatewayScheduler:
             await crud.release_task_for_manual_review(self.db, task_id, account_id, error_code="worker_not_ready", error_message="Worker is no longer ready")
             return None
         return worker
+
+    async def _handle_generation_failure(self, task_id: str, account_id: str, token: dict, result: dict) -> None:
+        category = scheduler_kernel.classify_error(result.get("error_code"), result.get("error_message"))
+        policy = scheduler_kernel.RETRY_POLICIES.get(category, scheduler_kernel.RETRY_POLICIES["permanent_task_error"])
+        task = await crud.get_task(self.db, task_id)
+        if not task:
+            return
+        attempts = int(task.get("generation_attempts") or 0)
+        max_attempts = int(task.get("generation_max_attempts") or 1)
+        can_retry = bool(policy.retryable and policy.retry_stage == "generation" and attempts < max_attempts)
+        next_status = "retry_wait" if can_retry else ("need_manual" if policy.manual_required else "failed")
+        next_retry_at = scheduler_kernel.utc_after(policy.backoff_seconds) if next_status == "retry_wait" and policy.backoff_seconds else None
+        retry_fields = {}
+        if next_status == "retry_wait":
+            retry_fields = {
+                "worker_job_id": None,
+                "submitted_at": None,
+                "submission_started_at": None,
+                "submission_confirmed_at": None,
+                "remote_submission_state": None,
+            }
+        async with self.assignment_lock:
+            account = await crud.get_account(self.db, account_id)
+            self._audit("account_released", task_id=task_id, account_id=account_id, release_reason=category)
+            released = await crud.guarded_release_account(
+                self.db,
+                task_id,
+                account_id,
+                token["lease_owner"],
+                token["lease_version"],
+                int((account or {}).get("lock_version") or 0),
+                next_status,
+                error_code=result.get("error_code") or category,
+                error_message=result.get("error_message") or category,
+                last_error_code=result.get("error_code") or category,
+                last_error_message=result.get("error_message") or category,
+                last_error_category=category,
+                remaining_credits=result.get("remaining_credits"),
+                next_retry_at=next_retry_at,
+                **retry_fields,
+            )
+            if released:
+                await self._apply_failure_policy_to_account(account_id, category, policy)
+        if next_status == "retry_wait":
+            await self.schedule_once()
+
+    async def _apply_failure_policy_to_account(self, account_id: str, category: str, policy: scheduler_kernel.RetryPolicy) -> None:
+        account = await crud.get_account(self.db, account_id)
+        if not account:
+            return
+        updates = {}
+        if policy.account_health_penalty:
+            updates["health_score"] = max(0, int(account.get("health_score") or 100) - int(policy.account_health_penalty))
+        if policy.cooldown_seconds:
+            updates["cooldown_until"] = scheduler_kernel.utc_after(policy.cooldown_seconds)
+            updates["cooldown_reason"] = category
+        if category == "authentication_expired":
+            updates["manual_paused"] = 1
+            updates["manual_pause_reason"] = category
+        if updates:
+            await crud.update_account_controls(self.db, account_id, **updates)
 
 
 def _now_marker():

@@ -637,7 +637,7 @@ async def guarded_release_account(db, task_id, account_id, expected_lease_owner,
         if cursor.rowcount != 1:
             await db.execute("ROLLBACK")
             return None
-        quota_release = status in {"failed", "failed_before_remote_submit", "cancelled", "manual_review", "manual_submit_required", "download_failed"}
+        quota_release = status in {"failed", "failed_before_remote_submit", "cancelled", "manual_review", "manual_submit_required", "download_failed", "retry_wait"}
         quota_consume = status == "completed"
         reserved = 0
         if expected_lease_owner:

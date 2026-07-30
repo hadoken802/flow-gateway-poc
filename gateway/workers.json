@@ -20,13 +20,13 @@
   {
     "account_id": "FLOW-004",
     "api_url": "http://127.0.0.1:8104",
-    "enabled": false,
+    "enabled": true,
     "runtime_instance_id": "11e727d0-db82-413f-be80-581880057d1e"
   },
   {
     "account_id": "FLOW-005",
     "api_url": "http://127.0.0.1:8105",
-    "enabled": false,
+    "enabled": true,
     "runtime_instance_id": "bd680026-0774-49d6-af8a-efab8619d344"
   }
 ]

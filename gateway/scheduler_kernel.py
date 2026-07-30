@@ -111,9 +111,9 @@ RETRY_POLICIES = {
     "browser_disconnected": RetryPolicy(True, "reconcile", 1, 120, False, 10, 300, False),
     "extension_disconnected": RetryPolicy(True, "reconcile", 1, 120, False, 10, 300, False),
     "flow_rate_limited": RetryPolicy(True, "generation", 2, 600, True, 10, 600, False),
-    "account_unusual_activity": RetryPolicy(False, "none", 0, 0, False, 40, 3600, True),
-    "recaptcha_required": RetryPolicy(False, "none", 0, 0, False, 40, 3600, True),
-    "authentication_expired": RetryPolicy(False, "none", 0, 0, False, 50, 0, True),
+    "account_unusual_activity": RetryPolicy(True, "generation", 1, 300, True, 40, 3600, True),
+    "recaptcha_required": RetryPolicy(True, "generation", 1, 300, True, 40, 3600, True),
+    "authentication_expired": RetryPolicy(True, "generation", 1, 300, True, 50, 0, True),
     "account_not_bound": RetryPolicy(False, "none", 0, 0, False, 30, 0, True),
     "ownership_not_verified": RetryPolicy(False, "none", 0, 0, False, 20, 0, True),
     "quota_insufficient": RetryPolicy(False, "none", 0, 0, True, 0, 0, False),
@@ -156,6 +156,8 @@ def classify_error(error_code: str | None, error_message: str | None = None) -> 
         return "quota_insufficient"
     if "download" in text:
         return "download_failed"
+    if "generation_failed" in text or "generation failed" in text:
+        return "generation_failed"
     if "timeout" in text:
         return "gateway_timeout"
     if "offline" in text or "connection" in text:

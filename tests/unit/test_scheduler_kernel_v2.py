@@ -23,6 +23,23 @@ def payload(key="k", preferred=None, priority=0, not_before=None):
     }
 
 
+class StaticWorkerProvider:
+    def __init__(self, workers):
+        self.workers = workers
+
+    def load_workers(self):
+        return WorkerSnapshot(self.workers, [], "test", "test", "now")
+
+
+class NoSubmitWorkerClient:
+    def __init__(self):
+        self.submit_calls = 0
+
+    async def submit_omni_video(self, *_args, **_kwargs):
+        self.submit_calls += 1
+        raise AssertionError("submit must not be called")
+
+
 async def add_account(db, account_id="FLOW-001", credits=100, **fields):
     worker = WorkerConfig(account_id, f"http://127.0.0.1/{account_id}", True, f"rt-{account_id}")
     await crud.upsert_account(db, worker, status="ready", credits=credits)
@@ -141,6 +158,114 @@ async def test_weighted_selection_skips_paused_cooldown_and_low_credit_accounts(
         reasons = {item["account_id"]: item["reason"] for item in selected["candidates"]}
         assert reasons["FLOW-001"] == "manual_paused"
         assert reasons["FLOW-002"] == "cooldown"
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_schedule_skips_account_when_available_credits_below_task_cost(tmp_path):
+    db = await connect(tmp_path / "gateway.db")
+    client = NoSubmitWorkerClient()
+    try:
+        await add_account(db, "FLOW-001", 10, reserved_credits=0, quota_confidence="live")
+        task = await crud.create_task(db, {**payload("low-credit"), "estimated_quota_cost": 15})
+        scheduler = GatewayScheduler(
+            GatewaySettings(db_path=tmp_path / "gateway.db", dry_run=False, max_concurrency=1),
+            worker_client=client,
+            worker_provider=StaticWorkerProvider([WorkerConfig("FLOW-001", "http://w1", True, "rt1")]),
+        )
+        scheduler.db = db
+        scheduler._stopping = True
+
+        selected = scheduler.select_worker(task, account_states=await crud.list_accounts(db))
+        await scheduler.schedule_once()
+
+        current = await crud.get_task(db, task["task_id"])
+        account = await crud.get_account(db, "FLOW-001")
+        active_leases = await (await db.execute("SELECT COUNT(*) FROM account_leases WHERE status='active'")).fetchone()
+        reserves = await (await db.execute("SELECT COUNT(*) FROM quota_ledger WHERE entry_type='reserve' AND status='active'")).fetchone()
+        assert selected["ok"] is False
+        assert selected["candidates"][0]["reason"] == "quota_insufficient"
+        assert current["status"] == "queued"
+        assert current["generation_attempts"] == 0
+        assert account["reserved_credits"] == 0
+        assert active_leases[0] == 0
+        assert reserves[0] == 0
+        assert client.submit_calls == 0
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_schedule_chooses_next_account_with_sufficient_available_credits(tmp_path):
+    db = await connect(tmp_path / "gateway.db")
+    client = NoSubmitWorkerClient()
+    try:
+        await add_account(db, "FLOW-001", 10, quota_confidence="live")
+        await add_account(db, "FLOW-002", 100, quota_confidence="live")
+        task = await crud.create_task(db, {**payload("choose-b"), "estimated_quota_cost": 15})
+        scheduler = GatewayScheduler(
+            GatewaySettings(db_path=tmp_path / "gateway.db", dry_run=False, max_concurrency=1),
+            worker_client=client,
+            worker_provider=StaticWorkerProvider([
+                WorkerConfig("FLOW-001", "http://w1", True, "rt1"),
+                WorkerConfig("FLOW-002", "http://w2", True, "rt2"),
+            ]),
+        )
+        scheduler.db = db
+        scheduler._stopping = True
+
+        selected = scheduler.select_worker(task, account_states=await crud.list_accounts(db))
+        await scheduler.schedule_once()
+
+        current = await crud.get_task(db, task["task_id"])
+        account_a = await crud.get_account(db, "FLOW-001")
+        account_b = await crud.get_account(db, "FLOW-002")
+        assert selected["selected_account_id"] == "FLOW-002"
+        assert {item["account_id"]: item["reason"] for item in selected["candidates"]}["FLOW-001"] == "quota_insufficient"
+        assert current["assigned_account_id"] == "FLOW-002"
+        assert account_a["reserved_credits"] == 0
+        assert account_b["reserved_credits"] == 15
+        assert client.submit_calls == 0
+    finally:
+        for task_obj in scheduler._real_tasks.values():
+            task_obj.cancel()
+        await asyncio.gather(*scheduler._real_tasks.values(), return_exceptions=True)
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_schedule_leaves_task_queued_without_busy_loop_when_all_accounts_lack_quota(tmp_path):
+    db = await connect(tmp_path / "gateway.db")
+    client = NoSubmitWorkerClient()
+    try:
+        await add_account(db, "FLOW-001", 10, quota_confidence="live")
+        await add_account(db, "FLOW-002", 12, quota_confidence="live")
+        task = await crud.create_task(db, {**payload("all-low"), "estimated_quota_cost": 15})
+        scheduler = GatewayScheduler(
+            GatewaySettings(db_path=tmp_path / "gateway.db", dry_run=False, max_concurrency=2),
+            worker_client=client,
+            worker_provider=StaticWorkerProvider([
+                WorkerConfig("FLOW-001", "http://w1", True, "rt1"),
+                WorkerConfig("FLOW-002", "http://w2", True, "rt2"),
+            ]),
+        )
+        scheduler.db = db
+        scheduler._stopping = True
+
+        await scheduler.schedule_once()
+        await scheduler.schedule_once()
+
+        current = await crud.get_task(db, task["task_id"])
+        active_leases = await (await db.execute("SELECT COUNT(*) FROM account_leases WHERE status='active'")).fetchone()
+        reserves = await (await db.execute("SELECT COUNT(*) FROM quota_ledger WHERE entry_type='reserve' AND status='active'")).fetchone()
+        attempts = await (await db.execute("SELECT generation_attempts, attempt_count FROM flow_tasks WHERE task_id=?", (task["task_id"],))).fetchone()
+        assert current["status"] == "queued"
+        assert active_leases[0] == 0
+        assert reserves[0] == 0
+        assert attempts["generation_attempts"] == 0
+        assert attempts["attempt_count"] == 0
+        assert client.submit_calls == 0
     finally:
         await db.close()
 
