@@ -6,6 +6,7 @@ import csv
 import json
 from dataclasses import asdict
 from io import StringIO
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -13,6 +14,7 @@ import httpx
 
 from runtime.process_manager import RuntimeManager
 from runtime.gateway_projection import ReadOnlyRuntimeStatusProvider
+from runtime.port_allocator import port_can_bind, port_is_listening
 from runtime.registry import AccountRegistry
 
 from . import crud
@@ -75,6 +77,124 @@ async def create_node(scheduler, payload: dict, registry: AccountRegistry | None
         )
     node = await get_node(scheduler, record.account_id, registry) if record else None
     return {"ok": True, "result": result, "node": node}
+
+
+def normalize_flow_account_id(value: Any) -> str:
+    raw = str(value or "").strip().upper()
+    if not raw:
+        raise ValueError("flow account number is required")
+    if raw.startswith("FLOW-"):
+        raw = raw.split("FLOW-", 1)[1]
+    if not raw.isdigit():
+        raise ValueError("flow account number must be numeric or FLOW-###")
+    number = int(raw)
+    if number <= 0 or number > 999:
+        raise ValueError("flow account number must be between 1 and 999")
+    return f"FLOW-{number:03d}"
+
+
+def quick_add_preview(payload: dict, registry: AccountRegistry | None = None, manager: RuntimeManager | None = None) -> dict:
+    registry = registry or AccountRegistry()
+    account_id = normalize_flow_account_id(payload.get("flow_account_number") or payload.get("account_id"))
+    number = int(account_id.rsplit("-", 1)[-1])
+    worker_port = int(payload.get("worker_port") or payload.get("worker_api_port") or (8100 + number))
+    extension_ws_port = int(payload.get("extension_ws_port") or payload.get("ws_port") or (9199 + number))
+    cdp_port = int(payload.get("cdp_port") or payload.get("chrome_cdp_port") or (9299 + number))
+    profile_path = str(Path(payload.get("profile_path") or registry.profiles_root / account_id))
+    database_path = str(registry.data_root / f"{account_id}.db")
+    output_dir = str(registry.outputs_root / account_id)
+    preview = {
+        "account_id": account_id,
+        "display_name": payload.get("display_name") or account_id,
+        "worker_host": payload.get("worker_host") or "127.0.0.1",
+        "worker_port": worker_port,
+        "worker_api_port": worker_port,
+        "extension_ws_port": extension_ws_port,
+        "ws_port": extension_ws_port,
+        "cdp_host": payload.get("cdp_host") or "127.0.0.1",
+        "cdp_port": cdp_port,
+        "chrome_cdp_port": cdp_port,
+        "profile_path": profile_path,
+        "database_path": database_path,
+        "output_dir": output_dir,
+        "enabled": False,
+    }
+    preview["checks"] = _quick_add_checks(preview, registry, manager or RuntimeManager(registry))
+    preview["ok"] = not preview["checks"]["errors"]
+    return preview
+
+
+async def quick_create_login(scheduler, payload: dict, registry: AccountRegistry | None = None, manager: RuntimeManager | None = None) -> dict:
+    registry = registry or AccountRegistry()
+    manager = manager or RuntimeManager(registry)
+    preview = quick_add_preview(payload, registry, manager)
+    if not preview["ok"]:
+        return {"ok": False, "result": "preflight_failed", "preview": preview}
+    for path in (preview["profile_path"], preview["database_path"], preview["output_dir"]):
+        target = Path(path)
+        (target.parent if target.suffix else target).mkdir(parents=True, exist_ok=True)
+    created = await create_node(
+        scheduler,
+        {
+            "account_id": preview["account_id"],
+            "display_name": preview["display_name"],
+            "worker_port": preview["worker_port"],
+            "extension_ws_port": preview["extension_ws_port"],
+            "cdp_port": preview["cdp_port"],
+            "profile_path": preview["profile_path"],
+            "enabled": False,
+        },
+        registry,
+    )
+    chrome = await asyncio.to_thread(manager.open_login, preview["account_id"])
+    worker = await asyncio.to_thread(manager.start_worker_only, preview["account_id"])
+    await _wait_runtime_identity(registry, preview["account_id"])
+    registry.sync_workers_json()
+    await _open_or_refresh_flow_page(preview["cdp_port"])
+    await scheduler.async_refresh_worker_snapshot()
+    return {
+        "ok": bool(created.get("ok")),
+        "result": "waiting_for_manual_login",
+        "message": "Waiting for manual Google/Flow login",
+        "preview": preview,
+        "created": created,
+        "chrome": chrome.to_dict(),
+        "worker": worker.to_dict(),
+        "node": await get_node(scheduler, preview["account_id"], registry, manager),
+    }
+
+
+async def check_login_and_enable(scheduler, account_id: str, registry: AccountRegistry | None = None, manager: RuntimeManager | None = None) -> dict | None:
+    registry = registry or AccountRegistry()
+    manager = manager or RuntimeManager(registry)
+    if not registry.get(account_id):
+        return None
+    refreshed = await refresh_session(scheduler, account_id, registry)
+    node = await get_node(scheduler, account_id, registry, manager)
+    runtime = (node or {}).get("runtime") or {}
+    checks = {
+        "chrome_cdp_online": bool(runtime.get("chrome_cdp_reachable") or runtime.get("chrome_process_alive")),
+        "worker_online": bool(runtime.get("worker_health_reachable")),
+        "extension_connected": bool(runtime.get("extension_connected")),
+        "account_match": bool(runtime.get("account_match")),
+        "ownership_verified": bool(runtime.get("worker_ownership_verified") or runtime.get("worker_service_reachable")),
+        "flow_key_present": bool(runtime.get("flow_key_present") or runtime.get("token_captured") or runtime.get("flow_key_captured")),
+        "quota_live": bool(node and node.get("quota_confidence") == "live" and node.get("credits") is not None),
+    }
+    ok = all(checks.values())
+    if ok:
+        enabled = await set_node_enabled(scheduler, account_id, True, registry)
+        return {"ok": True, "result": "enabled", "checks": checks, "refresh": refreshed, "node": enabled}
+    return {
+        "ok": False,
+        "result": "manual_login_required",
+        "checks": checks,
+        "refresh": refreshed,
+        "account_id": account_id,
+        "chrome_pid": node.get("chrome_pid") if node else None,
+        "cdp_port": node.get("cdp_port") if node else None,
+        "node": node,
+    }
 
 
 async def patch_node(scheduler, account_id: str, payload: dict, registry: AccountRegistry | None = None) -> dict | None:
@@ -256,3 +376,39 @@ def _as_bool(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on", "enabled"}
     return bool(value)
+
+
+def _quick_add_checks(preview: dict, registry: AccountRegistry, manager: RuntimeManager) -> dict:
+    errors = []
+    warnings = []
+    account_id = preview["account_id"]
+    if registry.get(account_id):
+        errors.append({"field": "account_id", "reason": "account_exists", "owner": account_id})
+    profile = Path(preview["profile_path"]).resolve(strict=False)
+    for other in registry.list_accounts():
+        if Path(other.profile_path).resolve(strict=False) == profile and other.account_id != account_id:
+            errors.append({"field": "profile_path", "reason": "profile_belongs_to_other_account", "owner": other.account_id})
+    for field, port in (
+        ("worker_api_port", preview["worker_port"]),
+        ("extension_ws_port", preview["extension_ws_port"]),
+        ("chrome_cdp_port", preview["cdp_port"]),
+    ):
+        for other in registry.list_accounts():
+            if int(getattr(other, field)) == int(port):
+                errors.append({"field": field, "port": port, "reason": "registry_port_conflict", "owner": other.account_id})
+        pid = manager.inspector.listening_pid(port)
+        if pid:
+            errors.append({"field": field, "port": port, "reason": "port_in_use", "pid": pid})
+        elif port_is_listening(port) or not port_can_bind(port):
+            errors.append({"field": field, "port": port, "reason": "port_unavailable"})
+    if profile.exists():
+        warnings.append({"field": "profile_path", "reason": "profile_path_already_exists", "path": str(profile)})
+    return {"errors": errors, "warnings": warnings}
+
+
+async def _wait_runtime_identity(registry: AccountRegistry, account_id: str, attempts: int = 20) -> None:
+    for _ in range(attempts):
+        account = registry.get(account_id)
+        if account and account.runtime_instance_id:
+            return
+        await asyncio.sleep(0.25)

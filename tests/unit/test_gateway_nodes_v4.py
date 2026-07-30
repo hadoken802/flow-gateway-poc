@@ -22,6 +22,18 @@ class FakeManager:
         self.registry = registry
         self.started = []
         self.stopped = []
+        self.opened = []
+        self.inspector = type("Inspector", (), {"listening_pid": lambda self, port: None})()
+        self.status_payload = {
+            "runtime_status": "running",
+            "worker_health_reachable": True,
+            "chrome_cdp_reachable": True,
+            "extension_bootstrap_status": "extension_ready",
+            "extension_connected": True,
+            "account_match": True,
+            "worker_service_reachable": True,
+            "flow_key_present": True,
+        }
 
     def status(self, account_id):
         account = self.registry.get(account_id)
@@ -30,6 +42,7 @@ class FakeManager:
             account_id,
             True,
             details={
+                **self.status_payload,
                 "runtime_status": "running",
                 "worker_health_reachable": True,
                 "chrome_cdp_reachable": True,
@@ -42,7 +55,15 @@ class FakeManager:
 
     def start_worker_only(self, account_id):
         self.started.append(account_id)
+        self.registry.mark_worker_runtime_identity(account_id, "runtime-test", "secret-ref", "fingerprint", 1)
         return RuntimeResult("already_running", account_id, True, details={"worker_pid": 1234})
+
+    def open_login(self, account_id):
+        self.opened.append(account_id)
+        account = self.registry.get(account_id)
+        if account:
+            self.registry.mark_started(account_id, chrome_pid=5678)
+        return RuntimeResult("opened", account_id, True, details={"chrome_pid": 5678})
 
     def stop_worker_only(self, account_id):
         self.stopped.append(account_id)
@@ -234,3 +255,100 @@ def test_dynamic_concurrency_respects_configured_upper_bound():
     )
 
     assert scheduler.effective_max_concurrency_from_accounts(accounts) == 5
+
+
+def test_quick_add_formats_account_number_and_ports(registry):
+    from gateway import nodes
+
+    assert nodes.normalize_flow_account_id("7") == "FLOW-007"
+    assert nodes.normalize_flow_account_id("007") == "FLOW-007"
+    assert nodes.normalize_flow_account_id("FLOW-007") == "FLOW-007"
+
+    preview = nodes.quick_add_preview({"flow_account_number": "7"}, registry, FakeManager(registry))
+
+    assert preview["account_id"] == "FLOW-007"
+    assert preview["worker_port"] == 8107
+    assert preview["extension_ws_port"] == 9206
+    assert preview["cdp_port"] == 9306
+    assert preview["enabled"] is False
+    assert preview["profile_path"].endswith("profiles\\FLOW-007") or preview["profile_path"].endswith("profiles/FLOW-007")
+
+
+def test_quick_add_skips_flow_006_and_allows_flow_007(registry):
+    from gateway import nodes
+
+    preview = nodes.quick_add_preview({"flow_account_number": "FLOW-007"}, registry, FakeManager(registry))
+
+    assert preview["account_id"] == "FLOW-007"
+    assert registry.get("FLOW-006") is None
+
+
+@pytest.mark.asyncio
+async def test_quick_add_rejects_duplicate_account_and_ports(gateway_db, registry):
+    from gateway import nodes
+
+    scheduler = FakeScheduler(gateway_db)
+    await nodes.create_node(scheduler, {"account_id": "FLOW-007", "worker_port": 8107, "extension_ws_port": 9206, "cdp_port": 9306}, registry)
+
+    duplicate = nodes.quick_add_preview({"flow_account_number": "7"}, registry, FakeManager(registry))
+    worker_conflict = nodes.quick_add_preview({"flow_account_number": "8", "worker_port": 8107}, registry, FakeManager(registry))
+    ws_conflict = nodes.quick_add_preview({"flow_account_number": "8", "extension_ws_port": 9206}, registry, FakeManager(registry))
+    cdp_conflict = nodes.quick_add_preview({"flow_account_number": "8", "cdp_port": 9306}, registry, FakeManager(registry))
+
+    assert any(item["reason"] == "account_exists" for item in duplicate["checks"]["errors"])
+    assert any(item["field"] == "worker_api_port" for item in worker_conflict["checks"]["errors"])
+    assert any(item["field"] == "extension_ws_port" for item in ws_conflict["checks"]["errors"])
+    assert any(item["field"] == "chrome_cdp_port" for item in cdp_conflict["checks"]["errors"])
+
+
+@pytest.mark.asyncio
+async def test_quick_create_login_creates_disabled_node_and_starts_runtime(gateway_db, registry):
+    from gateway import nodes
+
+    scheduler = FakeScheduler(gateway_db)
+    manager = FakeManager(registry)
+
+    result = await nodes.quick_create_login(
+        scheduler,
+        {"flow_account_number": "7", "worker_port": 18107, "extension_ws_port": 19206, "cdp_port": 19306},
+        registry,
+        manager,
+    )
+
+    account = registry.get("FLOW-007")
+    assert result["result"] == "waiting_for_manual_login"
+    assert account is not None
+    assert account.enabled is False
+    assert manager.opened == ["FLOW-007"]
+    assert manager.started == ["FLOW-007"]
+
+
+@pytest.mark.asyncio
+async def test_check_login_enable_requires_live_quota(gateway_db, registry):
+    from gateway import nodes
+
+    scheduler = FakeScheduler(gateway_db)
+    manager = FakeManager(registry)
+    await nodes.create_node(scheduler, {"account_id": "FLOW-007", "worker_port": 8107, "extension_ws_port": 9206, "cdp_port": 9306}, registry)
+
+    result = await nodes.check_login_and_enable(scheduler, "FLOW-007", registry, manager)
+
+    assert result["ok"] is False
+    assert result["result"] == "manual_login_required"
+    assert registry.get("FLOW-007").enabled is False
+
+
+@pytest.mark.asyncio
+async def test_check_login_enable_turns_on_live_node(gateway_db, registry):
+    from gateway import nodes
+
+    scheduler = FakeScheduler(gateway_db)
+    manager = FakeManager(registry)
+    await nodes.create_node(scheduler, {"account_id": "FLOW-007", "worker_port": 8107, "extension_ws_port": 9206, "cdp_port": 9306}, registry)
+    await _upsert_gateway_account(gateway_db, "FLOW-007", 8107, credits=1000, confidence="live", enabled=False)
+
+    result = await nodes.check_login_and_enable(scheduler, "FLOW-007", registry, manager)
+
+    assert result["ok"] is True
+    assert result["result"] == "enabled"
+    assert registry.get("FLOW-007").enabled is True

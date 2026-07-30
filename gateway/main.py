@@ -339,6 +339,22 @@ async def v1_create_node(payload: dict):
         raise HTTPException(400, str(exc)) from exc
 
 
+@app.post("/api/v1/nodes/quick-preview")
+async def v1_quick_preview_node(payload: dict):
+    try:
+        return nodes.quick_add_preview(payload)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/v1/nodes/quick-create-login")
+async def v1_quick_create_login_node(payload: dict):
+    try:
+        return await nodes.quick_create_login(scheduler, payload)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
 @app.post("/api/v1/nodes/import")
 async def v1_import_nodes(payload: dict):
     return await nodes.import_nodes(scheduler, payload)
@@ -401,6 +417,14 @@ async def v1_enable_node(account_id: str):
     if not node:
         raise HTTPException(404, "Node not found")
     return node
+
+
+@app.post("/api/v1/nodes/{account_id}/check-login-enable")
+async def v1_check_login_enable_node(account_id: str):
+    result = await nodes.check_login_and_enable(scheduler, account_id)
+    if not result:
+        raise HTTPException(404, "Node not found")
+    return result
 
 
 @app.post("/api/v1/nodes/{account_id}/disable")
@@ -501,6 +525,14 @@ TASK_CENTER_HTML = """
   <section>
     <h2>Account Nodes</h2>
     <div class="row">
+      <input id="quickFlowNumber" placeholder="Flow Account Number">
+      <button id="quickAddButton" type="button" class="primary" onclick="quickCreateLogin()">Create & Open Login Window</button>
+      <button type="button" onclick="quickPreviewNode()">Preview</button>
+    </div>
+    <pre id="quickNodePreview"></pre>
+    <details>
+      <summary>Advanced Settings</summary>
+    <div class="row">
       <input id="nodeAccountId" placeholder="Account ID">
       <input id="nodeDisplayName" placeholder="Display Name">
       <input id="nodeWorkerHost" placeholder="Worker Host" value="127.0.0.1">
@@ -512,6 +544,7 @@ TASK_CENTER_HTML = """
       <button onclick="loadNodeExample()">Load Node Example</button>
       <button onclick="importNodes()">Import Nodes</button>
     </div>
+    </details>
     <textarea id="nodeImportContent" placeholder="CSV or JSON node config"></textarea>
     <pre id="nodeResult"></pre>
     <div style="overflow:auto"><table id="nodesTable"></table></div>
@@ -559,11 +592,54 @@ async function exportTasks(){const rows=await api('/api/v1/tasks'); const blob=n
 async function loadNodes(){
   const rows=await api('/api/v1/nodes');
   nodesTable.innerHTML='<tr><th>account</th><th>worker</th><th>cdp</th><th>pids</th><th>runtime</th><th>extension</th><th>oauth/quota</th><th>credits</th><th>current task</th><th>enabled</th><th>paused/cooldown</th><th>error</th><th>actions</th></tr>'+
-    rows.map(n=>`<tr>${td(n.account_id)}${td(`${n.worker_host}:${n.worker_port}`)}${td(`${n.cdp_host}:${n.cdp_port}`)}${td(`worker ${n.worker_pid||''}<br>chrome ${n.chrome_pid||''}`)}${td(n.worker_status)}${td(n.extension_status)}${td(`${n.oauth_status||''}<br>${n.quota_confidence||''}`)}${td(n.credits)}${td(n.current_task_id)}${td(n.enabled)}${td(`${n.manual_paused?'paused':''}<br>${n.cooldown_until||''}`)}${td(n.last_gateway_error||n.last_error||'')}<td><button onclick="startNode('${n.account_id}')">start</button> <button onclick="stopNode('${n.account_id}')">stop</button> <button onclick="restartNode('${n.account_id}')">restart</button> <button onclick="refreshNodeSession('${n.account_id}')">refresh session</button> <button onclick="enableNode('${n.account_id}')">enable</button> <button onclick="disableNode('${n.account_id}')">disable</button> <button onclick="editNode('${n.account_id}',${n.worker_port},${n.cdp_port})">edit ports</button> <button onclick="nodeDetail('${n.account_id}')">diagnostics</button></td></tr>`).join('');
+    rows.map(n=>`<tr>${td(n.account_id)}${td(`${n.worker_host}:${n.worker_port}<br>ws ${n.extension_ws_port||''}`)}${td(`${n.cdp_host}:${n.cdp_port}`)}${td(`worker ${n.worker_pid||''}<br>chrome ${n.chrome_pid||''}`)}${td(n.worker_status)}${td(n.extension_status)}${td(`${n.oauth_status||''}<br>${n.quota_confidence||''}`)}${td(n.credits)}${td(n.current_task_id)}${td(n.enabled)}${td(`${n.manual_paused?'paused':''}<br>${n.cooldown_until||''}`)}${td(n.last_gateway_error||n.last_error||'')}<td><button onclick="startNode('${n.account_id}')">start</button> <button onclick="stopNode('${n.account_id}')">stop</button> <button onclick="restartNode('${n.account_id}')">restart</button> <button onclick="refreshNodeSession('${n.account_id}')">refresh session</button> <button onclick="checkLoginEnable('${n.account_id}')">Check Login & Enable</button> <button onclick="enableNode('${n.account_id}')">enable</button> <button onclick="disableNode('${n.account_id}')">disable</button> <button onclick="editNode('${n.account_id}',${n.worker_port},${n.cdp_port})">edit ports</button> <button onclick="nodeDetail('${n.account_id}')">diagnostics</button></td></tr>`).join('');
 }
 function showNodeResult(message, isError){
   nodeResult.className=isError?'error':'ok';
   nodeResult.textContent=message;
+}
+function quickPayload(){
+  const base={flow_account_number:quickFlowNumber.value.trim()};
+  if(nodeWorkerPort.value) base.worker_port=Number(nodeWorkerPort.value);
+  if(nodeCdpPort.value) base.cdp_port=Number(nodeCdpPort.value);
+  if(nodeDisplayName.value) base.display_name=nodeDisplayName.value.trim();
+  return base;
+}
+async function quickPreviewNode(){
+  try{
+    const data=await api('/api/v1/nodes/quick-preview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(quickPayload())});
+    quickNodePreview.className=data.ok?'ok':'error';
+    quickNodePreview.textContent=JSON.stringify(data,null,2);
+    return data;
+  }catch(e){
+    quickNodePreview.className='error';
+    quickNodePreview.textContent=e.message;
+  }
+}
+async function quickCreateLogin(){
+  const button=document.getElementById('quickAddButton');
+  button.disabled=true;
+  const oldText=button.textContent;
+  button.textContent='Creating...';
+  showNodeResult('Creating node and opening login window...', false);
+  try{
+    const r=await fetch('/api/v1/nodes/quick-create-login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(quickPayload())});
+    const text=await r.text();
+    let data; try{data=JSON.parse(text)}catch(_){data={raw:text}}
+    quickNodePreview.className=(r.ok&&data.ok)?'ok':'error';
+    quickNodePreview.textContent=JSON.stringify(data,null,2);
+    if(!r.ok || !data.ok){
+      showNodeResult(`Quick Add failed: HTTP ${r.status}\n${JSON.stringify(data,null,2)}`, true);
+      return;
+    }
+    showNodeResult(`${data.preview.account_id}: Waiting for manual Google/Flow login`, false);
+    await refresh();
+  }catch(e){
+    showNodeResult(`Quick Add failed before response\n${e.message}`, true);
+  }finally{
+    button.disabled=false;
+    button.textContent=oldText;
+  }
 }
 async function addNode(){
   const button=document.getElementById('addNodeButton');
@@ -621,6 +697,7 @@ async function startNode(id){nodeResult.textContent=JSON.stringify(await api(`/a
 async function stopNode(id){nodeResult.textContent=JSON.stringify(await api(`/api/v1/nodes/${id}/stop`,{method:'POST'}),null,2); await refresh()}
 async function restartNode(id){nodeResult.textContent=JSON.stringify(await api(`/api/v1/nodes/${id}/restart`,{method:'POST'}),null,2); await refresh()}
 async function refreshNodeSession(id){nodeResult.textContent=JSON.stringify(await api(`/api/v1/nodes/${id}/refresh-session`,{method:'POST'}),null,2); await refresh()}
+async function checkLoginEnable(id){nodeResult.textContent=JSON.stringify(await api(`/api/v1/nodes/${id}/check-login-enable`,{method:'POST'}),null,2); await refresh()}
 async function enableNode(id){nodeResult.textContent=JSON.stringify(await api(`/api/v1/nodes/${id}/enable`,{method:'POST'}),null,2); await refresh()}
 async function disableNode(id){nodeResult.textContent=JSON.stringify(await api(`/api/v1/nodes/${id}/disable`,{method:'POST'}),null,2); await refresh()}
 async function editNode(id,oldWorker,oldCdp){const worker=prompt('worker port',oldWorker); if(!worker) return; const cdp=prompt('cdp port',oldCdp); if(!cdp) return; nodeResult.textContent=JSON.stringify(await api(`/api/v1/nodes/${id}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({worker_port:Number(worker),cdp_port:Number(cdp)})}),null,2); await refresh()}
