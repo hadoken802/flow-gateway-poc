@@ -474,6 +474,18 @@ async def v1_system_status():
 async def v1_client_ready():
     status = await scheduler.pool_status()
     worker_eligible = scheduler.worker_snapshot.eligible_count
+    active_statuses = {
+        "queued", "leased", "assigning", "project_create_pending", "project_create_in_progress",
+        "project_creation_unknown", "project_created", "submit_pending", "submit_in_progress",
+        "submission_unknown", "submitted", "processing", "download_pending", "downloading",
+        "waiting_recovery",
+    }
+    tasks = await scheduler.list_tasks()
+    active_task_counts = {}
+    for task in tasks:
+        task_status = task.get("status")
+        if task_status in active_statuses:
+            active_task_counts[task_status] = active_task_counts.get(task_status, 0) + 1
     return {
         "ready": True,
         "status": "ok",
@@ -485,6 +497,7 @@ async def v1_client_ready():
         "effective_max_concurrency": status.get("effective_max_concurrency"),
         "queued_count": status.get("queued_count"),
         "active_count": status.get("active_count"),
+        "active_task_counts": active_task_counts,
     }
 
 

@@ -25,6 +25,9 @@ class FlowGatewayClient:
         self.engine_mode = engine_mode
         self.engine_root = Path(engine_root) if engine_root else Path(__file__).resolve().parents[1]
         self.api_key = api_key or _client_key_from_env_file(self.engine_root) or ""
+        self.attached_existing_engine = False
+        self.started_by_this_client = False
+        self._engine_process = None
 
     @property
     def headers(self) -> dict[str, str]:
@@ -34,17 +37,23 @@ class FlowGatewayClient:
         current = self.ready()
         if current.get("ready"):
             current["started"] = False
+            current["attached_existing_engine"] = not self.started_by_this_client
+            current["started_by_this_client"] = self.started_by_this_client
+            self.attached_existing_engine = not self.started_by_this_client
             return current
         health = self.health()
         if health.get("status") == "ok":
             current["started"] = False
             current["health"] = health
             current["engine_running"] = True
+            current["attached_existing_engine"] = True
+            current["started_by_this_client"] = False
+            self.attached_existing_engine = True
             return current
         root = Path(project_dir) if project_dir else self.engine_root
         if self.engine_mode == "clean_embedded":
             command = ["cmd", "/c", str(root / "start_embedded_engine.bat")]
-            subprocess.Popen(command, cwd=str(root), creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+            self._engine_process = subprocess.Popen(command, cwd=str(root), creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
         else:
             self._start_existing_pool(root)
         deadline = time.time() + timeout_seconds
@@ -53,6 +62,10 @@ class FlowGatewayClient:
             if status.get("ready"):
                 status["started"] = True
                 status["engine_mode"] = self.engine_mode
+                status["attached_existing_engine"] = False
+                status["started_by_this_client"] = True
+                self.attached_existing_engine = False
+                self.started_by_this_client = True
                 return status
             time.sleep(1)
         raise TimeoutError("Flow Gateway engine did not become ready")
@@ -77,6 +90,35 @@ class FlowGatewayClient:
         except httpx.RequestError as exc:
             return {"status": "unavailable", "error": str(exc)}
 
+    def get_system_status(self) -> dict:
+        return self.ready()
+
+    def shutdown(self, timeout_seconds: float = 10.0) -> dict:
+        if not self.started_by_this_client:
+            return {"stopped": False, "reason": "not_started_by_this_client"}
+        status = self.ready()
+        active_counts = status.get("active_task_counts") or {}
+        active_counts = {key: value for key, value in active_counts.items() if value}
+        if active_counts:
+            return {"stopped": False, "reason": "active_tasks_present", "active_task_counts": active_counts}
+        if status.get("active_count") or status.get("queued_count"):
+            return {
+                "stopped": False,
+                "reason": "active_tasks_present",
+                "active_count": status.get("active_count"),
+                "queued_count": status.get("queued_count"),
+            }
+        if self._engine_process is None:
+            return {"stopped": False, "reason": "missing_process_handle"}
+        self._engine_process.terminate()
+        try:
+            self._engine_process.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            return {"stopped": False, "reason": "shutdown_timeout"}
+        self.started_by_this_client = False
+        self.attached_existing_engine = False
+        return {"stopped": True}
+
     def _start_existing_pool(self, root: Path) -> None:
         root = root.resolve()
         python = _python_for_existing_pool(root)
@@ -93,7 +135,7 @@ class FlowGatewayClient:
             "GATEWAY_DB_PATH": str(root / "data" / "gateway.db"),
             "FLOW_GATEWAY_OUTPUT_DIR": str(root / "outputs"),
         })
-        subprocess.Popen(
+        self._engine_process = subprocess.Popen(
             [str(python), "-m", "gateway.main"],
             cwd=str(root),
             env=env,

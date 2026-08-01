@@ -694,7 +694,8 @@ async def test_real_mode_remote_id_conflict_stops_without_overwrite():
     await scheduler.schedule_once()
     for _ in range(100):
         task = (await scheduler.list_tasks())[0]
-        if task["status"] == "manual_review":
+        accounts = {a["account_id"]: a for a in await scheduler.list_accounts()}
+        if task["status"] == "manual_review" and accounts["FLOW-002"]["current_task_id"] is None:
             break
         await asyncio.sleep(0.02)
 

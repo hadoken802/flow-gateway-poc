@@ -133,7 +133,103 @@ def test_existing_pool_does_not_start_second_gateway_when_health_is_ok(monkeypat
 
     assert result["engine_running"] is True
     assert result["started"] is False
+    assert result["attached_existing_engine"] is True
+    assert result["started_by_this_client"] is False
     assert calls == []
+
+
+def test_existing_pool_attaches_to_ready_gateway_without_starting(monkeypatch, tmp_path):
+    from examples.flow_gateway_client import FlowGatewayClient
+
+    calls = []
+
+    def fake_get(url, **kwargs):
+        if url.endswith("/system/ready"):
+            return _FakeResponse(payload={"ready": True, "eligible_accounts": 7, "accounts_ready": 7})
+        raise AssertionError(url)
+
+    class FakePopen:
+        def __init__(self, args, **kwargs):
+            calls.append((args, kwargs))
+
+    monkeypatch.setattr("examples.flow_gateway_client.httpx.get", fake_get)
+    monkeypatch.setattr("examples.flow_gateway_client.subprocess.Popen", FakePopen)
+
+    client = FlowGatewayClient(engine_root=str(tmp_path), engine_mode="existing_pool")
+    result = client.ensure_engine_running(timeout_seconds=1)
+
+    assert result["started"] is False
+    assert result["attached_existing_engine"] is True
+    assert result["started_by_this_client"] is False
+    assert client.attached_existing_engine is True
+    assert client.started_by_this_client is False
+    assert calls == []
+
+
+def test_ensure_engine_running_is_idempotent_after_sdk_start(monkeypatch, tmp_path):
+    from examples.flow_gateway_client import FlowGatewayClient
+
+    calls = []
+    ready_calls = {"count": 0}
+
+    def fake_get(url, **kwargs):
+        if url.endswith("/system/ready"):
+            ready_calls["count"] += 1
+            if ready_calls["count"] == 1:
+                return _FakeResponse(status_code=503)
+            return _FakeResponse(payload={"ready": True, "eligible_accounts": 7, "accounts_ready": 7})
+        if url.endswith("/health"):
+            return _FakeResponse(status_code=503)
+        raise AssertionError(url)
+
+    class FakePopen:
+        def __init__(self, args, **kwargs):
+            calls.append((args, kwargs))
+
+    monkeypatch.setattr("examples.flow_gateway_client.httpx.get", fake_get)
+    monkeypatch.setattr("examples.flow_gateway_client.subprocess.Popen", FakePopen)
+
+    client = FlowGatewayClient(engine_root=str(tmp_path), engine_mode="existing_pool")
+    first = client.ensure_engine_running(timeout_seconds=1)
+    second = client.ensure_engine_running(timeout_seconds=1)
+
+    assert first["started"] is True
+    assert second["started"] is False
+    assert second["started_by_this_client"] is True
+    assert second["attached_existing_engine"] is False
+    assert len(calls) == 1
+
+
+def test_shutdown_does_not_stop_external_gateway(monkeypatch):
+    from examples.flow_gateway_client import FlowGatewayClient
+
+    client = FlowGatewayClient(api_key="client-key")
+    client.attached_existing_engine = True
+    result = client.shutdown()
+    assert result == {"stopped": False, "reason": "not_started_by_this_client"}
+
+
+def test_shutdown_refuses_when_active_tasks_exist(monkeypatch):
+    from examples.flow_gateway_client import FlowGatewayClient
+
+    class FakeProcess:
+        def __init__(self):
+            self.terminated = False
+
+        def terminate(self):
+            self.terminated = True
+
+    process = FakeProcess()
+    client = FlowGatewayClient(api_key="client-key")
+    client.started_by_this_client = True
+    client._engine_process = process
+    monkeypatch.setattr(client, "ready", lambda: {"ready": True, "active_task_counts": {"queued": 1, "download_pending": 1}})
+
+    result = client.shutdown()
+
+    assert result["stopped"] is False
+    assert result["reason"] == "active_tasks_present"
+    assert process.terminated is False
 
 
 def test_sdk_reads_only_client_key_from_env_file(tmp_path):

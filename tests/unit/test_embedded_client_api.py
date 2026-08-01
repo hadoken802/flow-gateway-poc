@@ -12,17 +12,23 @@ class FakeScheduler:
     def __init__(self, db):
         self.db = db
         self.schedule_calls = 0
-        self.worker_snapshot = type("Snapshot", (), {"eligible_count": 0})()
+        self.worker_snapshot = type("Snapshot", (), {"eligible_count": 7})()
 
     async def pool_status(self):
         from gateway import crud
 
         return {
-            "eligible_count": 0,
+            "eligible_count": 7,
+            "accounts_ready": 0,
             "effective_max_concurrency": 0,
             "queued_count": await crud.count_tasks(self.db, ["queued"]),
             "active_count": 0,
         }
+
+    async def list_tasks(self):
+        from gateway import crud
+
+        return await crud.list_tasks(self.db)
 
     async def create_task(self, payload):
         from gateway import crud
@@ -97,6 +103,19 @@ def test_client_key_required_and_cannot_manage_nodes(embedded_app):
     assert client.get("/api/v1/client/system/ready", headers={"X-API-Key": "wrong"}).status_code == 401
     assert client.get("/api/v1/client/system/ready", headers={"X-API-Key": "client-key"}).status_code == 200
     assert client.get("/api/v1/nodes", headers={"X-API-Key": "client-key"}).status_code == 401
+
+
+def test_ready_distinguishes_eligible_accounts_and_accounts_ready(embedded_app):
+    app, _db, _settings = embedded_app
+    client = TestClient(app)
+    response = client.get("/api/v1/client/system/ready", headers={"X-API-Key": "client-key"})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["eligible_accounts"] == 7
+    assert payload["eligible_count"] == 7
+    assert payload["accounts_ready"] == 0
+    assert payload["effective_max_concurrency"] == 0
+    assert payload["active_task_counts"] == {}
 
 
 @pytest.mark.asyncio
