@@ -13,3 +13,17 @@
 5. Omni 收到有序 `reference_media_ids`。
 
 换账号重试时，Gateway 会重新把原始文件路径发给新的账号 Worker，由新账号重新上传，不复用上一个账号的 `media_id`。
+
+## Embedded Local Engine
+
+朋友工具使用 Client API：
+
+- `GET /api/v1/client/system/ready`
+- `POST /api/v1/client/files`
+- `POST /api/v1/client/files/batch`
+- `POST /api/v1/client/tasks`
+- `GET /api/v1/client/tasks/{task_id}`
+- `POST /api/v1/client/tasks/{task_id}/cancel`
+- `GET /api/v1/client/tasks/{task_id}/download`
+
+如果配置了 `FLOW_GATEWAY_CLIENT_API_KEY`，请求需要带 `X-API-Key`。

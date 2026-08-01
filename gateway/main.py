@@ -3,10 +3,11 @@ from contextlib import asynccontextmanager
 import asyncio
 import logging
 import sys
+from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from . import crud
 from .config import GatewaySettings
@@ -52,6 +53,19 @@ async def lifespan(_app):
 
 
 app = FastAPI(title="Flow Gateway V3 Task Center", version="0.3.0", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def api_key_middleware(request: Request, call_next):
+    path = request.url.path
+    try:
+        if _client_api_protected(path):
+            _require_client_key(request)
+        elif _admin_api_protected(path):
+            _require_admin_key(request)
+    except HTTPException as exc:
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    return await call_next(request)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -456,6 +470,63 @@ async def v1_system_status():
     }
 
 
+@app.get("/api/v1/client/system/ready")
+async def v1_client_ready():
+    status = await scheduler.pool_status()
+    return {
+        "ready": True,
+        "status": "ok",
+        "api_version": "v1",
+        "dry_run": settings.dry_run,
+        "eligible_count": status.get("eligible_count", status.get("accounts_ready", 0)),
+        "effective_max_concurrency": status.get("effective_max_concurrency"),
+        "queued_count": status.get("queued_count"),
+        "active_count": status.get("active_count"),
+    }
+
+
+@app.post("/api/v1/client/tasks")
+async def v1_client_create_task(payload: dict):
+    return await v1_create_task(payload)
+
+
+@app.get("/api/v1/client/tasks/{task_id}")
+async def v1_client_task_detail(task_id: str):
+    detail = await v1_task_detail(task_id)
+    task = detail["task"]
+    return {
+        "task_id": task["task_id"],
+        "idempotency_key": task.get("idempotency_key"),
+        "status": task.get("status"),
+        "created_at": task.get("created_at"),
+        "updated_at": task.get("updated_at"),
+        "completed_at": task.get("completed_at"),
+        "video_ready": task.get("status") == "completed" and bool(task.get("video_path")),
+        "error_code": task.get("error_code") or task.get("last_error_code"),
+        "error_message": task.get("error_message") or task.get("last_error_message"),
+        "input_media": detail.get("input_media", []),
+    }
+
+
+@app.post("/api/v1/client/tasks/{task_id}/cancel")
+async def v1_client_cancel_task(task_id: str):
+    return await v1_cancel_task(task_id)
+
+
+@app.get("/api/v1/client/tasks/{task_id}/download")
+async def v1_client_download_task(task_id: str):
+    task = await scheduler.get_task(task_id)
+    if not task:
+        raise HTTPException(404, "Task not found")
+    if task.get("status") != "completed":
+        raise HTTPException(409, "Task is not completed")
+    check = _downloadable_mp4(task.get("video_path"))
+    if not check["ok"]:
+        raise HTTPException(409, check["error"])
+    filename = task.get("output_filename") or f"{task_id}.mp4"
+    return FileResponse(check["path"], media_type="video/mp4", filename=Path(filename).name)
+
+
 @app.post("/api/v1/client/files")
 async def v1_upload_client_files(request: Request):
     form = await request.form()
@@ -485,6 +556,61 @@ def _public_upload_result(item: dict) -> dict:
         "size_bytes": item["size_bytes"],
         "sha256": item["sha256"],
     }
+
+
+def _client_api_protected(path: str) -> bool:
+    return path.startswith("/api/v1/client/") and bool(settings.client_api_key or settings.admin_api_key)
+
+
+def _admin_api_protected(path: str) -> bool:
+    if not settings.admin_api_key:
+        return False
+    if path.startswith("/api/v1/client/") or path in {"/", "/health"}:
+        return False
+    return path.startswith("/api/")
+
+
+def _request_api_key(request: Request) -> str:
+    header = request.headers.get("x-api-key") or request.headers.get("authorization") or ""
+    if header.lower().startswith("bearer "):
+        return header[7:].strip()
+    return header.strip()
+
+
+def _require_client_key(request: Request) -> None:
+    key = _request_api_key(request)
+    allowed = {item for item in (settings.client_api_key, settings.admin_api_key) if item}
+    if key not in allowed:
+        raise HTTPException(401, "Invalid client API key")
+
+
+def _require_admin_key(request: Request) -> None:
+    if _request_api_key(request) != settings.admin_api_key:
+        raise HTTPException(401, "Invalid admin API key")
+
+
+def _downloadable_mp4(video_path: str | None) -> dict:
+    if not video_path:
+        return {"ok": False, "error": "completed task has no video_path"}
+    path = Path(video_path)
+    try:
+        resolved = path.resolve()
+        output_root = settings.output_root.resolve()
+        if output_root not in resolved.parents and resolved != output_root:
+            return {"ok": False, "error": "video_path is outside allowed output directory"}
+        if not resolved.exists() or not resolved.is_file():
+            return {"ok": False, "error": "video file not found"}
+        if resolved.suffix.lower() != ".mp4":
+            return {"ok": False, "error": "video file is not mp4"}
+        if resolved.stat().st_size < 8:
+            return {"ok": False, "error": "video file is too small"}
+        with resolved.open("rb") as fh:
+            header = fh.read(8)
+        if len(header) < 8 or header[4:8] != b"ftyp":
+            return {"ok": False, "error": "video file is not a valid MP4"}
+        return {"ok": True, "path": str(resolved)}
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)[:200]}
 
 
 @app.get("/api/v1/docs/examples")

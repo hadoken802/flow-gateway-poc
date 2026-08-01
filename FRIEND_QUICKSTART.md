@@ -2,8 +2,19 @@
 
 ## 上传多张参考图
 
+第一次使用：
+
+```bat
+setup_embedded_windows.bat
+start_embedded_engine.bat
+status_embedded_engine.bat
+```
+
+如果 `.env` 里设置了 `FLOW_GATEWAY_CLIENT_API_KEY`，CLI 要带 `--api-key`。
+
 ```bash
 python examples\client_python.py ^
+  --api-key change-me-client-key ^
   --image D:\images\img1.jpg ^
   --image D:\images\img2.jpg ^
   --image D:\images\img3.jpg ^

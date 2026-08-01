@@ -5,6 +5,25 @@ from pathlib import Path
 
 
 DEFAULT_GATEWAY_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "gateway.db"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def load_env_file(path: Path | None = None) -> None:
+    env_path = path or PROJECT_ROOT / ".env"
+    if not env_path.exists():
+        return
+    for raw in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = os.path.expandvars(value.strip().strip('"').strip("'"))
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+load_env_file()
 
 
 def _port(name: str, default: int) -> int:
@@ -79,6 +98,9 @@ class GatewaySettings:
     heartbeat_interval_seconds: float = 30.0
     lease_sweeper_interval_seconds: float = 30.0
     allow_stale_quota_scheduling: bool = False
+    client_api_key: str = ""
+    admin_api_key: str = ""
+    output_root: Path = PROJECT_ROOT / "outputs"
 
     @classmethod
     def from_env(cls) -> "GatewaySettings":
@@ -91,6 +113,7 @@ class GatewaySettings:
             canary_limit=int(os.environ.get("CANARY_LIMIT", "2")),
             omni_10s_credit_cost=int(os.environ.get("OMNI_10S_CREDIT_COST", "15")),
             db_path=Path(os.environ.get("GATEWAY_DB_PATH", str(DEFAULT_GATEWAY_DB_PATH))),
+            workers_path=Path(os.environ.get("GATEWAY_WORKERS_PATH", str(Path(__file__).parent / "workers.json"))),
             worker_source=os.environ.get("FLOWKIT_GATEWAY_WORKER_SOURCE", "runtime_registry"),
             dry_run_step_seconds=_float_tuple("DRY_RUN_STEP_SECONDS", (1.0, 2.0, 3.0)),
             real_submit_max_attempts=_positive_int("REAL_SUBMIT_MAX_ATTEMPTS", 1),
@@ -101,6 +124,9 @@ class GatewaySettings:
             heartbeat_interval_seconds=_positive_float("GATEWAY_HEARTBEAT_INTERVAL_SECONDS", 30.0),
             lease_sweeper_interval_seconds=_positive_float("GATEWAY_LEASE_SWEEPER_INTERVAL_SECONDS", 30.0),
             allow_stale_quota_scheduling=_bool("GATEWAY_ALLOW_STALE_QUOTA_SCHEDULING", False),
+            client_api_key=os.environ.get("FLOW_GATEWAY_CLIENT_API_KEY", ""),
+            admin_api_key=os.environ.get("FLOW_GATEWAY_ADMIN_API_KEY", ""),
+            output_root=Path(os.environ.get("FLOW_GATEWAY_OUTPUT_DIR", str(PROJECT_ROOT / "outputs"))),
         )
 
 

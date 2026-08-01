@@ -10,14 +10,15 @@ from flow_gateway_client import FlowGatewayClient
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default="http://127.0.0.1:8200")
+    parser.add_argument("--api-key")
     parser.add_argument("--image", action="append", required=True, help="JPG, PNG, or WebP image. Repeat to keep order.")
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--idempotency-key")
     args = parser.parse_args()
 
-    client = FlowGatewayClient(args.base_url)
-    result = client.generate_reference_images(
+    client = FlowGatewayClient(args.base_url, api_key=args.api_key)
+    result = client.generate(
         images=args.image,
         prompt=args.prompt,
         output_path=args.output,
