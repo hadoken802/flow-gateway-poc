@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -11,28 +12,47 @@ import httpx
 
 
 class FlowGatewayClient:
-    def __init__(self, base_url: str = "http://127.0.0.1:8200", api_key: str | None = None):
+    def __init__(
+        self,
+        base_url: str = "http://127.0.0.1:8200",
+        api_key: str | None = None,
+        engine_mode: str = "existing_pool",
+        engine_root: str | None = None,
+    ):
+        if engine_mode not in {"existing_pool", "clean_embedded"}:
+            raise ValueError("engine_mode must be existing_pool or clean_embedded")
         self.base_url = base_url.rstrip("/")
-        self.api_key = api_key or ""
+        self.engine_mode = engine_mode
+        self.engine_root = Path(engine_root) if engine_root else Path(__file__).resolve().parents[1]
+        self.api_key = api_key or _client_key_from_env_file(self.engine_root) or ""
 
     @property
     def headers(self) -> dict[str, str]:
         return {"X-API-Key": self.api_key} if self.api_key else {}
 
     def ensure_engine_running(self, project_dir: str | None = None, timeout_seconds: float = 30.0) -> dict:
-        if self.ready().get("ready"):
-            return {"started": False, "ready": True}
-        root = Path(project_dir) if project_dir else Path(__file__).resolve().parents[1]
-        subprocess.Popen(
-            ["cmd", "/c", str(root / "start_embedded_engine.bat")],
-            cwd=str(root),
-            creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
-        )
+        current = self.ready()
+        if current.get("ready"):
+            current["started"] = False
+            return current
+        health = self.health()
+        if health.get("status") == "ok":
+            current["started"] = False
+            current["health"] = health
+            current["engine_running"] = True
+            return current
+        root = Path(project_dir) if project_dir else self.engine_root
+        if self.engine_mode == "clean_embedded":
+            command = ["cmd", "/c", str(root / "start_embedded_engine.bat")]
+            subprocess.Popen(command, cwd=str(root), creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+        else:
+            self._start_existing_pool(root)
         deadline = time.time() + timeout_seconds
         while time.time() < deadline:
             status = self.ready()
             if status.get("ready"):
                 status["started"] = True
+                status["engine_mode"] = self.engine_mode
                 return status
             time.sleep(1)
         raise TimeoutError("Flow Gateway engine did not become ready")
@@ -47,6 +67,40 @@ class FlowGatewayClient:
             return response.json()
         except httpx.RequestError as exc:
             return {"ready": False, "error": str(exc)}
+
+    def health(self) -> dict:
+        try:
+            response = httpx.get(f"{self.base_url}/health", timeout=5)
+            if response.status_code >= 400:
+                return {"status": "unavailable", "status_code": response.status_code}
+            return response.json()
+        except httpx.RequestError as exc:
+            return {"status": "unavailable", "error": str(exc)}
+
+    def _start_existing_pool(self, root: Path) -> None:
+        root = root.resolve()
+        python = _python_for_existing_pool(root)
+        log_dir = root / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        env = os.environ.copy()
+        env.update({
+            "GATEWAY_API_HOST": _host_from_base_url(self.base_url),
+            "GATEWAY_API_PORT": _port_from_base_url(self.base_url),
+            "POOL_DRY_RUN": env.get("POOL_DRY_RUN", "false"),
+            "POOL_MAX_CONCURRENCY": env.get("POOL_MAX_CONCURRENCY", "10"),
+            "FLOWKIT_GATEWAY_WORKER_SOURCE": "static_json",
+            "GATEWAY_WORKERS_PATH": str(root / "gateway" / "workers.json"),
+            "GATEWAY_DB_PATH": str(root / "data" / "gateway.db"),
+            "FLOW_GATEWAY_OUTPUT_DIR": str(root / "outputs"),
+        })
+        subprocess.Popen(
+            [str(python), "-m", "gateway.main"],
+            cwd=str(root),
+            env=env,
+            stdout=(log_dir / "gateway.log").open("ab"),
+            stderr=(log_dir / "gateway-startup-error.log").open("ab"),
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
 
     def upload_images(self, images: list[str]) -> list[dict]:
         files = []
@@ -176,3 +230,41 @@ def _mime_for(path: Path) -> str:
     if suffix == ".webp":
         return "image/webp"
     return "image/png"
+
+
+def _python_for_existing_pool(root: Path) -> Path:
+    candidates = [
+        root.parent / ".venv" / "Scripts" / "python.exe",
+        root / ".venv" / "Scripts" / "python.exe",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return Path("python")
+
+
+def _host_from_base_url(base_url: str) -> str:
+    from urllib.parse import urlparse
+
+    return urlparse(base_url).hostname or "127.0.0.1"
+
+
+def _port_from_base_url(base_url: str) -> str:
+    from urllib.parse import urlparse
+
+    parsed = urlparse(base_url)
+    return str(parsed.port or (443 if parsed.scheme == "https" else 80))
+
+
+def _client_key_from_env_file(root: Path) -> str:
+    env_path = root / ".env"
+    if not env_path.exists():
+        return ""
+    for raw in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key.strip() == "FLOW_GATEWAY_CLIENT_API_KEY":
+            return value.strip().strip('"').strip("'")
+    return ""

@@ -473,12 +473,15 @@ async def v1_system_status():
 @app.get("/api/v1/client/system/ready")
 async def v1_client_ready():
     status = await scheduler.pool_status()
+    worker_eligible = scheduler.worker_snapshot.eligible_count
     return {
         "ready": True,
         "status": "ok",
         "api_version": "v1",
         "dry_run": settings.dry_run,
-        "eligible_count": status.get("eligible_count", status.get("accounts_ready", 0)),
+        "eligible_accounts": worker_eligible,
+        "eligible_count": worker_eligible,
+        "accounts_ready": status.get("accounts_ready", 0),
         "effective_max_concurrency": status.get("effective_max_concurrency"),
         "queued_count": status.get("queued_count"),
         "active_count": status.get("active_count"),

@@ -2,7 +2,60 @@
 
 Embedded callers should upload images first, then create a task with `input_file_ids`.
 
-## Local Install
+## Engine Modes
+
+There are two local engine modes.
+
+### existing_pool
+
+Use this on the user's own machine when the production Flow account pool already exists.
+
+```python
+client = FlowGatewayClient(
+    base_url="http://127.0.0.1:8200",
+    api_key="client-key",
+    engine_mode="existing_pool",
+    engine_root="D:/Codex/projects/flow_gateway_poc/flowkit",
+)
+client.ensure_engine_running()
+```
+
+Behavior:
+
+- Reuses a running `http://127.0.0.1:8200` Gateway when `/health` is OK.
+- If Gateway is not running, starts `python -m gateway.main` from `engine_root`.
+- Uses `FLOWKIT_GATEWAY_WORKER_SOURCE=static_json`.
+- Uses the existing production `gateway/workers.json`.
+- Uses `data/gateway.db` and `outputs` under `engine_root`.
+- Does not create or overwrite `runtime/embedded_workers.json`.
+- Does not initialize a blank account pool.
+- Does not restart Chrome or Worker processes.
+- Does not modify `FLOW-001` to `FLOW-008` profiles, cookies, OAuth data, or account state.
+
+This is the mode for embedding FlowKit into a user's existing local tool.
+
+### clean_embedded
+
+Use this for a friend or a new computer that should start from an empty local install.
+
+```python
+client = FlowGatewayClient(
+    base_url="http://127.0.0.1:8200",
+    api_key="client-key",
+    engine_mode="clean_embedded",
+    engine_root="D:/apps/flowkit",
+)
+client.ensure_engine_running()
+```
+
+Behavior:
+
+- Uses `start_embedded_engine.bat`.
+- Uses `runtime/embedded_workers.json`.
+- Starts with zero accounts (`[]`) until accounts are added.
+- Keeps data isolated from an existing production pool.
+
+## Clean Embedded Install
 
 Run:
 
@@ -21,7 +74,7 @@ The scripts calculate paths from their own directory, so the project can live in
 - `runtime`
 - `runtime\embedded_workers.json`
 
-The initial embedded worker list is empty (`[]`), so it does not read existing `FLOW-001` to `FLOW-008` data.
+The initial embedded worker list is empty (`[]`), so it does not read existing `FLOW-001` to `FLOW-008` data. Do not use this mode for a machine that should reuse an existing production account pool.
 
 Configure `.env` from `.env.example`:
 
@@ -39,7 +92,7 @@ Python:
 ```python
 from examples.flow_gateway_client import FlowGatewayClient
 
-client = FlowGatewayClient("http://127.0.0.1:8200", api_key="change-me-client-key")
+client = FlowGatewayClient("http://127.0.0.1:8200", api_key="change-me-client-key", engine_mode="existing_pool")
 client.ensure_engine_running()
 client.generate(
     images=[

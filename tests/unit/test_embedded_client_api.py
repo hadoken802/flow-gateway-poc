@@ -12,6 +12,7 @@ class FakeScheduler:
     def __init__(self, db):
         self.db = db
         self.schedule_calls = 0
+        self.worker_snapshot = type("Snapshot", (), {"eligible_count": 0})()
 
     async def pool_status(self):
         from gateway import crud
