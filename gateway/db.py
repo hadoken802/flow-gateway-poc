@@ -89,6 +89,26 @@ CREATE TABLE IF NOT EXISTS gateway_schema_version (
     applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
 
+CREATE TABLE IF NOT EXISTS client_files (
+    file_id TEXT PRIMARY KEY,
+    original_filename TEXT NOT NULL,
+    stored_filename TEXT NOT NULL,
+    mime_type TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS task_input_media (
+    input_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    file_id TEXT NOT NULL,
+    uploaded_media_id TEXT,
+    position INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    UNIQUE(task_id, position)
+);
+
 CREATE TABLE IF NOT EXISTS task_state_events (
     event_id TEXT PRIMARY KEY,
     task_id TEXT NOT NULL,
@@ -157,6 +177,7 @@ CREATE TABLE IF NOT EXISTS task_attempts (
 async def connect(db_path):
     db_path.parent.mkdir(parents=True, exist_ok=True)
     db = await aiosqlite.connect(str(db_path), isolation_level=None)
+    db._flowkit_gateway_db_path = db_path
     db.row_factory = aiosqlite.Row
     await db.execute("BEGIN IMMEDIATE")
     try:
@@ -336,6 +357,24 @@ async def _migrate(db):
             error_category TEXT,
             error_code TEXT,
             UNIQUE(task_id, attempt_type, attempt_number)
+        );
+        CREATE TABLE IF NOT EXISTS client_files (
+            file_id TEXT PRIMARY KEY,
+            original_filename TEXT NOT NULL,
+            stored_filename TEXT NOT NULL,
+            mime_type TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            sha256 TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+        );
+        CREATE TABLE IF NOT EXISTS task_input_media (
+            input_id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            file_id TEXT NOT NULL,
+            uploaded_media_id TEXT,
+            position INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+            UNIQUE(task_id, position)
         );
         """
     )

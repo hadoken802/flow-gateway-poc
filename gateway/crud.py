@@ -3,6 +3,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from . import scheduler_kernel
+from . import client_files
 
 
 LEASE_SECONDS = 15 * 60
@@ -140,6 +141,18 @@ async def create_task(db, payload):
     not_before = payload.get("not_before")
     duration = int(payload.get("duration") or payload.get("seconds") or 10)
     aspect_ratio = payload.get("aspect_ratio") or "9:16"
+    input_file_ids = payload.get("input_file_ids")
+    if input_file_ids is None and payload.get("input_file_id"):
+        input_file_ids = [payload.get("input_file_id")]
+    if input_file_ids is not None:
+        if not isinstance(input_file_ids, list) or not input_file_ids:
+            raise ValueError("input_file_ids must contain at least one file_id")
+        input_file_ids = [str(item) for item in input_file_ids]
+        if any(not item for item in input_file_ids):
+            raise ValueError("input_file_ids contains an empty file_id")
+    image_path = payload.get("image_path")
+    if input_file_ids is None and not image_path:
+        raise ValueError("image_path or input_file_ids is required")
     await db.commit()
     await db.execute("BEGIN IMMEDIATE")
     try:
@@ -153,6 +166,16 @@ async def create_task(db, payload):
             item = dict(existing)
             item["reused"] = True
             return item
+        file_rows = []
+        if input_file_ids is not None:
+            placeholders = ",".join("?" for _ in set(input_file_ids))
+            cursor = await db.execute(f"SELECT * FROM client_files WHERE file_id IN ({placeholders})", tuple(set(input_file_ids)))
+            by_id = {row["file_id"]: dict(row) for row in await cursor.fetchall()}
+            missing = [file_id for file_id in input_file_ids if file_id not in by_id]
+            if missing:
+                raise ValueError(f"unknown input_file_ids: {', '.join(missing)}")
+            file_rows = [by_id[file_id] for file_id in input_file_ids]
+            image_path = client_files.local_path_for_file(db._flowkit_gateway_db_path, file_rows[0])
         await db.execute(
             """
             INSERT INTO flow_tasks(task_id, idempotency_key, project_id, image_path, prompt, duration, aspect_ratio,
@@ -161,7 +184,7 @@ async def create_task(db, payload):
             VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 'queued', ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                task_id, idempotency_key, payload.get("project_id"), payload["image_path"],
+                task_id, idempotency_key, payload.get("project_id"), image_path,
                 payload["prompt"], duration, aspect_ratio, payload.get("preferred_account_id"),
                 priority, not_before, estimated_quota_cost,
                 payload.get("external_task_id"), payload.get("batch_id"),
@@ -169,6 +192,14 @@ async def create_task(db, payload):
                 payload.get("metadata_json"), payload.get("generation_parameters_json"),
             ),
         )
+        for position, file_id in enumerate(input_file_ids or [], start=0):
+            await db.execute(
+                """
+                INSERT INTO task_input_media(input_id, task_id, file_id, position)
+                VALUES(?, ?, ?, ?)
+                """,
+                (str(uuid.uuid4()), task_id, file_id, position),
+            )
         await scheduler_kernel.record_state_event(
             db,
             task_id=task_id,
@@ -183,6 +214,39 @@ async def create_task(db, payload):
     item = await get_task(db, task_id)
     item["reused"] = False
     return item
+
+
+async def get_file(db, file_id):
+    cursor = await db.execute("SELECT * FROM client_files WHERE file_id=?", (file_id,))
+    row = await cursor.fetchone()
+    return dict(row) if row else None
+
+
+async def list_task_input_media(db, task_id):
+    cursor = await db.execute(
+        """
+        SELECT m.*, f.original_filename, f.stored_filename, f.mime_type, f.size_bytes, f.sha256
+        FROM task_input_media m
+        JOIN client_files f ON f.file_id=m.file_id
+        WHERE m.task_id=?
+        ORDER BY m.position
+        """,
+        (task_id,),
+    )
+    return [dict(row) for row in await cursor.fetchall()]
+
+
+async def set_task_uploaded_media_ids(db, task_id, media_ids):
+    for position, media_id in enumerate(media_ids):
+        await db.execute(
+            """
+            UPDATE task_input_media
+            SET uploaded_media_id=?
+            WHERE task_id=? AND position=?
+            """,
+            (media_id, task_id, position),
+        )
+    await db.commit()
 
 
 async def list_tasks(db):

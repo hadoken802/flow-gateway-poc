@@ -171,7 +171,20 @@ async def task_detail(scheduler, task_id: str) -> dict[str, Any] | None:
     leases = await _query(scheduler.db, "SELECT * FROM account_leases WHERE task_id=? ORDER BY acquired_at", (task_id,))
     attempts = await _query(scheduler.db, "SELECT * FROM task_attempts WHERE task_id=? ORDER BY started_at", (task_id,))
     ledger = await _query(scheduler.db, "SELECT * FROM quota_ledger WHERE task_id=? ORDER BY created_at", (task_id,))
-    return {"task": task, "state_events": events, "leases": leases, "attempts": attempts, "quota_ledger": ledger}
+    input_media = await crud.list_task_input_media(scheduler.db, task_id)
+    public_input_media = [
+        {
+            "file_id": item["file_id"],
+            "uploaded_media_id": item.get("uploaded_media_id"),
+            "position": item["position"],
+            "original_filename": item["original_filename"],
+            "mime_type": item["mime_type"],
+            "size_bytes": item["size_bytes"],
+            "sha256": item["sha256"],
+        }
+        for item in input_media
+    ]
+    return {"task": task, "input_media": public_input_media, "state_events": events, "leases": leases, "attempts": attempts, "quota_ledger": ledger}
 
 
 async def _query(db, sql: str, params=()):

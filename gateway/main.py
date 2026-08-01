@@ -5,7 +5,7 @@ import logging
 import sys
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
 
 from . import crud
@@ -14,6 +14,7 @@ from .instance_lock import GatewayInstanceLock, GatewayInstanceLockError
 from .scheduler import GatewayScheduler
 from . import task_center
 from . import nodes
+from . import client_files
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s", force=True)
 logger = logging.getLogger(__name__)
@@ -452,6 +453,37 @@ async def v1_system_status():
         "workers": scheduler.worker_snapshot.diagnostics(),
         "examples": task_center.examples(),
         "node_examples": nodes.examples(),
+    }
+
+
+@app.post("/api/v1/client/files")
+async def v1_upload_client_files(request: Request):
+    form = await request.form()
+    uploads = [item for key, item in form.multi_items() if key == "files" or key == "file"]
+    if not uploads:
+        raise HTTPException(400, "file or files multipart field is required")
+    results = [await client_files.save_upload(scheduler.db, settings.db_path, upload) for upload in uploads]
+    return {"files": [_public_upload_result(item) for item in results]}
+
+
+@app.post("/api/v1/client/files/batch")
+async def v1_upload_client_files_batch(request: Request):
+    return await v1_upload_client_files(request)
+
+
+def _public_upload_result(item: dict) -> dict:
+    if not item.get("ok"):
+        return {
+            "ok": False,
+            "original_filename": item.get("original_filename"),
+            "error": item.get("error"),
+        }
+    return {
+        "file_id": item["file_id"],
+        "original_filename": item["original_filename"],
+        "mime_type": item["mime_type"],
+        "size_bytes": item["size_bytes"],
+        "sha256": item["sha256"],
     }
 
 

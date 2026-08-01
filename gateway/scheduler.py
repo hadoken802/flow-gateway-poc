@@ -6,6 +6,7 @@ import uuid
 from pathlib import Path
 
 from . import crud
+from . import client_files
 from . import scheduler_kernel
 from .config import GatewaySettings
 from .db import connect
@@ -768,6 +769,9 @@ class GatewayScheduler:
                     "duration": task["duration"],
                     "aspect_ratio": task["aspect_ratio"],
                 }
+                input_media = await crud.list_task_input_media(self.db, task_id)
+                if input_media:
+                    payload["image_paths"] = [item["stored_path"] if "stored_path" in item else _stored_input_path(self.settings.db_path, item) for item in input_media]
                 try:
                     async with self.assignment_lock:
                         task = await crud.guarded_update_task(self.db, task_id, token["lease_owner"], token["lease_version"], "submit_pending")
@@ -791,6 +795,8 @@ class GatewayScheduler:
                         return
                     self._audit("worker_submit_started", task_id=task_id, worker_account_id=worker.account_id, project_id=project_id)
                     result = await self.worker_client.submit_omni_video(worker, payload)
+                    if result.get("input_media_ids") and input_media:
+                        await crud.set_task_uploaded_media_ids(self.db, task_id, result["input_media_ids"])
                     if task_id in self._fencing_lost:
                         self._audit("fencing_lost", task_id=task_id, action="after_submit")
                         return
@@ -1255,3 +1261,7 @@ def _valid_local_mp4(video_path, min_size_bytes: int = 1024) -> dict:
     except OSError as exc:
         return {"ok": False, "error_code": "video_path_error", "error_message": str(exc)[:500]}
     return {"ok": True, "error_code": None, "error_message": None}
+
+
+def _stored_input_path(db_path: Path, row: dict) -> str:
+    return client_files.local_path_for_file(db_path, row)

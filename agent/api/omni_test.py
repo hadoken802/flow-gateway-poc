@@ -65,7 +65,8 @@ async def shutdown_omni_jobs() -> None:
 class OmniVideoRequest(BaseModel):
     idempotency_key: str
     project_id: str
-    image_path: str
+    image_path: str | None = None
+    image_paths: list[str] | None = None
     prompt: str
     duration: int
     aspect_ratio: str
@@ -121,9 +122,10 @@ async def submit_omni_video(body: OmniVideoRequest):
     if client._flow_key is None:
         raise HTTPException(503, "Flow key not present")
 
-    image_path = Path(body.image_path)
-    if not image_path.exists() or not image_path.is_file():
-        raise HTTPException(404, f"File not found: {body.image_path}")
+    image_paths = _request_image_paths(body)
+    for image_path in image_paths:
+        if not image_path.exists() or not image_path.is_file():
+            raise HTTPException(404, f"File not found: {image_path}")
 
     credits_before = await client.get_credits()
     if credits_before.get("error"):
@@ -134,23 +136,26 @@ async def submit_omni_video(body: OmniVideoRequest):
     if credits_value < OMNI_CREDIT_COST:
         raise HTTPException(400, f"Insufficient credits: {credits_value}, need {OMNI_CREDIT_COST}")
 
-    upload_result = await _upload_image(client, image_path, body.project_id)
-    input_media_id = upload_result.get("_mediaId")
-    if not input_media_id:
-        raise HTTPException(502, "Upload succeeded but mediaId was not returned")
+    input_media_ids = []
+    for image_path in image_paths:
+        upload_result = await _upload_image(client, image_path, body.project_id)
+        input_media_id = upload_result.get("_mediaId")
+        if not input_media_id:
+            raise HTTPException(502, "Upload succeeded but mediaId was not returned")
+        input_media_ids.append(input_media_id)
 
-    job = await crud.create_omni_test_job(str(uuid.uuid4()), body.project_id, body.prompt, str(image_path), body.idempotency_key)
+    job = await crud.create_omni_test_job(str(uuid.uuid4()), body.project_id, body.prompt, str(image_paths[0]), body.idempotency_key)
     job_id = job["job_id"]
     if job.get("reused"):
         response = _public_job(job)
         response["reused"] = True
         return response
-    await crud.update_omni_test_job_required(job_id, input_media_id=input_media_id, status="queued")
+    await crud.update_omni_test_job_required(job_id, input_media_id=input_media_ids[0], status="queued")
 
     omni = OmniClient(client)
     result = await omni.submit_reference_video(
         project_id=body.project_id,
-        reference_media_ids=[input_media_id],
+        reference_media_ids=input_media_ids,
         prompt=body.prompt,
         user_paygate_tier="PAYGATE_TIER_NOT_PAID",
     )
@@ -183,6 +188,7 @@ async def submit_omni_video(body: OmniVideoRequest):
         job_id, body.project_id[:8], input_media_id[:8],
         (job.get("output_media_id") or "")[:8], job.get("status"), job.get("remaining_credits"))
     response = _public_job(job)
+    response["input_media_ids"] = input_media_ids
     response["reused"] = False
     return response
 
@@ -799,3 +805,10 @@ def _public_job(job: dict) -> dict:
         "extension_request_id", "remote_http_status", "remote_submission_state",
     ]
     return {key: job.get(key) for key in keys}
+
+
+def _request_image_paths(body: OmniVideoRequest) -> list[Path]:
+    raw_paths = body.image_paths if body.image_paths is not None else ([body.image_path] if body.image_path else [])
+    if not raw_paths:
+        raise HTTPException(400, "image_path or image_paths is required")
+    return [Path(path) for path in raw_paths]
