@@ -257,8 +257,10 @@ def test_dynamic_concurrency_respects_configured_upper_bound():
     assert scheduler.effective_max_concurrency_from_accounts(accounts) == 5
 
 
-def test_quick_add_formats_account_number_and_ports(registry):
+def test_quick_add_formats_account_number_and_ports(monkeypatch, registry):
     from gateway import nodes
+
+    monkeypatch.setattr("gateway.nodes.port_is_available", lambda port, reserved=(), host="127.0.0.1": int(port) == 8107)
 
     assert nodes.normalize_flow_account_id("7") == "FLOW-007"
     assert nodes.normalize_flow_account_id("007") == "FLOW-007"
@@ -272,6 +274,71 @@ def test_quick_add_formats_account_number_and_ports(registry):
     assert preview["cdp_port"] == 9306
     assert preview["enabled"] is False
     assert preview["profile_path"].endswith("profiles\\FLOW-007") or preview["profile_path"].endswith("profiles/FLOW-007")
+
+
+def test_quick_add_uses_fallback_when_preferred_worker_port_unavailable(monkeypatch, registry):
+    from gateway import nodes
+
+    monkeypatch.setattr("gateway.nodes.worker_fallback_range", lambda: range(18100, 18110))
+    monkeypatch.setattr("gateway.nodes.port_is_available", lambda port, reserved=(), host="127.0.0.1": int(port) == 18100)
+
+    preview = nodes.quick_add_preview({"flow_account_number": "7"}, registry, FakeManager(registry))
+
+    assert preview["worker_port"] == 18100
+
+
+def test_quick_add_uses_fallback_when_preferred_worker_port_is_excluded(monkeypatch, registry):
+    from gateway import nodes
+    from runtime import port_allocator
+
+    port_allocator.windows_excluded_tcp_port_ranges.cache_clear()
+    monkeypatch.setattr("runtime.port_allocator.windows_excluded_tcp_port_ranges", lambda: ((8107, 8107),))
+    monkeypatch.setattr("runtime.port_allocator.port_is_listening", lambda port, host="127.0.0.1": False)
+    monkeypatch.setattr("runtime.port_allocator.port_can_bind", lambda port, host="127.0.0.1": True)
+    monkeypatch.setattr("gateway.nodes.worker_fallback_range", lambda: range(18100, 18110))
+    monkeypatch.setattr("gateway.nodes.port_is_available", port_allocator.port_is_available)
+
+    preview = nodes.quick_add_preview({"flow_account_number": "7"}, registry, FakeManager(registry))
+
+    assert preview["worker_port"] == 18100
+
+
+def test_quick_add_fallback_skips_existing_node_ports(monkeypatch, gateway_db, registry):
+    from gateway import nodes
+
+    registry.upsert_account("FLOW-008", worker_api_port=8108, extension_ws_port=9207, chrome_cdp_port=9307, status="login_verified")
+    monkeypatch.setattr("gateway.nodes.worker_fallback_range", lambda: range(18100, 18103))
+
+    def fake_available(port, reserved=(), host="127.0.0.1"):
+        return int(port) not in {8107, 18100} and int(port) not in {int(item) for item in reserved}
+
+    monkeypatch.setattr("gateway.nodes.port_is_available", fake_available)
+
+    preview = nodes.quick_add_preview({"flow_account_number": "7"}, registry, FakeManager(registry))
+    flow_008 = registry.get("FLOW-008")
+
+    assert preview["worker_port"] == 18101
+    assert flow_008 is not None
+    assert flow_008.worker_api_port == 8108
+
+
+@pytest.mark.asyncio
+async def test_quick_create_login_saves_allocated_worker_port(monkeypatch, gateway_db, registry):
+    from gateway import nodes
+
+    scheduler = FakeScheduler(gateway_db)
+    manager = FakeManager(registry)
+    monkeypatch.setattr("gateway.nodes.worker_fallback_range", lambda: range(18100, 18110))
+    monkeypatch.setattr("gateway.nodes.port_is_available", lambda port, reserved=(), host="127.0.0.1": int(port) == 18100)
+    monkeypatch.setattr("gateway.nodes.port_is_listening", lambda port, host="127.0.0.1": False)
+    monkeypatch.setattr("gateway.nodes.port_can_bind", lambda port, host="127.0.0.1": True)
+
+    result = await nodes.quick_create_login(scheduler, {"flow_account_number": "7"}, registry, manager)
+    account = registry.get("FLOW-007")
+
+    assert result["ok"] is True
+    assert account is not None
+    assert account.worker_api_port == 18100
 
 
 def test_quick_add_skips_flow_006_and_allows_flow_007(registry):

@@ -14,7 +14,7 @@ import httpx
 
 from runtime.process_manager import RuntimeManager
 from runtime.gateway_projection import ReadOnlyRuntimeStatusProvider
-from runtime.port_allocator import port_can_bind, port_is_listening
+from runtime.port_allocator import port_can_bind, port_is_available, port_is_listening, worker_fallback_range, worker_port_base
 from runtime.registry import AccountRegistry
 
 from . import crud
@@ -95,9 +95,10 @@ def normalize_flow_account_id(value: Any) -> str:
 
 def quick_add_preview(payload: dict, registry: AccountRegistry | None = None, manager: RuntimeManager | None = None) -> dict:
     registry = registry or AccountRegistry()
+    manager = manager or RuntimeManager(registry)
     account_id = normalize_flow_account_id(payload.get("flow_account_number") or payload.get("account_id"))
     number = int(account_id.rsplit("-", 1)[-1])
-    worker_port = int(payload.get("worker_port") or payload.get("worker_api_port") or (8100 + number))
+    worker_port = _quick_add_worker_port(payload, number, registry)
     extension_ws_port = int(payload.get("extension_ws_port") or payload.get("ws_port") or (9199 + number))
     cdp_port = int(payload.get("cdp_port") or payload.get("chrome_cdp_port") or (9299 + number))
     profile_path = str(Path(payload.get("profile_path") or registry.profiles_root / account_id))
@@ -119,9 +120,27 @@ def quick_add_preview(payload: dict, registry: AccountRegistry | None = None, ma
         "output_dir": output_dir,
         "enabled": False,
     }
-    preview["checks"] = _quick_add_checks(preview, registry, manager or RuntimeManager(registry))
+    preview["checks"] = _quick_add_checks(preview, registry, manager)
     preview["ok"] = not preview["checks"]["errors"]
     return preview
+
+
+def _quick_add_worker_port(payload: dict, number: int, registry: AccountRegistry) -> int:
+    explicit = payload.get("worker_port") or payload.get("worker_api_port")
+    if explicit:
+        return int(explicit)
+    preferred = worker_port_base() + int(number)
+    reserved = {account.worker_api_port for account in registry.list_accounts()}
+    if port_is_available(preferred, reserved):
+        return preferred
+    return port_is_available_from_range(worker_fallback_range(), reserved | {preferred})
+
+
+def port_is_available_from_range(candidates, reserved: set[int]) -> int:
+    for port in candidates:
+        if port_is_available(int(port), reserved):
+            return int(port)
+    raise RuntimeError("no_available_worker_port")
 
 
 async def quick_create_login(scheduler, payload: dict, registry: AccountRegistry | None = None, manager: RuntimeManager | None = None) -> dict:

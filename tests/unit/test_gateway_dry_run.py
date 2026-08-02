@@ -2,6 +2,7 @@ import asyncio
 import json
 import tempfile
 import uuid
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -118,9 +119,14 @@ def local_db(name):
 
 
 def make_scheduler(settings, worker_client):
+    from gateway.config import GatewaySettings
     from gateway.scheduler import GatewayScheduler
     from gateway.worker_provider import StaticJsonWorkerProvider
 
+    if settings.workers_path == GatewaySettings().workers_path:
+        workers_path = RUN_ROOT / settings.db_path.parent.name / "workers.json"
+        write_workers(workers_path, list(worker_client.states))
+        settings = replace(settings, workers_path=workers_path)
     return GatewayScheduler(settings, worker_client=worker_client, worker_provider=StaticJsonWorkerProvider(settings.workers_path))
 
 
@@ -797,7 +803,8 @@ async def test_real_mode_remote_completed_with_invalid_local_mp4_does_not_comple
     })
     for _ in range(100):
         task = (await scheduler.list_tasks())[0]
-        if task["status"] in {"download_failed", "manual_review"}:
+        accounts = {a["account_id"]: a for a in await scheduler.list_accounts()}
+        if task["status"] in {"download_failed", "manual_review"} and accounts["FLOW-002"]["current_task_id"] is None:
             break
         await asyncio.sleep(0.02)
     task = (await scheduler.list_tasks())[0]
