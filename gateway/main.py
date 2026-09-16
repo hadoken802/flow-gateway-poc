@@ -640,109 +640,147 @@ TASK_CENTER_HTML = """
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Flow Gateway Task Center</title>
+  <title>Flow Gateway</title>
   <style>
-    body{font-family:Segoe UI,Arial,sans-serif;margin:0;background:#f6f7f9;color:#1d2733}
-    header{background:#102033;color:white;padding:14px 20px}
-    main{padding:16px;display:grid;gap:16px}
-    section{background:white;border:1px solid #d7dde5;border-radius:6px;padding:14px}
-    h1{font-size:20px;margin:0} h2{font-size:16px;margin:0 0 10px}
-    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
-    .metric{border:1px solid #e1e5ea;border-radius:6px;padding:10px}
-    .metric b{display:block;font-size:22px;margin-top:4px}
-    table{width:100%;border-collapse:collapse;font-size:13px}
-    th,td{border-bottom:1px solid #e5e9ef;padding:7px;text-align:left;vertical-align:top}
-    th{background:#f2f4f7}
+    *{box-sizing:border-box}
+    body{font-family:"Segoe UI","Microsoft YaHei",Arial,sans-serif;margin:0;background:#fff;color:#18212b;font-size:14px}
+    main{width:min(1180px,calc(100% - 48px));margin:0 auto;padding:28px 0 48px}
+    header{display:flex;align-items:center;justify-content:space-between;margin-bottom:22px}
+    h1{font-size:22px;font-weight:650;margin:0} h2{font-size:17px;margin:0}
+    section{border-top:1px solid #e8ebef;padding:22px 0}
+    .section-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+    .muted{color:#768291}
+    .status-grid{display:grid;grid-template-columns:1.4fr repeat(4,1fr);gap:10px}
+    .metric{background:#f7f8fa;border-radius:9px;padding:12px 14px;color:#687483}
+    .metric b{display:block;color:#18212b;font-size:20px;font-weight:650;margin-top:5px}
+    .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:8px;background:#1eae68}
+    .dot.warn{background:#e58a19}.dot.danger{background:#d94b4b}
+    .simple-list{border:1px solid #e8ebef;border-radius:10px;overflow:hidden}
+    .list-row{display:grid;grid-template-columns:minmax(150px,1.3fr) minmax(170px,1fr) minmax(90px,.7fr) minmax(100px,auto);align-items:center;gap:18px;min-height:48px;padding:8px 14px;border-bottom:1px solid #eef0f3}
+    .list-row:last-child{border-bottom:0}.list-head{min-height:38px;background:#fafbfc;color:#768291;font-size:12px}
+    .task-row{grid-template-columns:minmax(180px,1.5fr) minmax(130px,.8fr) minmax(130px,.8fr) minmax(110px,auto)}
+    .state{display:inline-flex;align-items:center}.credits{font-variant-numeric:tabular-nums}
+    .empty{padding:24px;text-align:center;color:#8a95a3}
     input,select,textarea,button{font:inherit}
-    textarea{width:100%;min-height:130px}
-    button{border:1px solid #9aa7b5;background:#fff;border-radius:5px;padding:6px 10px;cursor:pointer}
-    button.primary{background:#0f5cc0;color:#fff;border-color:#0f5cc0}
+    input,select,textarea{border:1px solid #cfd5dc;border-radius:7px;padding:8px 10px;background:#fff}
+    textarea{width:100%;min-height:120px;margin-top:10px}
+    button,.link-button{border:1px solid #c9d0d8;background:#fff;color:#283746;border-radius:7px;padding:6px 11px;cursor:pointer;text-decoration:none;display:inline-block}
+    button:hover,.link-button:hover{background:#f5f7f9}
+    button.primary{background:#1769d2;color:#fff;border-color:#1769d2}
+    button.danger{color:#b53a3a}
     .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-    .error{color:#a10000}
-    .ok{color:#087443}
+    .add-row{margin-top:12px}.add-panel{display:none;margin-top:10px}.add-panel.open{display:flex}
+    .error{color:#b53a3a}.ok{color:#118451}pre{white-space:pre-wrap;word-break:break-word}
+    details.advanced{border-top:1px solid #e8ebef;padding:18px 0}
+    details.advanced>summary{cursor:pointer;font-weight:600;list-style:none;color:#4f5c69}
+    details.advanced>summary::before{content:'›';display:inline-block;margin-right:8px;transition:transform .15s}
+    details.advanced[open]>summary::before{transform:rotate(90deg)}
+    .advanced-body{display:grid;gap:18px;margin-top:16px}.advanced-card{background:#f8f9fb;border-radius:9px;padding:14px;overflow:auto}
+    .advanced-card h3{font-size:14px;margin:0 0 10px}
+    table{width:100%;border-collapse:collapse;font-size:12px;min-width:900px}
+    th,td{border-bottom:1px solid #e4e8ed;padding:7px;text-align:left;vertical-align:top}th{color:#667382}
     code{background:#edf1f5;padding:1px 4px;border-radius:4px}
+    @media(max-width:760px){main{width:calc(100% - 28px)}.status-grid{grid-template-columns:1fr 1fr}.status-grid .metric:first-child{grid-column:1/-1}.list-row,.task-row{grid-template-columns:1fr 1fr;gap:8px}.list-head{display:none}}
   </style>
 </head>
 <body>
-<header><h1>Flow Gateway Task Center</h1></header>
 <main>
+  <header><h1>Flow Gateway</h1><span class="muted">自动刷新</span></header>
   <section>
-    <h2>Overview</h2>
-    <div class="grid" id="metrics"></div>
+    <div class="status-grid" id="metrics"></div>
   </section>
   <section>
-    <h2>Batch Import</h2>
-    <div class="row">
-      <select id="importFormat"><option value="csv">CSV</option><option value="json">JSON</option></select>
-      <input id="importFile" type="file" accept=".csv,.json" onchange="loadImportFile()">
-      <button onclick="loadExample()">Load Example</button>
-      <button class="primary" onclick="importTasks()">Import Tasks</button>
+    <div class="section-head"><h2>账号</h2><span class="muted" id="accountSummary"></span></div>
+    <div class="simple-list" id="accountList"></div>
+    <div class="add-row"><button type="button" onclick="toggleQuickAdd()">＋ 添加账号</button></div>
+    <div class="row add-panel" id="quickAddPanel">
+      <input id="quickFlowNumber" placeholder="账号编号，例如 009" inputmode="numeric">
+      <button id="quickAddButton" type="button" class="primary" onclick="quickCreateLogin()">创建并打开登录窗口</button>
     </div>
-    <textarea id="importContent"></textarea>
-    <pre id="importResult"></pre>
+    <pre id="quickNodePreview"></pre><pre id="nodeResult"></pre>
   </section>
   <section>
-    <h2>Tasks</h2>
-    <div class="row">
-      <input id="filterStatus" placeholder="status">
-      <input id="filterBatch" placeholder="batch_id">
-      <input id="filterAccount" placeholder="account_id">
-      <button onclick="loadTasks()">Refresh</button>
-      <button onclick="exportTasks()">Export</button>
-    </div>
-    <div style="overflow:auto"><table id="tasks"></table></div>
+    <div class="section-head"><h2>最近任务</h2><button type="button" id="allTasksButton" onclick="toggleAllTasks()">查看全部任务</button></div>
+    <div class="simple-list" id="taskList"></div>
   </section>
-  <section>
-    <h2>Accounts</h2>
-    <div style="overflow:auto"><table id="accounts"></table></div>
-  </section>
-  <section>
-    <h2>Account Nodes</h2>
-    <div class="row">
-      <input id="quickFlowNumber" placeholder="Flow Account Number">
-      <button id="quickAddButton" type="button" class="primary" onclick="quickCreateLogin()">Create & Open Login Window</button>
-      <button type="button" onclick="quickPreviewNode()">Preview</button>
+  <details class="advanced">
+    <summary>高级设置</summary>
+    <div class="advanced-body">
+      <div class="advanced-card"><h3>账号控制</h3><table id="accounts"></table></div>
+      <div class="advanced-card"><h3>节点与诊断</h3><table id="nodesTable"></table></div>
+      <div class="advanced-card">
+        <h3>节点配置</h3>
+        <div class="row">
+          <input id="nodeAccountId" placeholder="Account ID"><input id="nodeDisplayName" placeholder="Display Name">
+          <input id="nodeWorkerHost" placeholder="Worker Host" value="127.0.0.1"><input id="nodeWorkerPort" placeholder="Worker Port">
+          <input id="nodeCdpHost" placeholder="CDP Host" value="127.0.0.1"><input id="nodeCdpPort" placeholder="CDP Port">
+          <label><input id="nodeEnabled" type="checkbox"> Enabled</label>
+          <button id="addNodeButton" type="button" class="primary" onclick="addNode()">Add Node</button>
+          <button onclick="quickPreviewNode()">Preview Quick Add</button><button onclick="loadNodeExample()">Load Node Example</button><button onclick="importNodes()">Import Nodes</button>
+        </div>
+        <textarea id="nodeImportContent" placeholder="CSV or JSON node config"></textarea>
+      </div>
+      <div class="advanced-card">
+        <h3>任务管理</h3>
+        <div class="row"><input id="filterStatus" placeholder="status"><input id="filterBatch" placeholder="batch_id"><input id="filterAccount" placeholder="account_id"><button onclick="loadTasks()">刷新</button><button onclick="exportTasks()">导出</button></div>
+        <table id="tasks"></table>
+      </div>
+      <div class="advanced-card">
+        <h3>批量导入</h3>
+        <div class="row"><select id="importFormat"><option value="csv">CSV</option><option value="json">JSON</option></select><input id="importFile" type="file" accept=".csv,.json" onchange="loadImportFile()"><button onclick="loadExample()">加载示例</button><button class="primary" onclick="importTasks()">导入任务</button></div>
+        <textarea id="importContent"></textarea><pre id="importResult"></pre>
+      </div>
     </div>
-    <pre id="quickNodePreview"></pre>
-    <details>
-      <summary>Advanced Settings</summary>
-    <div class="row">
-      <input id="nodeAccountId" placeholder="Account ID">
-      <input id="nodeDisplayName" placeholder="Display Name">
-      <input id="nodeWorkerHost" placeholder="Worker Host" value="127.0.0.1">
-      <input id="nodeWorkerPort" placeholder="Worker Port">
-      <input id="nodeCdpHost" placeholder="CDP Host" value="127.0.0.1">
-      <input id="nodeCdpPort" placeholder="CDP Port">
-      <label><input id="nodeEnabled" type="checkbox"> Enabled</label>
-      <button id="addNodeButton" type="button" class="primary" onclick="addNode()">Add Node</button>
-      <button onclick="loadNodeExample()">Load Node Example</button>
-      <button onclick="importNodes()">Import Nodes</button>
-    </div>
-    </details>
-    <textarea id="nodeImportContent" placeholder="CSV or JSON node config"></textarea>
-    <pre id="nodeResult"></pre>
-    <div style="overflow:auto"><table id="nodesTable"></table></div>
-  </section>
+  </details>
 </main>
 <script>
 async function api(path, options){const r=await fetch(path, options); if(!r.ok) throw new Error(await r.text()); return await r.json();}
 function td(v){return `<td>${v??''}</td>`}
+function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+let accountRows=[],nodeRows=[],taskRows=[],showAllTasks=false;
 async function refresh(){
-  const s=await api('/api/v1/system/status');
-  const ms=[['queued',s.queued_count],['running',s.active_count],['completed',s.completed_count],['failed',s.failed_count],['ready accounts',s.accounts_ready],['cooldown',s.accounts_cooldown||0],['paused',s.accounts_paused||0]];
-  metrics.innerHTML=ms.map(m=>`<div class="metric">${m[0]}<b>${m[1]}</b></div>`).join('');
-  await loadAccounts(); await loadTasks(); await loadNodes();
+  try{
+    const [s,accountsData,tasksData,nodesData]=await Promise.all([api('/api/v1/system/status'),api('/api/v1/accounts'),api('/api/v1/tasks'),api('/api/v1/nodes')]);
+    accountRows=accountsData;taskRows=tasksData;nodeRows=nodesData;
+    renderAccounts();renderTasks();renderAdvanced();renderMetrics(s);
+  }catch(e){metrics.innerHTML=`<div class="metric"><span class="dot danger"></span>Gateway<b>异常</b></div>`;console.error(e)}
 }
-async function loadAccounts(){
-  const rows=await api('/api/v1/accounts');
-  accounts.innerHTML='<tr><th>account</th><th>status</th><th>credits</th><th>reserved</th><th>health</th><th>current_task</th><th>cooldown</th><th>weight</th><th>actions</th></tr>'+
-    rows.map(a=>`<tr>${td(a.account_id)}${td(a.status)}${td(a.credits)}${td(a.reserved_credits)}${td(a.health_score)}${td(a.current_task_id)}${td(a.cooldown_until)}${td(a.account_weight)}<td><button onclick="pauseAccount('${a.account_id}')">pause</button> <button onclick="resumeAccount('${a.account_id}')">resume</button> <button onclick="cooldownAccount('${a.account_id}')">cooldown</button> <button onclick="clearCooldown('${a.account_id}')">clear</button> <button onclick="setWeight('${a.account_id}')">weight</button> <button onclick="setCredits('${a.account_id}')">credits</button></td></tr>`).join('');
+function mergedAccounts(){
+  const merged=new Map();accountRows.forEach(a=>merged.set(a.account_id,{account:a,node:null}));nodeRows.forEach(n=>merged.set(n.account_id,{account:merged.get(n.account_id)?.account||null,node:n}));return [...merged.entries()].sort((a,b)=>a[0].localeCompare(b[0]));
 }
+function cooldownRemaining(value){const end=Date.parse(value);if(!value||Number.isNaN(end)||end<=Date.now())return '';const sec=Math.ceil((end-Date.now())/1000);return sec<60?`${sec} 秒`:`${Math.ceil(sec/60)} 分钟`}
+function accountState(account,node){
+  const cooldown=cooldownRemaining(account?.cooldown_until||node?.cooldown_until);if(cooldown)return {key:'cooldown',label:`冷却中 · 剩余 ${cooldown}`,tone:'warn'};
+  const status=String(account?.status||'').toLowerCase(), worker=String(node?.worker_status||'').toLowerCase(), oauth=String(node?.oauth_status||'').toLowerCase();
+  if(status==='needs_login')return {key:'login',label:'需要登录',tone:'warn'};
+  if(node&&(!node.worker_online||worker==='offline')||status==='offline')return {key:'offline',label:'离线',tone:'danger'};
+  if(oauth.includes('oauth')||oauth.includes('login')||node?.extension_status==='extension_missing')return {key:'login',label:'需要登录',tone:'warn'};
+  if(node&&oauth!=='live'&&oauth!=='unknown'&&oauth)return {key:'oauth',label:'OAuth 异常',tone:'danger'};
+  if(status==='ready'||status==='busy')return {key:'ready',label:status==='busy'?'生成中':'Ready',tone:''};
+  return {key:'other',label:status||worker||'未知',tone:'warn'};
+}
+function accountAction(id,state){if(state.key==='login'||state.key==='oauth')return `<button onclick="refreshNodeSession('${esc(id)}')">${state.key==='oauth'?'重新登录':'登录'}</button>`;if(state.key==='offline')return `<button onclick="startNode('${esc(id)}')">启动</button>`;return ''}
+function renderAccounts(){
+  const rows=mergedAccounts();accountSummary.textContent=`${rows.length} 个账号`;
+  accountList.innerHTML='<div class="list-row list-head"><span>账号</span><span>状态</span><span>积分</span><span></span></div>'+(rows.length?rows.map(([id,v])=>{const state=accountState(v.account,v.node),credits=v.account?.credits??v.node?.credits??'—';return `<div class="list-row"><strong>${esc(id)}</strong><span class="state"><i class="dot ${state.tone}"></i>${esc(state.label)}</span><span class="credits">${esc(credits)}</span><span>${accountAction(id,state)}</span></div>`}).join(''):'<div class="empty">暂无账号</div>');
+}
+function renderMetrics(s){const rows=mergedAccounts(),bad=rows.filter(([,v])=>accountState(v.account,v.node).key!=='ready').length,total=rows.length,gatewayOk=s.gateway?.status==='ok';metrics.innerHTML=`<div class="metric"><span class="dot ${gatewayOk?'':'danger'}"></span>Gateway<b>${gatewayOk?'正常':'异常'}</b></div><div class="metric">可用账号<b>${s.accounts_ready||0} / ${total}</b></div><div class="metric">当前生成<b>${s.active_count||0}</b></div><div class="metric">排队<b>${s.queued_count||0}</b></div><div class="metric">异常账号<b>${bad}</b></div>`}
+function taskState(t){const map={completed:'已完成',failed:'失败',queued:'排队中',processing:'生成中',downloading:'下载中',cancelled:'已取消'};return map[t.status]||t.status||'未知'}
+function taskAction(t){if(t.status==='completed'&&t.video_path)return `<a class="link-button" target="_blank" href="/api/v1/client/tasks/${encodeURIComponent(t.task_id)}/download">打开视频</a>`;if(t.status==='failed'||t.error_code||t.last_error_category)return `<button onclick="showTaskReason('${esc(t.task_id)}')">查看原因</button>`;return ''}
+function renderTasks(){const newest=[...taskRows].reverse(),rows=showAllTasks?newest:newest.slice(0,8);taskList.innerHTML='<div class="list-row task-row list-head"><span>任务</span><span>状态</span><span>账号</span><span></span></div>'+(rows.length?rows.map(t=>`<div class="list-row task-row"><strong>${esc(t.name||t.external_task_id||'未命名任务')}</strong><span>${esc(taskState(t))}</span><span>${esc(t.assigned_account_id||t.account_id||'—')}</span><span>${taskAction(t)}</span></div>`).join(''):'<div class="empty">暂无任务</div>');allTasksButton.textContent=showAllTasks?'只看最近任务':'查看全部任务'}
+function toggleAllTasks(){showAllTasks=!showAllTasks;renderTasks()}
+function toggleQuickAdd(){quickAddPanel.classList.toggle('open');if(quickAddPanel.classList.contains('open'))quickFlowNumber.focus()}
+async function showTaskReason(id){const data=await api(`/api/v1/tasks/${id}`),t=data.task||data;alert(t.error_message||t.last_error_message||t.error_code||t.last_error_category||'没有可用的失败原因')}
+function renderAdvanced(){
+  accounts.innerHTML='<tr><th>account</th><th>status</th><th>credits</th><th>reserved</th><th>health</th><th>current_task</th><th>cooldown</th><th>weight</th><th>actions</th></tr>'+accountRows.map(a=>`<tr>${td(a.account_id)}${td(a.status)}${td(a.credits)}${td(a.reserved_credits)}${td(a.health_score)}${td(a.current_task_id)}${td(a.cooldown_until)}${td(a.account_weight)}<td><button onclick="pauseAccount('${a.account_id}')">pause</button> <button onclick="resumeAccount('${a.account_id}')">resume</button> <button onclick="cooldownAccount('${a.account_id}')">cooldown</button> <button onclick="clearCooldown('${a.account_id}')">clear</button> <button onclick="setWeight('${a.account_id}')">weight</button> <button onclick="setCredits('${a.account_id}')">credits</button></td></tr>`).join('');
+  nodesTable.innerHTML='<tr><th>account</th><th>worker</th><th>cdp/ws</th><th>PID</th><th>runtime</th><th>OAuth</th><th>account_match / ownership</th><th>quota_confidence</th><th>enabled</th><th>actions</th></tr>'+nodeRows.map(n=>`<tr>${td(n.account_id)}${td(`${n.worker_host}:${n.worker_port}`)}${td(`${n.cdp_host}:${n.cdp_port}<br>ws ${n.extension_ws_port||''}`)}${td(`worker ${n.worker_pid||''}<br>chrome ${n.chrome_pid||''}`)}${td(n.worker_status)}${td(n.oauth_status)}${td(`${n.runtime?.account_match??''}<br>${n.runtime?.ownership_status||n.runtime?.worker_ownership_verified||''}`)}${td(n.quota_confidence)}${td(n.enabled)}<td><button onclick="startNode('${n.account_id}')">start</button> <button onclick="stopNode('${n.account_id}')">stop</button> <button onclick="restartNode('${n.account_id}')">restart</button> <button onclick="refreshNodeSession('${n.account_id}')">refresh session</button> <button onclick="checkLoginEnable('${n.account_id}')">Check Login & Enable</button> <button onclick="enableNode('${n.account_id}')">enable</button> <button onclick="disableNode('${n.account_id}')">disable</button> <button onclick="editNode('${n.account_id}',${n.worker_port},${n.cdp_port})">edit ports</button> <button onclick="nodeDetail('${n.account_id}')">diagnostics</button></td></tr>`).join('');
+  renderAdvancedTasks();
+}
+function renderAdvancedTasks(){tasks.innerHTML='<tr><th>task_id</th><th>external</th><th>batch</th><th>status</th><th>account</th><th>job</th><th>project</th><th>gen</th><th>dl</th><th>output</th><th>error</th><th>actions</th></tr>'+taskRows.map(t=>`<tr>${td(`<code>${t.task_id}</code>`)}${td(t.external_task_id)}${td(t.batch_id)}${td(t.status)}${td(t.assigned_account_id||t.account_id)}${td(t.worker_job_id)}${td(t.project_id)}${td(t.generation_attempts)}${td(t.download_attempts)}${td(t.video_path||((t.output_directory||'')+'/'+(t.output_filename||'')))}${td(t.error_code||t.last_error_category||'')}<td><button onclick="detail('${t.task_id}')">detail</button> <button onclick="pauseTask('${t.task_id}')">pause</button> <button onclick="resumeTask('${t.task_id}')">resume</button> <button onclick="cancelTask('${t.task_id}')">cancel</button> <button onclick="priorityTask('${t.task_id}')">priority</button> <button onclick="requeueTask('${t.task_id}')">requeue</button> <button onclick="retryDownload('${t.task_id}')">retry download</button> <button onclick="reconcileTask('${t.task_id}')">reconcile</button> <button onclick="manualTask('${t.task_id}')">need manual</button></td></tr>`).join('')}
+async function loadAccounts(){accountRows=await api('/api/v1/accounts');renderAccounts();renderAdvanced()}
 async function loadTasks(){
   const q=new URLSearchParams(); if(filterStatus.value) q.set('status',filterStatus.value); if(filterBatch.value) q.set('batch_id',filterBatch.value); if(filterAccount.value) q.set('account_id',filterAccount.value);
-  const rows=await api('/api/v1/tasks?'+q.toString());
-  tasks.innerHTML='<tr><th>task_id</th><th>external</th><th>batch</th><th>status</th><th>account</th><th>job</th><th>project</th><th>gen</th><th>dl</th><th>priority</th><th>output</th><th>error</th><th>actions</th></tr>'+
-    rows.map(t=>`<tr>${td(`<code>${t.task_id}</code>`)}${td(t.external_task_id)}${td(t.batch_id)}${td(t.status)}${td(t.assigned_account_id||t.account_id)}${td(t.worker_job_id)}${td(t.project_id)}${td(t.generation_attempts)}${td(t.download_attempts)}${td(t.priority)}${td(t.video_path||((t.output_directory||'')+'/'+(t.output_filename||'')))}${td(t.error_code||t.last_error_category||'')}<td><button onclick="detail('${t.task_id}')">detail</button> <button onclick="pauseTask('${t.task_id}')">pause</button> <button onclick="resumeTask('${t.task_id}')">resume</button> <button onclick="cancelTask('${t.task_id}')">cancel</button> <button onclick="priorityTask('${t.task_id}')">priority</button> <button onclick="requeueTask('${t.task_id}')">requeue</button> <button onclick="retryDownload('${t.task_id}')">retry download</button> <button onclick="reconcileTask('${t.task_id}')">reconcile</button> <button onclick="manualTask('${t.task_id}')">need manual</button></td></tr>`).join('');
+  taskRows=await api('/api/v1/tasks?'+q.toString());renderTasks();renderAdvancedTasks();
 }
 async function loadExample(){const e=await api('/api/v1/docs/examples'); importContent.value=importFormat.value==='csv'?e.csv:JSON.stringify(e.json,null,2);}
 async function loadImportFile(){const f=importFile.files[0]; if(!f) return; importContent.value=await f.text(); importFormat.value=f.name.toLowerCase().endsWith('.json')?'json':'csv';}
@@ -764,9 +802,7 @@ async function manualTask(id){await api(`/api/v1/tasks/${id}/need-manual`,{metho
 async function detail(id){alert(JSON.stringify(await api(`/api/v1/tasks/${id}`),null,2))}
 async function exportTasks(){const rows=await api('/api/v1/tasks'); const blob=new Blob([JSON.stringify(rows,null,2)],{type:'application/json'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='flow-gateway-tasks.json'; a.click();}
 async function loadNodes(){
-  const rows=await api('/api/v1/nodes');
-  nodesTable.innerHTML='<tr><th>account</th><th>worker</th><th>cdp</th><th>pids</th><th>runtime</th><th>extension</th><th>oauth/quota</th><th>credits</th><th>current task</th><th>enabled</th><th>paused/cooldown</th><th>error</th><th>actions</th></tr>'+
-    rows.map(n=>`<tr>${td(n.account_id)}${td(`${n.worker_host}:${n.worker_port}<br>ws ${n.extension_ws_port||''}`)}${td(`${n.cdp_host}:${n.cdp_port}`)}${td(`worker ${n.worker_pid||''}<br>chrome ${n.chrome_pid||''}`)}${td(n.worker_status)}${td(n.extension_status)}${td(`${n.oauth_status||''}<br>${n.quota_confidence||''}`)}${td(n.credits)}${td(n.current_task_id)}${td(n.enabled)}${td(`${n.manual_paused?'paused':''}<br>${n.cooldown_until||''}`)}${td(n.last_gateway_error||n.last_error||'')}<td><button onclick="startNode('${n.account_id}')">start</button> <button onclick="stopNode('${n.account_id}')">stop</button> <button onclick="restartNode('${n.account_id}')">restart</button> <button onclick="refreshNodeSession('${n.account_id}')">refresh session</button> <button onclick="checkLoginEnable('${n.account_id}')">Check Login & Enable</button> <button onclick="enableNode('${n.account_id}')">enable</button> <button onclick="disableNode('${n.account_id}')">disable</button> <button onclick="editNode('${n.account_id}',${n.worker_port},${n.cdp_port})">edit ports</button> <button onclick="nodeDetail('${n.account_id}')">diagnostics</button></td></tr>`).join('');
+  nodeRows=await api('/api/v1/nodes');renderAccounts();renderAdvanced();
 }
 function showNodeResult(message, isError){
   nodeResult.className=isError?'error':'ok';
@@ -877,6 +913,7 @@ async function disableNode(id){nodeResult.textContent=JSON.stringify(await api(`
 async function editNode(id,oldWorker,oldCdp){const worker=prompt('worker port',oldWorker); if(!worker) return; const cdp=prompt('cdp port',oldCdp); if(!cdp) return; nodeResult.textContent=JSON.stringify(await api(`/api/v1/nodes/${id}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({worker_port:Number(worker),cdp_port:Number(cdp)})}),null,2); await refresh()}
 async function nodeDetail(id){nodeResult.textContent=JSON.stringify(await api(`/api/v1/nodes/${id}`),null,2)}
 refresh();
+setInterval(refresh,15000);
 </script>
 </body>
 </html>
