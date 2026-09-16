@@ -8,12 +8,12 @@
         {
           "header": "Referer",
           "operation": "set",
-          "value": "https://labs.google/"
+          "value": "https://flow.google.com/"
         },
         {
           "header": "Origin",
           "operation": "set",
-          "value": "https://labs.google"
+          "value": "https://flow.google.com"
         }
       ]
     },

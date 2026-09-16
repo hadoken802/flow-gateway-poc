@@ -7,6 +7,12 @@
 
 const DEFAULT_ACCOUNT_ID = '';
 const DEFAULT_AGENT_WS_URL = '';
+const FLOW_URL = 'https://flow.google.com/';
+const FLOW_TAB_PATTERNS = [
+  'https://flow.google.com/*',
+  'https://labs.google/fx/tools/flow*',
+  'https://labs.google/fx/*/tools/flow*',
+];
 const KEEPALIVE_INTERVAL_MS = 20000;
 // NOTE: This is a browser-restricted public API key — safe to ship in extension bundles.
 const API_KEY = '';
@@ -205,7 +211,7 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
       ws.send(JSON.stringify({ type: 'token_captured', flowKey }));
     }
   },
-  { urls: ['https://aisandbox-pa.googleapis.com/*', 'https://labs.google/*'] },
+  { urls: ['https://aisandbox-pa.googleapis.com/*', 'https://flow.google.com/*', 'https://labs.google/*'] },
   ['requestHeaders', 'extraHeaders'],
 );
 
@@ -213,7 +219,7 @@ let _openingFlowTab = false;
 
 async function captureTokenFromFlowTab() {
   const tabs = await chrome.tabs.query({
-    url: ['https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*'],
+    url: FLOW_TAB_PATTERNS,
   });
   if (!tabs.length) {
     if (_openingFlowTab) {
@@ -223,10 +229,10 @@ async function captureTokenFromFlowTab() {
     _openingFlowTab = true;
     try {
       console.log('[FlowAgent] No Flow tab found — opening one in background');
-      await chrome.tabs.create({ url: 'https://labs.google/fx/tools/flow', active: false });
+      await chrome.tabs.create({ url: FLOW_URL, active: false });
       await sleep(3000);
       const retryTabs = await chrome.tabs.query({
-        url: ['https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*'],
+        url: FLOW_TAB_PATTERNS,
       });
       if (!retryTabs.length) {
         console.log('[FlowAgent] Flow tab not ready yet after open');
@@ -489,17 +495,17 @@ async function requestCaptchaFromTab(tabId, requestId, pageAction) {
 
 async function solveCaptcha(requestId, captchaAction) {
   const tabs = await chrome.tabs.query({
-    url: ['https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*'],
+    url: FLOW_TAB_PATTERNS,
   });
 
   if (!tabs.length) {
     // Auto-open Flow tab and wait briefly before returning error
     try {
-      await chrome.tabs.create({ url: 'https://labs.google/fx/tools/flow', active: false });
+      await chrome.tabs.create({ url: FLOW_URL, active: false });
       await sleep(3000);
       // Retry tab query after opening
       const retryTabs = await chrome.tabs.query({
-        url: ['https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*'],
+        url: FLOW_TAB_PATTERNS,
       });
       if (!retryTabs.length) return { error: 'NO_FLOW_TAB' };
       const resp = await Promise.race([
@@ -816,13 +822,13 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
 
   if (msg.type === 'OPEN_FLOW_TAB') {
     chrome.tabs.query({
-      url: ['https://labs.google/fx/tools/flow*', 'https://labs.google/fx/*/tools/flow*'],
+      url: FLOW_TAB_PATTERNS,
     }).then((tabs) => {
       if (tabs.length) {
         chrome.tabs.update(tabs[0].id, { active: true });
         reply({ ok: true, tabId: tabs[0].id });
       } else {
-        chrome.tabs.create({ url: 'https://labs.google/fx/tools/flow' })
+        chrome.tabs.create({ url: FLOW_URL })
           .then((tab) => reply({ ok: true, tabId: tab.id }))
           .catch((e) => reply({ error: e.message }));
       }

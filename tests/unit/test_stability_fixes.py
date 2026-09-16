@@ -1,7 +1,21 @@
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
+
+
+def test_extension_supports_current_flow_google_domain():
+    manifest = json.loads(Path("extension/manifest.json").read_text(encoding="utf-8"))
+    background = Path("extension/background.js").read_text(encoding="utf-8")
+    rules = json.loads(Path("extension/rules.json").read_text(encoding="utf-8"))
+
+    assert "https://flow.google.com/*" in manifest["host_permissions"]
+    assert any("https://flow.google.com/*" in item["matches"] for item in manifest["content_scripts"])
+    assert "https://flow.google.com/*" in background
+    assert "https://flow.google.com" in background
+    assert rules[0]["action"]["requestHeaders"][0]["value"] == "https://flow.google.com/"
+    assert rules[0]["action"]["requestHeaders"][1]["value"] == "https://flow.google.com"
 
 
 def test_extension_http_callback_does_not_use_ws_port():

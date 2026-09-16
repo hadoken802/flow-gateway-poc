@@ -30,7 +30,7 @@ from .port_allocator import port_can_bind, port_is_listening
 from .registry import AccountRecord, AccountRegistry
 
 
-FLOW_URL = "https://labs.google/fx/tools/flow"
+FLOW_URL = "https://flow.google.com/"
 PYTHON_EXE = POC_ROOT / ".venv" / "Scripts" / "python.exe"
 MANAGED_CFT_VERSION = "151.0.7922.47"
 MANAGED_CFT_CHROME = POC_ROOT / "browsers" / "chrome-for-testing" / MANAGED_CFT_VERSION / "chrome-win64" / "chrome.exe"

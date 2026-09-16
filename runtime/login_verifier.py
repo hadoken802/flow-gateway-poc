@@ -15,7 +15,7 @@ from .registry import AccountRegistry
 
 
 LOGIN_HOSTS = {"accounts.google.com"}
-FLOW_HOSTS = {"labs.google", "aitestkitchen.withgoogle.com"}
+FLOW_HOSTS = {"flow.google.com", "labs.google", "aitestkitchen.withgoogle.com"}
 LOGIN_TEXT_MARKERS = (
     "sign in",
     "choose an account",
@@ -297,6 +297,8 @@ class LoginVerifier:
 
     def _is_flow_target(self, target: dict) -> bool:
         parsed = urlparse(str(target.get("url") or ""))
+        if parsed.scheme == "https" and parsed.netloc.lower() == "flow.google.com":
+            return parsed.path == "/" or parsed.path.startswith("/project/")
         return (
             parsed.scheme == "https"
             and parsed.netloc.lower() == "labs.google"

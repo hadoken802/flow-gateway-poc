@@ -184,6 +184,16 @@ def test_localized_flow_urls_are_recognized(tmp_path):
     assert all(verifier._is_flow_target({"url": url}) for url in urls)
 
 
+def test_current_flow_google_urls_are_recognized(tmp_path):
+    urls = [
+        "https://flow.google.com/",
+        "https://flow.google.com/project/4dee7682-7be4-4016-b5e0-8d1873626171",
+    ]
+    verifier, _, _ = make_verifier(tmp_path, {"account_id": "FLOW-005", "extension_connected": True}, [])
+
+    assert all(verifier._is_flow_target({"url": url}) for url in urls)
+
+
 def test_non_flow_urls_are_not_recognized(tmp_path):
     urls = [
         "https://accounts.google.com/",

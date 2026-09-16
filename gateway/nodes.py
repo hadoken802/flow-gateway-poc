@@ -21,7 +21,7 @@ from . import crud
 from .worker_provider import WorkerConfig
 
 
-FLOW_URL = "https://labs.google/fx/tools/flow"
+FLOW_URL = "https://flow.google.com/"
 
 
 def examples() -> dict:
@@ -415,7 +415,7 @@ async def _open_or_refresh_flow_page(cdp_port: int) -> dict:
         for page in pages if isinstance(pages, list) else []:
             page_id = page.get("id")
             url = page.get("url") or ""
-            if page_id and "labs.google" in url and "/flow" in url:
+            if page_id and ("flow.google.com" in url or ("labs.google" in url and "/flow" in url)):
                 await client.put(f"{base}/json/activate/{quote(page_id, safe='')}")
                 return {"ok": True, "stage": "activated_existing_page", "page_id": page_id}
         response = await client.put(f"{base}/json/new?{quote(FLOW_URL, safe=':/?=&')}")
