@@ -711,18 +711,18 @@ TASK_CENTER_HTML = """
       <div class="advanced-card">
         <h3>节点配置</h3>
         <div class="row">
-          <input id="nodeAccountId" placeholder="Account ID"><input id="nodeDisplayName" placeholder="Display Name">
-          <input id="nodeWorkerHost" placeholder="Worker Host" value="127.0.0.1"><input id="nodeWorkerPort" placeholder="Worker Port">
-          <input id="nodeCdpHost" placeholder="CDP Host" value="127.0.0.1"><input id="nodeCdpPort" placeholder="CDP Port">
-          <label><input id="nodeEnabled" type="checkbox"> Enabled</label>
-          <button id="addNodeButton" type="button" class="primary" onclick="addNode()">Add Node</button>
-          <button onclick="quickPreviewNode()">Preview Quick Add</button><button onclick="loadNodeExample()">Load Node Example</button><button onclick="importNodes()">Import Nodes</button>
+          <input id="nodeAccountId" placeholder="账号编号"><input id="nodeDisplayName" placeholder="显示名称">
+          <input id="nodeWorkerHost" placeholder="Worker 地址" value="127.0.0.1"><input id="nodeWorkerPort" placeholder="Worker 端口">
+          <input id="nodeCdpHost" placeholder="CDP 地址" value="127.0.0.1"><input id="nodeCdpPort" placeholder="CDP 端口">
+          <label><input id="nodeEnabled" type="checkbox"> 启用</label>
+          <button id="addNodeButton" type="button" class="primary" onclick="addNode()">添加节点</button>
+          <button onclick="quickPreviewNode()">预览快速添加</button><button onclick="loadNodeExample()">加载节点示例</button><button onclick="importNodes()">导入节点</button>
         </div>
-        <textarea id="nodeImportContent" placeholder="CSV or JSON node config"></textarea>
+        <textarea id="nodeImportContent" placeholder="CSV 或 JSON 节点配置"></textarea>
       </div>
       <div class="advanced-card">
         <h3>任务管理</h3>
-        <div class="row"><input id="filterStatus" placeholder="status"><input id="filterBatch" placeholder="batch_id"><input id="filterAccount" placeholder="account_id"><button onclick="loadTasks()">刷新</button><button onclick="exportTasks()">导出</button></div>
+        <div class="row"><input id="filterStatus" placeholder="任务状态"><input id="filterBatch" placeholder="批次编号"><input id="filterAccount" placeholder="账号编号"><button onclick="loadTasks()">刷新</button><button onclick="exportTasks()">导出</button></div>
         <table id="tasks"></table>
       </div>
       <div class="advanced-card">
@@ -756,7 +756,7 @@ function accountState(account,node){
   if(node&&(!node.worker_online||worker==='offline')||status==='offline')return {key:'offline',label:'离线',tone:'danger'};
   if(oauth.includes('oauth')||oauth.includes('login')||node?.extension_status==='extension_missing')return {key:'login',label:'需要登录',tone:'warn'};
   if(node&&oauth!=='live'&&oauth!=='unknown'&&oauth)return {key:'oauth',label:'OAuth 异常',tone:'danger'};
-  if(status==='ready'||status==='busy')return {key:'ready',label:status==='busy'?'生成中':'Ready',tone:''};
+  if(status==='ready'||status==='busy')return {key:'ready',label:status==='busy'?'生成中':'正常',tone:''};
   return {key:'other',label:status||worker||'未知',tone:'warn'};
 }
 function accountAction(id,state){if(state.key==='login'||state.key==='oauth')return `<button onclick="refreshNodeSession('${esc(id)}')">${state.key==='oauth'?'重新登录':'登录'}</button>`;if(state.key==='offline')return `<button onclick="startNode('${esc(id)}')">启动</button>`;return ''}
@@ -772,11 +772,11 @@ function toggleAllTasks(){showAllTasks=!showAllTasks;renderTasks()}
 function toggleQuickAdd(){quickAddPanel.classList.toggle('open');if(quickAddPanel.classList.contains('open'))quickFlowNumber.focus()}
 async function showTaskReason(id){const data=await api(`/api/v1/tasks/${id}`),t=data.task||data;alert(t.error_message||t.last_error_message||t.error_code||t.last_error_category||'没有可用的失败原因')}
 function renderAdvanced(){
-  accounts.innerHTML='<tr><th>account</th><th>status</th><th>credits</th><th>reserved</th><th>health</th><th>current_task</th><th>cooldown</th><th>weight</th><th>actions</th></tr>'+accountRows.map(a=>`<tr>${td(a.account_id)}${td(a.status)}${td(a.credits)}${td(a.reserved_credits)}${td(a.health_score)}${td(a.current_task_id)}${td(a.cooldown_until)}${td(a.account_weight)}<td><button onclick="pauseAccount('${a.account_id}')">pause</button> <button onclick="resumeAccount('${a.account_id}')">resume</button> <button onclick="cooldownAccount('${a.account_id}')">cooldown</button> <button onclick="clearCooldown('${a.account_id}')">clear</button> <button onclick="setWeight('${a.account_id}')">weight</button> <button onclick="setCredits('${a.account_id}')">credits</button></td></tr>`).join('');
-  nodesTable.innerHTML='<tr><th>account</th><th>worker</th><th>cdp/ws</th><th>PID</th><th>runtime</th><th>OAuth</th><th>account_match / ownership</th><th>quota_confidence</th><th>enabled</th><th>actions</th></tr>'+nodeRows.map(n=>`<tr>${td(n.account_id)}${td(`${n.worker_host}:${n.worker_port}`)}${td(`${n.cdp_host}:${n.cdp_port}<br>ws ${n.extension_ws_port||''}`)}${td(`worker ${n.worker_pid||''}<br>chrome ${n.chrome_pid||''}`)}${td(n.worker_status)}${td(n.oauth_status)}${td(`${n.runtime?.account_match??''}<br>${n.runtime?.ownership_status||n.runtime?.worker_ownership_verified||''}`)}${td(n.quota_confidence)}${td(n.enabled)}<td><button onclick="startNode('${n.account_id}')">start</button> <button onclick="stopNode('${n.account_id}')">stop</button> <button onclick="restartNode('${n.account_id}')">restart</button> <button onclick="refreshNodeSession('${n.account_id}')">refresh session</button> <button onclick="checkLoginEnable('${n.account_id}')">Check Login & Enable</button> <button onclick="enableNode('${n.account_id}')">enable</button> <button onclick="disableNode('${n.account_id}')">disable</button> <button onclick="editNode('${n.account_id}',${n.worker_port},${n.cdp_port})">edit ports</button> <button onclick="nodeDetail('${n.account_id}')">diagnostics</button></td></tr>`).join('');
+  accounts.innerHTML='<tr><th>账号</th><th>状态</th><th>积分</th><th>预留积分</th><th>健康度</th><th>当前任务</th><th>冷却截止</th><th>权重</th><th>操作</th></tr>'+accountRows.map(a=>`<tr>${td(a.account_id)}${td(a.status)}${td(a.credits)}${td(a.reserved_credits)}${td(a.health_score)}${td(a.current_task_id)}${td(a.cooldown_until)}${td(a.account_weight)}<td><button onclick="pauseAccount('${a.account_id}')">暂停</button> <button onclick="resumeAccount('${a.account_id}')">恢复</button> <button onclick="cooldownAccount('${a.account_id}')">设置冷却</button> <button onclick="clearCooldown('${a.account_id}')">清除冷却</button> <button onclick="setWeight('${a.account_id}')">设置权重</button> <button onclick="setCredits('${a.account_id}')">设置积分</button></td></tr>`).join('');
+  nodesTable.innerHTML='<tr><th>账号</th><th>Worker</th><th>CDP/WS</th><th>进程</th><th>运行状态</th><th>OAuth</th><th>账号匹配 / 所有权</th><th>额度可信度</th><th>已启用</th><th>操作</th></tr>'+nodeRows.map(n=>`<tr>${td(n.account_id)}${td(`${n.worker_host}:${n.worker_port}`)}${td(`${n.cdp_host}:${n.cdp_port}<br>WS ${n.extension_ws_port||''}`)}${td(`Worker ${n.worker_pid||''}<br>Chrome ${n.chrome_pid||''}`)}${td(n.worker_status)}${td(n.oauth_status)}${td(`${n.runtime?.account_match??''}<br>${n.runtime?.ownership_status||n.runtime?.worker_ownership_verified||''}`)}${td(n.quota_confidence)}${td(n.enabled)}<td><button onclick="startNode('${n.account_id}')">启动</button> <button onclick="stopNode('${n.account_id}')">停止</button> <button onclick="restartNode('${n.account_id}')">重启</button> <button onclick="refreshNodeSession('${n.account_id}')">刷新登录</button> <button onclick="checkLoginEnable('${n.account_id}')">检查登录并启用</button> <button onclick="enableNode('${n.account_id}')">启用</button> <button onclick="disableNode('${n.account_id}')">停用</button> <button onclick="editNode('${n.account_id}',${n.worker_port},${n.cdp_port})">编辑端口</button> <button onclick="nodeDetail('${n.account_id}')">诊断</button></td></tr>`).join('');
   renderAdvancedTasks();
 }
-function renderAdvancedTasks(){tasks.innerHTML='<tr><th>task_id</th><th>external</th><th>batch</th><th>status</th><th>account</th><th>job</th><th>project</th><th>gen</th><th>dl</th><th>output</th><th>error</th><th>actions</th></tr>'+taskRows.map(t=>`<tr>${td(`<code>${t.task_id}</code>`)}${td(t.external_task_id)}${td(t.batch_id)}${td(t.status)}${td(t.assigned_account_id||t.account_id)}${td(t.worker_job_id)}${td(t.project_id)}${td(t.generation_attempts)}${td(t.download_attempts)}${td(t.video_path||((t.output_directory||'')+'/'+(t.output_filename||'')))}${td(t.error_code||t.last_error_category||'')}<td><button onclick="detail('${t.task_id}')">detail</button> <button onclick="pauseTask('${t.task_id}')">pause</button> <button onclick="resumeTask('${t.task_id}')">resume</button> <button onclick="cancelTask('${t.task_id}')">cancel</button> <button onclick="priorityTask('${t.task_id}')">priority</button> <button onclick="requeueTask('${t.task_id}')">requeue</button> <button onclick="retryDownload('${t.task_id}')">retry download</button> <button onclick="reconcileTask('${t.task_id}')">reconcile</button> <button onclick="manualTask('${t.task_id}')">need manual</button></td></tr>`).join('')}
+function renderAdvancedTasks(){tasks.innerHTML='<tr><th>任务编号</th><th>外部编号</th><th>批次</th><th>状态</th><th>账号</th><th>Worker 任务</th><th>项目</th><th>生成次数</th><th>下载次数</th><th>输出</th><th>错误</th><th>操作</th></tr>'+taskRows.map(t=>`<tr>${td(`<code>${t.task_id}</code>`)}${td(t.external_task_id)}${td(t.batch_id)}${td(t.status)}${td(t.assigned_account_id||t.account_id)}${td(t.worker_job_id)}${td(t.project_id)}${td(t.generation_attempts)}${td(t.download_attempts)}${td(t.video_path||((t.output_directory||'')+'/'+(t.output_filename||'')))}${td(t.error_code||t.last_error_category||'')}<td><button onclick="detail('${t.task_id}')">详情</button> <button onclick="pauseTask('${t.task_id}')">暂停</button> <button onclick="resumeTask('${t.task_id}')">恢复</button> <button onclick="cancelTask('${t.task_id}')">取消</button> <button onclick="priorityTask('${t.task_id}')">优先级</button> <button onclick="requeueTask('${t.task_id}')">重新排队</button> <button onclick="retryDownload('${t.task_id}')">重试下载</button> <button onclick="reconcileTask('${t.task_id}')">校准</button> <button onclick="manualTask('${t.task_id}')">转人工</button></td></tr>`).join('')}
 async function loadAccounts(){accountRows=await api('/api/v1/accounts');renderAccounts();renderAdvanced()}
 async function loadTasks(){
   const q=new URLSearchParams(); if(filterStatus.value) q.set('status',filterStatus.value); if(filterBatch.value) q.set('batch_id',filterBatch.value); if(filterAccount.value) q.set('account_id',filterAccount.value);
@@ -787,14 +787,14 @@ async function loadImportFile(){const f=importFile.files[0]; if(!f) return; impo
 async function importTasks(){try{const format=importFormat.value; const content=importContent.value; importResult.textContent=JSON.stringify(await api('/api/v1/tasks/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({format,content})}),null,2); await refresh();}catch(e){importResult.textContent=e.message}}
 async function pauseAccount(id){await api(`/api/pool/accounts/${id}/pause`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}); await refresh()}
 async function resumeAccount(id){await api(`/api/pool/accounts/${id}/resume`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}); await refresh()}
-async function cooldownAccount(id){const seconds=prompt('cooldown seconds','300'); if(!seconds) return; await api(`/api/pool/accounts/${id}/cooldown`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({seconds:Number(seconds),reason:'task_center'})}); await refresh()}
+async function cooldownAccount(id){const seconds=prompt('冷却秒数','300'); if(!seconds) return; await api(`/api/pool/accounts/${id}/cooldown`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({seconds:Number(seconds),reason:'task_center'})}); await refresh()}
 async function clearCooldown(id){await api(`/api/pool/accounts/${id}/cooldown/clear`,{method:'POST'}); await refresh()}
-async function setWeight(id){const weight=prompt('account weight','1'); if(!weight) return; await api(`/api/pool/accounts/${id}/weight`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({account_weight:Number(weight)})}); await refresh()}
-async function setCredits(id){const credits=prompt('credits'); if(!credits) return; await api(`/api/pool/accounts/${id}/credits`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({credits:Number(credits),source:'task_center'})}); await refresh()}
+async function setWeight(id){const weight=prompt('账号权重','1'); if(!weight) return; await api(`/api/pool/accounts/${id}/weight`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({account_weight:Number(weight)})}); await refresh()}
+async function setCredits(id){const credits=prompt('账号积分'); if(!credits) return; await api(`/api/pool/accounts/${id}/credits`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({credits:Number(credits),source:'task_center'})}); await refresh()}
 async function pauseTask(id){await api(`/api/v1/tasks/${id}/pause`,{method:'POST'}); await loadTasks()}
 async function resumeTask(id){await api(`/api/v1/tasks/${id}/resume`,{method:'POST'}); await loadTasks()}
 async function cancelTask(id){await api(`/api/v1/tasks/${id}/cancel`,{method:'POST'}); await loadTasks()}
-async function priorityTask(id){const priority=prompt('priority'); if(priority===null) return; await api(`/api/v1/tasks/${id}/priority`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({priority:Number(priority)})}); await loadTasks()}
+async function priorityTask(id){const priority=prompt('任务优先级'); if(priority===null) return; await api(`/api/v1/tasks/${id}/priority`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({priority:Number(priority)})}); await loadTasks()}
 async function requeueTask(id){await api(`/api/v1/tasks/${id}/requeue`,{method:'POST'}); await loadTasks()}
 async function retryDownload(id){alert(JSON.stringify(await api(`/api/v1/tasks/${id}/retry-download`,{method:'POST'}),null,2))}
 async function reconcileTask(id){alert(JSON.stringify(await api(`/api/v1/tasks/${id}/reconcile`,{method:'POST'}),null,2))}
@@ -830,8 +830,8 @@ async function quickCreateLogin(){
   const button=document.getElementById('quickAddButton');
   button.disabled=true;
   const oldText=button.textContent;
-  button.textContent='Creating...';
-  showNodeResult('Creating node and opening login window...', false);
+  button.textContent='正在创建…';
+  showNodeResult('正在创建账号并打开登录窗口…', false);
   try{
     const r=await fetch('/api/v1/nodes/quick-create-login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(quickPayload())});
     const text=await r.text();
@@ -842,7 +842,7 @@ async function quickCreateLogin(){
       showNodeResult(`Quick Add failed: HTTP ${r.status}\n${JSON.stringify(data,null,2)}`, true);
       return;
     }
-    showNodeResult(`${data.preview.account_id}: Waiting for manual Google/Flow login`, false);
+    showNodeResult(`${data.preview.account_id}：等待手动登录 Google/Flow`, false);
     await refresh();
   }catch(e){
     showNodeResult(`Quick Add failed before response\n${e.message}`, true);
@@ -868,8 +868,8 @@ async function addNode(){
   }
   button.disabled=true;
   const oldText=button.textContent;
-  button.textContent='Adding...';
-  showNodeResult('Submitting node...', false);
+  button.textContent='正在添加…';
+  showNodeResult('正在提交节点…', false);
   try{
     const r=await fetch('/api/v1/nodes',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
     const text=await r.text();
@@ -910,7 +910,7 @@ async function refreshNodeSession(id){nodeResult.textContent=JSON.stringify(awai
 async function checkLoginEnable(id){nodeResult.textContent=JSON.stringify(await api(`/api/v1/nodes/${id}/check-login-enable`,{method:'POST'}),null,2); await refresh()}
 async function enableNode(id){nodeResult.textContent=JSON.stringify(await api(`/api/v1/nodes/${id}/enable`,{method:'POST'}),null,2); await refresh()}
 async function disableNode(id){nodeResult.textContent=JSON.stringify(await api(`/api/v1/nodes/${id}/disable`,{method:'POST'}),null,2); await refresh()}
-async function editNode(id,oldWorker,oldCdp){const worker=prompt('worker port',oldWorker); if(!worker) return; const cdp=prompt('cdp port',oldCdp); if(!cdp) return; nodeResult.textContent=JSON.stringify(await api(`/api/v1/nodes/${id}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({worker_port:Number(worker),cdp_port:Number(cdp)})}),null,2); await refresh()}
+async function editNode(id,oldWorker,oldCdp){const worker=prompt('Worker 端口',oldWorker); if(!worker) return; const cdp=prompt('CDP 端口',oldCdp); if(!cdp) return; nodeResult.textContent=JSON.stringify(await api(`/api/v1/nodes/${id}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({worker_port:Number(worker),cdp_port:Number(cdp)})}),null,2); await refresh()}
 async function nodeDetail(id){nodeResult.textContent=JSON.stringify(await api(`/api/v1/nodes/${id}`),null,2)}
 refresh();
 setInterval(refresh,15000);
