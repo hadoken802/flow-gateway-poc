@@ -324,11 +324,13 @@ async def open_login(scheduler, account_id: str, registry: AccountRegistry | Non
     if not account:
         return None
     manager = manager or RuntimeManager(registry)
+    worker = await asyncio.to_thread(manager.start_worker_only, account_id)
     chrome = await asyncio.to_thread(manager.open_login, account_id)
     cdp = await _open_or_refresh_flow_page(account.chrome_cdp_port)
     return {
-        "ok": bool(chrome.ok),
+        "ok": bool(worker.ok and chrome.ok),
         "account_id": account_id,
+        "worker": worker.to_dict(),
         "chrome": chrome.to_dict(),
         "cdp": cdp,
         "node": await get_node(scheduler, account_id, registry, manager),

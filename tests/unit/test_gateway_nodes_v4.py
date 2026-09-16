@@ -181,8 +181,10 @@ async def test_open_login_opens_account_chrome_and_flow_page(monkeypatch, gatewa
     result = await nodes.open_login(scheduler, "FLOW-004", registry, manager)
 
     assert result["ok"] is True
+    assert manager.started == ["FLOW-004"]
     assert manager.opened == ["FLOW-004"]
     assert opened_ports == [9303]
+    assert result["worker"]["result"] == "already_running"
     assert result["chrome"]["result"] == "opened"
 
 

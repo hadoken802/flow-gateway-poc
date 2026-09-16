@@ -760,14 +760,16 @@ function cooldownRemaining(value){const end=Date.parse(value);if(!value||Number.
 function accountState(account,node){
   const cooldown=cooldownRemaining(account?.cooldown_until||node?.cooldown_until);if(cooldown)return {key:'cooldown',label:`冷却中 · 剩余 ${cooldown}`,tone:'warn'};
   const status=String(account?.status||'').toLowerCase(), worker=String(node?.worker_status||'').toLowerCase(), oauth=String(node?.oauth_status||'').toLowerCase();
+  if(node&&!node.worker_online)return {key:'offline',label:'本地服务未启动',tone:'danger'};
+  if(status==='offline')return {key:'offline',label:'离线',tone:'danger'};
+  if(node?.extension_connected&&node?.runtime?.account_match&&(account?.quota_confidence==='stale'||oauth.includes('credits_http_')))return {key:'quota',label:'登录正常，额度验证失败',tone:'warn'};
   if(status==='needs_login')return {key:'login',label:'需要登录',tone:'warn'};
-  if(node&&(!node.worker_online||worker==='offline')||status==='offline')return {key:'offline',label:'离线',tone:'danger'};
   if(oauth.includes('oauth')||oauth.includes('login')||node?.extension_status==='extension_missing')return {key:'login',label:'需要登录',tone:'warn'};
   if(node&&oauth!=='live'&&oauth!=='unknown'&&oauth)return {key:'oauth',label:'OAuth 异常',tone:'danger'};
   if(status==='ready'||status==='busy')return {key:'ready',label:status==='busy'?'生成中':'正常',tone:''};
   return {key:'other',label:status||worker||'未知',tone:'warn'};
 }
-function accountAction(id,state){if(state.key==='login'||state.key==='oauth')return `<button onclick="openNodeLogin('${esc(id)}',this)">${state.key==='oauth'?'重新登录':'登录'}</button>`;if(state.key==='offline')return `<button onclick="startNode('${esc(id)}')">启动</button>`;return ''}
+function accountAction(id,state){if(state.key==='login'||state.key==='oauth')return `<button onclick="openNodeLogin('${esc(id)}',this)">${state.key==='oauth'?'重新登录':'登录'}</button>`;if(state.key==='quota')return `<button onclick="refreshNodeSession('${esc(id)}')">重新验证</button>`;if(state.key==='offline')return `<button onclick="startNode('${esc(id)}')">启动</button>`;return ''}
 function renderAccounts(){
   const rows=mergedAccounts();accountSummary.textContent=`${rows.length} 个账号`;
   accountList.innerHTML='<div class="list-row list-head"><span>账号</span><span>状态</span><span>积分</span><span></span></div>'+(rows.length?rows.map(([id,v])=>{const state=accountState(v.account,v.node),credits=v.account?.credits??v.node?.credits??'—';return `<div class="list-row"><strong>${esc(id)}</strong><span class="state"><i class="dot ${state.tone}"></i>${esc(state.label)}</span><span class="credits">${esc(credits)}</span><span>${accountAction(id,state)}</span></div>`}).join(''):'<div class="empty">暂无账号</div>');
