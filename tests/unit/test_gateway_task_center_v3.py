@@ -149,3 +149,6 @@ def test_account_node_add_form_maps_fields_and_reports_results():
     assert "POST /api/v1/nodes failed" in TASK_CENTER_HTML
     assert "await loadNodes();" in TASK_CENTER_HTML
     assert 'onclick="openNodeLogin(' in TASK_CENTER_HTML
+    assert "浏览器扩展未连接" in TASK_CENTER_HTML
+    assert "登录账号不匹配" in TASK_CENTER_HTML
+    assert "登录正常，额度验证失败" in TASK_CENTER_HTML
