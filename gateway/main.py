@@ -418,6 +418,14 @@ async def v1_restart_node(account_id: str):
     return result
 
 
+@app.post("/api/v1/nodes/{account_id}/open-login")
+async def v1_open_node_login(account_id: str):
+    result = await nodes.open_login(scheduler, account_id)
+    if not result:
+        raise HTTPException(404, "Node not found")
+    return result
+
+
 @app.post("/api/v1/nodes/{account_id}/refresh-session")
 async def v1_refresh_node_session(account_id: str):
     result = await nodes.refresh_session(scheduler, account_id)
@@ -759,7 +767,7 @@ function accountState(account,node){
   if(status==='ready'||status==='busy')return {key:'ready',label:status==='busy'?'生成中':'正常',tone:''};
   return {key:'other',label:status||worker||'未知',tone:'warn'};
 }
-function accountAction(id,state){if(state.key==='login'||state.key==='oauth')return `<button onclick="refreshNodeSession('${esc(id)}')">${state.key==='oauth'?'重新登录':'登录'}</button>`;if(state.key==='offline')return `<button onclick="startNode('${esc(id)}')">启动</button>`;return ''}
+function accountAction(id,state){if(state.key==='login'||state.key==='oauth')return `<button onclick="openNodeLogin('${esc(id)}',this)">${state.key==='oauth'?'重新登录':'登录'}</button>`;if(state.key==='offline')return `<button onclick="startNode('${esc(id)}')">启动</button>`;return ''}
 function renderAccounts(){
   const rows=mergedAccounts();accountSummary.textContent=`${rows.length} 个账号`;
   accountList.innerHTML='<div class="list-row list-head"><span>账号</span><span>状态</span><span>积分</span><span></span></div>'+(rows.length?rows.map(([id,v])=>{const state=accountState(v.account,v.node),credits=v.account?.credits??v.node?.credits??'—';return `<div class="list-row"><strong>${esc(id)}</strong><span class="state"><i class="dot ${state.tone}"></i>${esc(state.label)}</span><span class="credits">${esc(credits)}</span><span>${accountAction(id,state)}</span></div>`}).join(''):'<div class="empty">暂无账号</div>');
@@ -908,6 +916,7 @@ async function importNodes(){
 async function startNode(id){nodeResult.textContent=JSON.stringify(await api(`/api/v1/nodes/${id}/start`,{method:'POST'}),null,2); await refresh()}
 async function stopNode(id){nodeResult.textContent=JSON.stringify(await api(`/api/v1/nodes/${id}/stop`,{method:'POST'}),null,2); await refresh()}
 async function restartNode(id){nodeResult.textContent=JSON.stringify(await api(`/api/v1/nodes/${id}/restart`,{method:'POST'}),null,2); await refresh()}
+async function openNodeLogin(id,button){const oldText=button.textContent;button.disabled=true;button.textContent='正在打开…';nodeResult.className='muted';nodeResult.textContent=`正在打开 ${id} 的登录窗口…`;try{const data=await api(`/api/v1/nodes/${id}/open-login`,{method:'POST'});nodeResult.className=data.ok?'ok':'error';nodeResult.textContent=data.ok?`${id} 的登录窗口已打开`:`${id} 的登录窗口打开失败`;await refresh()}catch(e){nodeResult.className='error';nodeResult.textContent=`打开登录窗口失败：${e.message}`}finally{button.disabled=false;button.textContent=oldText}}
 async function refreshNodeSession(id){nodeResult.textContent=JSON.stringify(await api(`/api/v1/nodes/${id}/refresh-session`,{method:'POST'}),null,2); await refresh()}
 async function checkLoginEnable(id){nodeResult.textContent=JSON.stringify(await api(`/api/v1/nodes/${id}/check-login-enable`,{method:'POST'}),null,2); await refresh()}
 async function enableNode(id){nodeResult.textContent=JSON.stringify(await api(`/api/v1/nodes/${id}/enable`,{method:'POST'}),null,2); await refresh()}

@@ -164,6 +164,29 @@ async def test_runtime_actions_use_worker_only_and_preserve_chrome(gateway_db, r
 
 
 @pytest.mark.asyncio
+async def test_open_login_opens_account_chrome_and_flow_page(monkeypatch, gateway_db, registry):
+    from gateway import nodes
+
+    scheduler = FakeScheduler(gateway_db)
+    await nodes.create_node(scheduler, {"account_id": "FLOW-004", "worker_port": 8104, "cdp_port": 9303}, registry)
+    manager = FakeManager(registry)
+    opened_ports = []
+
+    async def fake_open_flow_page(port):
+        opened_ports.append(port)
+        return {"ok": True, "stage": "opened_flow_page"}
+
+    monkeypatch.setattr(nodes, "_open_or_refresh_flow_page", fake_open_flow_page)
+
+    result = await nodes.open_login(scheduler, "FLOW-004", registry, manager)
+
+    assert result["ok"] is True
+    assert manager.opened == ["FLOW-004"]
+    assert opened_ports == [9303]
+    assert result["chrome"]["result"] == "opened"
+
+
+@pytest.mark.asyncio
 async def test_node_list_merges_runtime_registry_and_gateway_account(gateway_db, registry):
     from gateway import nodes
 

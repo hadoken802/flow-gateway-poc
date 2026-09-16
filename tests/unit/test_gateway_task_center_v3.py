@@ -125,6 +125,7 @@ def test_v1_routes_are_registered():
     assert "/api/v1/tasks/{task_id}/retry-download" in paths
     assert "/api/v1/accounts" in paths
     assert "/api/v1/nodes" in paths
+    assert "/api/v1/nodes/{account_id}/open-login" in paths
     assert "/api/v1/nodes/{account_id}/refresh-session" in paths
     assert "/" in paths
 
@@ -147,3 +148,4 @@ def test_account_node_add_form_maps_fields_and_reports_results():
     assert "POST /api/v1/nodes returned duplicate" in TASK_CENTER_HTML
     assert "POST /api/v1/nodes failed" in TASK_CENTER_HTML
     assert "await loadNodes();" in TASK_CENTER_HTML
+    assert 'onclick="openNodeLogin(' in TASK_CENTER_HTML

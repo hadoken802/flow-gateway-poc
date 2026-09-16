@@ -318,6 +318,23 @@ async def runtime_action(scheduler, account_id: str, action: str, registry: Acco
     return {"ok": bool(result.ok), **result.to_dict(), "node": await get_node(scheduler, account_id, registry)}
 
 
+async def open_login(scheduler, account_id: str, registry: AccountRegistry | None = None, manager: RuntimeManager | None = None) -> dict | None:
+    registry = registry or AccountRegistry()
+    account = registry.get(account_id)
+    if not account:
+        return None
+    manager = manager or RuntimeManager(registry)
+    chrome = await asyncio.to_thread(manager.open_login, account_id)
+    cdp = await _open_or_refresh_flow_page(account.chrome_cdp_port)
+    return {
+        "ok": bool(chrome.ok),
+        "account_id": account_id,
+        "chrome": chrome.to_dict(),
+        "cdp": cdp,
+        "node": await get_node(scheduler, account_id, registry, manager),
+    }
+
+
 async def refresh_session(scheduler, account_id: str, registry: AccountRegistry | None = None) -> dict | None:
     registry = registry or AccountRegistry()
     account = registry.get(account_id)
