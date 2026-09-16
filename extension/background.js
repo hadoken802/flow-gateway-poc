@@ -26,6 +26,8 @@ let accountId = DEFAULT_ACCOUNT_ID;
 let wsUrl = DEFAULT_AGENT_WS_URL;
 let apiUrl = '';
 let flowKey = null;
+let pageCredits = null;
+let pageCreditsCapturedAt = null;
 let callbackSecret = null;  // Auth secret for HTTP callback, received from server on WS connect
 let state = 'off'; // off | idle | running
 let manualDisconnect = false;
@@ -155,8 +157,10 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 async function init() {
   if (initialized) return;
   initialized = true;
-  const data = await chrome.storage.local.get(['flowKey', 'metrics', 'callbackSecret', 'account_id', 'ws_url', 'api_url']);
+  const data = await chrome.storage.local.get(['flowKey', 'pageCredits', 'pageCreditsCapturedAt', 'metrics', 'callbackSecret', 'account_id', 'ws_url', 'api_url']);
   if (data.flowKey) flowKey = data.flowKey;
+  if (Number.isInteger(data.pageCredits) && data.pageCredits >= 0) pageCredits = data.pageCredits;
+  if (Number.isInteger(data.pageCreditsCapturedAt)) pageCreditsCapturedAt = data.pageCreditsCapturedAt;
   if (data.metrics) Object.assign(metrics, data.metrics);
   if (data.callbackSecret) callbackSecret = data.callbackSecret;
   accountId = data.account_id || '';
@@ -315,6 +319,13 @@ function connectToAgent() {
     if (flowKey) {
       ws.send(JSON.stringify({ type: 'token_captured', flowKey }));
     }
+    if (Number.isInteger(pageCredits)) {
+      ws.send(JSON.stringify({
+        type: 'credits_captured',
+        credits: pageCredits,
+        capturedAt: pageCreditsCapturedAt,
+      }));
+    }
   };
 
   ws.onmessage = async ({ data }) => {
@@ -324,6 +335,8 @@ function connectToAgent() {
 
       if (msg.method === 'api_request') {
         await handleApiRequest(msg);
+      } else if (msg.method === 'page_credits') {
+        await handlePageCreditsRequest(msg);
       } else if (msg.method === 'trpc_request') {
         await handleTrpcRequest(msg);
       } else if (msg.method === 'solve_captcha') {
@@ -373,6 +386,32 @@ function connectToAgent() {
     metrics.lastError = 'WS_ERROR';
     chrome.storage.local.set({ metrics });
   };
+}
+
+async function handlePageCreditsRequest(msg) {
+  try {
+    const tabs = await chrome.tabs.query({ url: FLOW_TAB_PATTERNS });
+    if (!tabs.length) {
+      fallbackToWebSocket({ id: msg.id, status: 503, error: 'NO_FLOW_TAB' });
+      return;
+    }
+    const response = await chrome.tabs.sendMessage(tabs[0].id, { type: 'GET_PAGE_CREDITS' });
+    const credits = response?.credits;
+    if (!Number.isInteger(credits) || credits < 0) {
+      fallbackToWebSocket({ id: msg.id, status: 502, error: response?.error || 'PAGE_CREDITS_INVALID' });
+      return;
+    }
+    pageCredits = credits;
+    pageCreditsCapturedAt = Date.now();
+    await chrome.storage.local.set({ pageCredits, pageCreditsCapturedAt });
+    fallbackToWebSocket({
+      id: msg.id,
+      status: 200,
+      data: { credits, creditsSource: 'flow_page', capturedAt: pageCreditsCapturedAt },
+    });
+  } catch (e) {
+    fallbackToWebSocket({ id: msg.id, status: 500, error: e.message || 'PAGE_CREDITS_FAILED' });
+  }
 }
 
 function scheduleReconnect() {

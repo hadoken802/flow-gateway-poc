@@ -58,6 +58,8 @@ class FlowClient:
         self._extension_registered = False
         self._pending: dict[str, asyncio.Future] = {}
         self._flow_key: Optional[str] = None
+        self._page_credits: Optional[int] = None
+        self._page_credits_at: Optional[int] = None
         # WS stats
         self._ws_connect_count = 0
         self._ws_disconnect_count = 0
@@ -132,6 +134,10 @@ class FlowClient:
         self._flow_key = key
 
     @property
+    def page_credits(self) -> Optional[int]:
+        return self._page_credits
+
+    @property
     def connected(self) -> bool:
         return self._extension_ws is not None and self._extension_registered
 
@@ -199,6 +205,15 @@ class FlowClient:
             self._flow_key = data.get("flowKey")
             logger.info("Flow key captured from extension")
             self._track_task(self._sync_tier())
+            return
+
+        if data.get("type") == "credits_captured":
+            credits = data.get("credits")
+            if isinstance(credits, int) and not isinstance(credits, bool) and credits >= 0:
+                self._page_credits = credits
+                captured_at = data.get("capturedAt")
+                self._page_credits_at = captured_at if isinstance(captured_at, int) else int(time.time() * 1000)
+                logger.info("Flow page credits captured: %d", credits)
             return
 
         if data.get("type") == "extension_ready":
@@ -629,6 +644,24 @@ class FlowClient:
 
     async def get_credits(self) -> dict:
         """Get user credits and tier."""
+        now_ms = int(time.time() * 1000)
+        if (
+            self._page_credits is not None
+            and self._page_credits_at is not None
+            and now_ms - self._page_credits_at < 60_000
+        ):
+            return {
+                "credits": self._page_credits,
+                "creditsSource": "flow_page",
+                "capturedAt": self._page_credits_at,
+            }
+        page_result = await self._send("page_credits", {}, timeout=10)
+        page_data = page_result.get("data", page_result)
+        page_value = page_data.get("credits") if isinstance(page_data, dict) else None
+        if isinstance(page_value, int) and not isinstance(page_value, bool) and page_value >= 0:
+            self._page_credits = page_value
+            self._page_credits_at = page_data.get("capturedAt") or now_ms
+            return page_data
         url = self._build_url("get_credits")
         return await self._send("api_request", {
             "url": url,
