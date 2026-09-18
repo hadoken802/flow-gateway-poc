@@ -1,4 +1,6 @@
 import time
+import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -39,3 +41,29 @@ def test_extension_reads_current_flow_page_credits_and_returns_over_websocket():
     assert "Google Flow" in content
     assert "msg.method === 'page_credits'" in background
     assert "fallbackToWebSocket({\n      id: msg.id,\n      status: 200" in background
+
+
+def test_extension_version_invalidates_stale_service_worker_cache():
+    manifest = json.loads(Path("extension/manifest.json").read_text(encoding="utf-8"))
+
+    assert tuple(map(int, manifest["version"].split("."))) >= (0, 2, 1)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_credit_checks_share_one_page_read(monkeypatch):
+    client = FlowClient()
+    calls = 0
+
+    async def fake_send(method, params, timeout=300, request_id=None):
+        nonlocal calls
+        assert method == "page_credits"
+        calls += 1
+        await asyncio.sleep(0.01)
+        return {"data": {"credits": 580, "creditsSource": "flow_page", "capturedAt": int(time.time() * 1000)}}
+
+    monkeypatch.setattr(client, "_send", fake_send)
+
+    first, second = await asyncio.gather(client.get_credits(), client.get_credits())
+
+    assert first["credits"] == second["credits"] == 580
+    assert calls == 1

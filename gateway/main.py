@@ -678,6 +678,10 @@ TASK_CENTER_HTML = """
     button.danger{color:#b53a3a}
     .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
     .add-row{margin-top:12px}.add-panel{display:none;margin-top:10px}.add-panel.open{display:flex}
+    .create-form{display:grid;grid-template-columns:minmax(220px,.8fr) minmax(320px,1.6fr) auto;gap:10px;align-items:start}
+    .create-form textarea{min-height:76px;margin:0;resize:vertical}
+    .file-field{display:flex;min-height:76px;align-items:center;border:1px dashed #c9d0d8;border-radius:8px;padding:10px;background:#fafbfc}
+    .submit-stack{display:grid;gap:8px;min-width:110px}.form-result{margin-top:8px;min-height:20px}
     .error{color:#b53a3a}.ok{color:#118451}pre{white-space:pre-wrap;word-break:break-word}
     details.advanced{border-top:1px solid #e8ebef;padding:18px 0}
     details.advanced>summary{cursor:pointer;font-weight:600;list-style:none;color:#4f5c69}
@@ -688,7 +692,7 @@ TASK_CENTER_HTML = """
     table{width:100%;border-collapse:collapse;font-size:12px;min-width:900px}
     th,td{border-bottom:1px solid #e4e8ed;padding:7px;text-align:left;vertical-align:top}th{color:#667382}
     code{background:#edf1f5;padding:1px 4px;border-radius:4px}
-    @media(max-width:760px){main{width:calc(100% - 28px)}.status-grid{grid-template-columns:1fr 1fr}.status-grid .metric:first-child{grid-column:1/-1}.list-row,.task-row{grid-template-columns:1fr 1fr;gap:8px}.list-head{display:none}}
+    @media(max-width:760px){main{width:calc(100% - 28px)}.status-grid{grid-template-columns:1fr 1fr}.status-grid .metric:first-child{grid-column:1/-1}.list-row,.task-row{grid-template-columns:1fr 1fr;gap:8px}.list-head{display:none}.create-form{grid-template-columns:1fr}}
   </style>
 </head>
 <body>
@@ -696,6 +700,15 @@ TASK_CENTER_HTML = """
   <header><h1>Flow Gateway</h1><span class="muted">自动刷新</span></header>
   <section>
     <div class="status-grid" id="metrics"></div>
+  </section>
+  <section>
+    <div class="section-head"><h2>创建任务</h2><span class="muted">上传一张图片并填写提示词</span></div>
+    <div class="create-form">
+      <label class="file-field"><input id="taskImage" type="file" accept="image/jpeg,image/png,image/webp"></label>
+      <textarea id="taskPrompt" placeholder="输入视频生成提示词，例如：镜头缓慢推进，主体自然轻微移动，光线柔和稳定……"></textarea>
+      <div class="submit-stack"><button id="createTaskButton" type="button" class="primary" onclick="createSimpleTask()">创建任务</button><span class="muted">默认 10 秒 · 9:16</span></div>
+    </div>
+    <div id="createTaskResult" class="form-result muted"></div>
   </section>
   <section>
     <div class="section-head"><h2>账号</h2><span class="muted" id="accountSummary"></span></div>
@@ -783,6 +796,21 @@ function zhBool(value){return value===true||value===1?'是':value===false||value
 function taskAction(t){if(t.status==='completed'&&t.video_path)return `<a class="link-button" target="_blank" href="/api/v1/client/tasks/${encodeURIComponent(t.task_id)}/download">打开视频</a>`;if(t.status==='failed'||t.error_code||t.last_error_category)return `<button onclick="showTaskReason('${esc(t.task_id)}')">查看原因</button>`;return ''}
 function renderTasks(){const newest=[...taskRows].reverse(),rows=showAllTasks?newest:newest.slice(0,8);taskList.innerHTML='<div class="list-row task-row list-head"><span>任务</span><span>状态</span><span>账号</span><span></span></div>'+(rows.length?rows.map(t=>`<div class="list-row task-row"><strong>${esc(t.name||t.external_task_id||'未命名任务')}</strong><span>${esc(taskState(t))}</span><span>${esc(t.assigned_account_id||t.account_id||'—')}</span><span>${taskAction(t)}</span></div>`).join(''):'<div class="empty">暂无任务</div>');allTasksButton.textContent=showAllTasks?'只看最近任务':'查看全部任务'}
 function toggleAllTasks(){showAllTasks=!showAllTasks;renderTasks()}
+async function createSimpleTask(){
+  const file=taskImage.files[0],promptText=taskPrompt.value.trim();
+  if(!file){createTaskResult.className='form-result error';createTaskResult.textContent='请先选择图片';return}
+  if(!promptText){createTaskResult.className='form-result error';createTaskResult.textContent='请输入提示词';return}
+  createTaskButton.disabled=true;createTaskButton.textContent='正在创建…';createTaskResult.className='form-result muted';createTaskResult.textContent='正在上传图片…';
+  try{
+    const form=new FormData();form.append('file',file);
+    const uploaded=await api('/api/v1/client/files',{method:'POST',body:form}),saved=uploaded.files?.[0];
+    if(!saved?.ok||!saved.file_id)throw new Error(saved?.error||'图片上传失败');
+    createTaskResult.textContent='正在加入队列…';
+    const task=await api('/api/v1/client/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:promptText,input_file_ids:[saved.file_id],duration:10,aspect_ratio:'9:16',external_task_id:file.name.replace(/\.[^.]+$/,'')})});
+    createTaskResult.className='form-result ok';createTaskResult.textContent=`任务已创建，状态：${taskState(task)}`;taskImage.value='';taskPrompt.value='';await refresh();
+  }catch(e){createTaskResult.className='form-result error';createTaskResult.textContent=`创建失败：${e.message}`}
+  finally{createTaskButton.disabled=false;createTaskButton.textContent='创建任务'}
+}
 function toggleQuickAdd(){quickAddPanel.classList.toggle('open');if(quickAddPanel.classList.contains('open'))quickFlowNumber.focus()}
 async function showTaskReason(id){const data=await api(`/api/v1/tasks/${id}`),t=data.task||data;alert(t.error_message||t.last_error_message||t.error_code||t.last_error_category||'没有可用的失败原因')}
 function renderAdvanced(){

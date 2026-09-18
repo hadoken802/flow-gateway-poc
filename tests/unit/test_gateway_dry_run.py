@@ -1436,6 +1436,12 @@ def test_gateway_submit_timeout_defaults_and_env_override(monkeypatch):
         GatewaySettings.from_env()
 
 
+def test_worker_inspection_allows_page_credit_read_to_exceed_health_timeout():
+    source = Path("gateway/worker_client.py").read_text(encoding="utf-8")
+
+    assert 'api/flow/credits", timeout=15.0' in source
+
+
 def test_canary_script_uses_single_run_isolated_database():
     text = Path("start_gateway_real_canary.bat").read_text(encoding="utf-8")
     assert "set POOL_MAX_CONCURRENCY=1" in text

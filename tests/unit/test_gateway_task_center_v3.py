@@ -152,3 +152,14 @@ def test_account_node_add_form_maps_fields_and_reports_results():
     assert "浏览器扩展未连接" in TASK_CENTER_HTML
     assert "登录账号不匹配" in TASK_CENTER_HTML
     assert "登录正常，额度验证失败" in TASK_CENTER_HTML
+
+
+def test_simple_task_form_uploads_image_and_creates_task():
+    from gateway.main import TASK_CENTER_HTML
+
+    assert 'id="taskImage"' in TASK_CENTER_HTML
+    assert 'id="taskPrompt"' in TASK_CENTER_HTML
+    assert 'accept="image/jpeg,image/png,image/webp"' in TASK_CENTER_HTML
+    assert "'/api/v1/client/files'" in TASK_CENTER_HTML
+    assert "'/api/v1/client/tasks'" in TASK_CENTER_HTML
+    assert "input_file_ids:[saved.file_id]" in TASK_CENTER_HTML

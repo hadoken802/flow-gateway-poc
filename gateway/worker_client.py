@@ -31,7 +31,7 @@ class WorkerClient:
             health = (await client.get(f"{worker.api_url}/health")).json()
             info = (await client.get(f"{worker.api_url}/api/worker/info")).json()
             flow_status = (await client.get(f"{worker.api_url}/api/flow/status")).json()
-            credits_response = await client.get(f"{worker.api_url}/api/flow/credits")
+            credits_response = await client.get(f"{worker.api_url}/api/flow/credits", timeout=15.0)
             credits_info = parse_worker_credits_response(credits_response)
         return {
             "status": health.get("status", "error"),
