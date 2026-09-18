@@ -67,3 +67,22 @@ async def test_concurrent_credit_checks_share_one_page_read(monkeypatch):
 
     assert first["credits"] == second["credits"] == 580
     assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_transient_page_read_failure_keeps_last_verified_credits(monkeypatch):
+    client = FlowClient()
+    client._page_credits = 580
+    client._page_credits_at = int(time.time() * 1000) - 61_000
+
+    async def fake_send(method, params, timeout=300, request_id=None):
+        assert method == "page_credits"
+        return {"status": 503, "error": "PAGE_CREDITS_NOT_FOUND"}
+
+    monkeypatch.setattr(client, "_send", fake_send)
+
+    result = await client.get_credits()
+
+    assert result["credits"] == 580
+    assert result["creditsSource"] == "flow_page_cached"
+    assert result["capturedAt"] == client._page_credits_at

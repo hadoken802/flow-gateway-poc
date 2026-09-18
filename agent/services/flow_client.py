@@ -664,6 +664,12 @@ class FlowClient:
                 self._page_credits = page_value
                 self._page_credits_at = page_data.get("capturedAt") or now_ms
                 return page_data
+            if self._page_credits is not None and self._page_credits_at is not None:
+                return {
+                    "credits": self._page_credits,
+                    "creditsSource": "flow_page_cached",
+                    "capturedAt": self._page_credits_at,
+                }
         url = self._build_url("get_credits")
         return await self._send("api_request", {
             "url": url,
