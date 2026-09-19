@@ -66,6 +66,7 @@ async def extension_status():
     return {
         "connected": client.connected,
         "flow_key_present": client._flow_key is not None,
+        "page_ui_ready": client.connected,
     }
 
 

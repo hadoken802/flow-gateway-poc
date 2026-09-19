@@ -46,6 +46,26 @@ async def test_submit_reference_video_uses_omni_flash_payload(sample_uuid):
     assert body["mediaGenerationContext"]["audioFailurePreference"] == "BLOCK_SILENCED_VIDEOS"
 
 
+@pytest.mark.asyncio
+async def test_submit_reference_video_uses_page_for_staged_uploads():
+    flow_client = type("FakeFlowClient", (), {})()
+    flow_client.submit_reference_video_ui = AsyncMock(return_value={"data": {"ok": True}})
+    client = OmniClient(flow_client)
+
+    result = await client.submit_reference_video(
+        project_id="project-123",
+        reference_media_ids=["page-upload:first", "page-upload:second"],
+        prompt="A short motion prompt",
+    )
+
+    assert result == {"data": {"ok": True}}
+    flow_client.submit_reference_video_ui.assert_awaited_once_with(
+        project_id="project-123",
+        reference_media_ids=["page-upload:first", "page-upload:second"],
+        prompt="A short motion prompt",
+    )
+
+
 def test_extract_submit_fields_reads_confirmed_omni_response(sample_uuid):
     data = {
         "remainingCredits": 503505,

@@ -102,9 +102,9 @@ async def test_worker_uploads_all_images_as_ordered_reference_media(monkeypatch,
         async def get_credits(self):
             return {"credits": 100}
 
-        async def upload_image(self, image_base64, mime_type, project_id, file_name):
+        def prepare_page_upload(self, image_bytes, mime_type, project_id, file_name):
             uploads.append(file_name)
-            return {"_mediaId": f"media-{file_name}"}
+            return {"_mediaId": f"page-upload:{file_name}"}
 
     class FakeOmni:
         def __init__(self, client):
@@ -141,8 +141,8 @@ async def test_worker_uploads_all_images_as_ordered_reference_media(monkeypatch,
         aspect_ratio="9:16",
     ))
     assert uploads == ["1.png", "2.jpg"]
-    assert submitted["reference_media_ids"] == ["media-1.png", "media-2.jpg"]
-    assert response["input_media_ids"] == ["media-1.png", "media-2.jpg"]
+    assert submitted["reference_media_ids"] == ["page-upload:1.png", "page-upload:2.jpg"]
+    assert response["input_media_ids"] == ["page-upload:1.png", "page-upload:2.jpg"]
 
 
 @pytest.mark.asyncio

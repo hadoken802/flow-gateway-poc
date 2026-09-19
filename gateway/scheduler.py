@@ -160,7 +160,9 @@ class GatewayScheduler:
                         write_credits = last_known_credits
                     if info.get("status") == "offline":
                         status = "offline"
-                    elif not info.get("extension_connected") or not info.get("flow_key_present"):
+                    elif not info.get("extension_connected") or not (
+                        info.get("flow_key_present") or info.get("page_ui_ready")
+                    ):
                         status = "needs_login"
                     elif credits is not None and credits < self.settings.omni_10s_credit_cost:
                         status = "low_credits"
@@ -1176,7 +1178,9 @@ class GatewayScheduler:
         except Exception as exc:
             await crud.release_task_for_manual_review(self.db, task_id, account_id, error_code="worker_offline", error_message=str(exc)[:500])
             return None
-        if info.get("status") == "offline" or not info.get("extension_connected") or not info.get("flow_key_present"):
+        if info.get("status") == "offline" or not info.get("extension_connected") or not (
+            info.get("flow_key_present") or info.get("page_ui_ready")
+        ):
             await crud.release_task_for_manual_review(self.db, task_id, account_id, error_code="worker_not_ready", error_message="Worker is no longer ready")
             return None
         return worker

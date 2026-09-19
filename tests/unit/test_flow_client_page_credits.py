@@ -9,6 +9,37 @@ from agent.services.flow_client import FlowClient
 
 
 @pytest.mark.asyncio
+async def test_dom_page_video_completion_routes_download_through_extension(monkeypatch):
+    client = FlowClient()
+
+    async def fake_send(method, params, timeout=300, request_id=None):
+        if method == "page_video_status":
+            return {
+                "status": 200,
+                "data": {
+                    "media": [{
+                        "name": "rendered-video-id",
+                        "mediaStatus": {"mediaGenerationStatus": "MEDIA_GENERATION_STATUS_SUCCEEDED"},
+                    }]
+                },
+            }
+        assert method == "page_video_media"
+        assert params == {"mediaId": "dom-video-id"}
+        assert timeout == 240
+        return {"status": 200, "data": {"localFilePath": "C:/Downloads/dom-video-id.mp4"}}
+
+    monkeypatch.setattr(client, "_send", fake_send)
+    client._page_video_jobs.add("dom-video-id")
+
+    status = await client.check_page_video_status("project-id", "dom-video-id")
+    media = await client.get_media("dom-video-id")
+
+    assert status["status"] == 200
+    assert status["data"]["media"][0]["name"] == "dom-video-id"
+    assert media["data"]["localFilePath"].endswith("dom-video-id.mp4")
+
+
+@pytest.mark.asyncio
 async def test_page_credits_replace_obsolete_oauth_credits_request():
     client = FlowClient()
     await client.handle_message(
@@ -66,7 +97,7 @@ async def test_create_project_uses_authenticated_flow_page(monkeypatch):
 
     result = await client.create_project("测试项目")
 
-    assert calls == [("page_create_project", {"projectTitle": "测试项目", "toolName": "PINHOLE"}, 75)]
+    assert calls == [("page_create_project", {"projectTitle": "测试项目", "toolName": "PINHOLE"}, 120)]
     assert result["data"]["result"]["data"]["json"]["result"]["projectId"] == "eb7ee09c-bd8d-4d7c-bbbb-a8191b4a0dc0"
 
 
@@ -80,6 +111,12 @@ def test_extension_creates_project_by_clicking_current_flow_page():
     assert content.index("reply({ clicked: true })") < content.index("target.click()")
     assert "msg.method === 'page_create_project'" in background
     assert "const currentTabs = await chrome.tabs.query" in background
+    assert "const deadline = Date.now() + 90000" in background
+    assert "const maxClickAttempts = 3" in background
+    assert "clickAttempts < maxClickAttempts" in background
+    assert "target.scrollIntoView({ block: 'center', inline: 'center' })" in background
+    assert "chrome.tabs.sendMessage(tab.id, { type: 'CLICK_NEW_PROJECT' })" in background
+    assert "await chrome.tabs.get(tab.id)" in background
     assert "data: { projectId: match[1] }" in background
     assert "Input.dispatchMouseEvent" in background
     assert "const response = { id: msg.id, status: 200" in background

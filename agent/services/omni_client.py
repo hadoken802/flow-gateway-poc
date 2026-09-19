@@ -32,6 +32,13 @@ class OmniClient:
         if not reference_media_ids:
             return {"error": "reference_media_ids is required"}
 
+        if all(media_id.startswith("page-upload:") for media_id in reference_media_ids):
+            return await self.flow_client.submit_reference_video_ui(
+                project_id=project_id,
+                reference_media_ids=reference_media_ids,
+                prompt=prompt,
+            )
+
         batch_id = batch_id or str(uuid.uuid4())
         ts = int(time.time() * 1000)
         body = {
@@ -73,6 +80,8 @@ class OmniClient:
         }, timeout=60, request_id=extension_request_id)
 
     async def check_status(self, project_id: str, media_name: str) -> dict:
+        if media_name in self.flow_client._page_video_jobs:
+            return await self.flow_client.check_page_video_status(project_id, media_name)
         url = f"{GOOGLE_FLOW_API}/v1/video:batchCheckAsyncVideoGenerationStatus?key={GOOGLE_API_KEY}"
         return await self.flow_client._send("api_request", {
             "url": url,

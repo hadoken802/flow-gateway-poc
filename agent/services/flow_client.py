@@ -5,6 +5,7 @@ Agent runs a WS server. Extension connects as client. Agent sends API requests,
 extension executes them in browser context (residential IP, cookies, reCAPTCHA).
 """
 import asyncio
+import base64
 import json
 import logging
 import time
@@ -72,6 +73,9 @@ class FlowClient:
         self._bootstrap_diagnostics = deque(maxlen=50)
         self._background_tasks: set[asyncio.Task] = set()
         self._shutting_down = False
+        self._page_uploads: dict[str, dict] = {}
+        self._page_video_jobs: set[str] = set()
+        self._page_video_outputs: set[str] = set()
 
     def _track_task(self, coro):
         if self._shutting_down:
@@ -396,7 +400,7 @@ class FlowClient:
 
     async def create_project(self, project_title: str, tool_name: str = "PINHOLE") -> dict:
         """Create a project through the authenticated current Flow page."""
-        result = await self._send("page_create_project", {"projectTitle": project_title, "toolName": tool_name}, timeout=75)
+        result = await self._send("page_create_project", {"projectTitle": project_title, "toolName": tool_name}, timeout=120)
         if result.get("error"):
             logger.error("Flow page project creation failed: %s", result["error"])
         data = result.get("data", result)
@@ -404,6 +408,55 @@ class FlowClient:
         if not project_id:
             return {"error": result.get("error", "PAGE_CREATE_PROJECT_FAILED")}
         return {"data": {"result": {"data": {"json": {"result": {"projectId": project_id}}}}}}
+
+    def prepare_page_upload(self, image_bytes: bytes, mime_type: str, project_id: str, file_name: str) -> dict:
+        """Stage a local image for the current Flow web UI submission path."""
+        media_id = f"page-upload:{uuid.uuid4()}"
+        self._page_uploads[media_id] = {
+            "imageBase64": base64.b64encode(image_bytes).decode(),
+            "mimeType": mime_type,
+            "projectId": project_id,
+            "fileName": file_name,
+        }
+        return {"status": 200, "_mediaId": media_id, "data": {"media": {"name": media_id}}}
+
+    async def submit_reference_video_ui(self, project_id: str, reference_media_ids: list[str], prompt: str) -> dict:
+        uploads = [self._page_uploads.get(media_id) for media_id in reference_media_ids]
+        if not uploads or any(upload is None for upload in uploads):
+            return {"error": "PAGE_UPLOAD_NOT_PREPARED"}
+        result = await self._send("page_submit_video", {
+            "projectId": project_id,
+            "prompt": prompt,
+            "images": uploads,
+            "duration": 10,
+            "aspectRatio": "9:16",
+        }, timeout=180)
+        if not _is_ws_error(result):
+            data = result.get("data", {})
+            media = data.get("media") if isinstance(data, dict) else None
+            media_id = media[0].get("name") if isinstance(media, list) and media and isinstance(media[0], dict) else None
+            if media_id:
+                self._page_video_jobs.add(media_id)
+                for upload_id in reference_media_ids:
+                    self._page_uploads.pop(upload_id, None)
+        return result
+
+    async def check_page_video_status(self, project_id: str, media_id: str) -> dict:
+        result = await self._send("page_video_status", {"projectId": project_id, "mediaId": media_id}, timeout=45)
+        data = result.get("data") if isinstance(result, dict) else None
+        media = data.get("media") if isinstance(data, dict) else None
+        output_id = media[0].get("name") if isinstance(media, list) and media and isinstance(media[0], dict) else None
+        status = media[0].get("mediaStatus", {}).get("mediaGenerationStatus", "") if isinstance(media, list) and media and isinstance(media[0], dict) else ""
+        if output_id and "SUCCEEDED" in str(status).upper():
+            self._page_video_jobs.add(output_id)
+            self._page_video_outputs.add(output_id)
+            # Gateway binds remote ids once. Page-mode jobs use a local receipt
+            # until Flow renders the final tile, so keep that receipt stable and
+            # let the extension resolve it to the real tile for downloading.
+            if media_id in self._page_video_jobs:
+                self._page_video_outputs.add(media_id)
+                media[0]["name"] = media_id
+        return result
 
     async def generate_images(self, prompt: str, project_id: str,
                                aspect_ratio: str = "IMAGE_ASPECT_RATIO_PORTRAIT",
@@ -686,6 +739,8 @@ class FlowClient:
         Returns the raw API response which contains a fresh signed URL
         in data.fifeUrl or data.servingUri.
         """
+        if media_id in self._page_video_outputs:
+            return await self._send("page_video_media", {"mediaId": media_id}, timeout=240)
         url = f"{GOOGLE_FLOW_API}/v1/media/{media_id}?key={GOOGLE_API_KEY}&clientContext.tool=PINHOLE"
         return await self._send("api_request", {
             "url": url,

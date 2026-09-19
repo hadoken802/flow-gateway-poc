@@ -2501,11 +2501,55 @@ def test_background_reuses_flow_page_api_key_for_worker_proxy_requests():
     assert "withFlowApiKey(url)" in text
     assert "searchParams.set('key', flowApiKey)" in text
     assert "createFlowPageAuthHeader()" in text
-    assert "SAPISIDHASH ${timestamp}_${hash}" in text
+    assert "SAPISIDHASH ${timestamp}_${await cookieHash" in text
+    assert "SAPISID1PHASH" in text
+    assert "SAPISID3PHASH" in text
     assert "trustedPageInitiator" in text
-    assert "pageAuthHeader || (flowKey ? `Bearer ${flowKey}` : null)" in text
-    assert "pageAuthHeader || (flowKey ? `Bearer ${flowKey}` : null)" in offscreen
+    assert "(flowKey ? `Bearer ${flowKey}` : null) || pageAuthHeader" in text
+    assert "(flowKey ? `Bearer ${flowKey}` : null) || pageAuthHeader" in offscreen
+    assert "const FLOW_BEARER_MAX_AGE_MS = 45 * 60 * 1000" in text
+    assert "const freshFlowBearer" in text
+    assert "flowKey: freshFlowBearer" in text
+    assert "if (!flowKey && pageAuthHeader) fetchHeaders['x-origin']" in text
+    assert "if (!flowKey && pageAuthHeader) fetchHeaders['x-origin']" in offscreen
     assert "fetchHeaders['x-origin'] = 'https://flow.google.com'" in text
     assert "fetchHeaders['x-origin'] = 'https://flow.google.com'" in offscreen
     assert "console.log(flowApiKey)" not in text
     assert runtime_text.read_text(encoding="utf-8") == text
+
+
+def test_browser_headers_use_current_flow_origin():
+    from agent.services.headers import random_headers
+
+    headers = random_headers()
+
+    assert headers["origin"] == "https://flow.google.com"
+    assert headers["referer"] == "https://flow.google.com/"
+
+
+def test_page_video_receipt_can_fall_back_to_rendered_video_tile():
+    content = Path("extension/content.js").read_text(encoding="utf-8")
+    background = Path("extension/background.js").read_text(encoding="utf-8")
+
+    assert "GET_PAGE_VIDEO_JOB_IDS" in content
+    assert "flow-video-tile img" in content
+    assert "baselineIds: [...existingIds]" in background
+    assert "const jobId = capturedJobId || crypto.randomUUID()" in background
+    assert "page_video_media" in background
+    assert "/(^|\\n)(下载|Download)(\\n|$)/i" in content
+    assert "element.innerText || element.textContent" in content
+    assert "const menuDeadline = Date.now() + 5000" in content
+    assert "if (more.getAttribute('aria-expanded') === 'true')" in content
+    assert "['pointerdown', 'mousedown', 'mouseup', 'click']" in content
+    assert "GET_PAGE_VIDEO_DOWNLOAD_COORDS" in content
+    assert "await trustedClick(job.tabId, more.x, more.y)" in background
+    assert "await trustedClick(job.tabId, download.x, download.y)" in background
+    assert "PAGE_VIDEO_DOWNLOAD_RESOLUTION_NOT_FOUND" in content
+    assert "await trustedClick(job.tabId, resolution.x, resolution.y)" in background
+    assert "target === 'hover'" in content
+    assert "await trustedMove(job.tabId, hover.x, hover.y)" in background
+    injected = Path("extension/injected.js").read_text(encoding="utf-8")
+    assert "closeAgentPanel" in injected
+    assert "button.getAttribute('aria-label') === '关闭'" in injected
+    assert "tileIndex: tile ? tiles.indexOf(tile) : -1" in content
+    assert "tiles.length === 1 ? tiles[0]" in content

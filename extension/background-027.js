@@ -14,6 +14,7 @@ const FLOW_TAB_PATTERNS = [
   'https://labs.google/fx/*/tools/flow*',
 ];
 const KEEPALIVE_INTERVAL_MS = 20000;
+const FLOW_BEARER_MAX_AGE_MS = 45 * 60 * 1000;
 // NOTE: This is a browser-restricted public API key — safe to ship in extension bundles.
 const API_KEY = '';
 
@@ -32,6 +33,7 @@ let pageCreditsCapturedAt = null;
 let callbackSecret = null;  // Auth secret for HTTP callback, received from server on WS connect
 let state = 'off'; // off | idle | running
 let manualDisconnect = false;
+const pageVideoJobs = new Map();
 let metrics = {
   tokenCapturedAt: null,
   requestCount: 0,   // captcha-consuming requests only (gen image/video/upscale)
@@ -126,16 +128,20 @@ async function createFlowPageAuthHeader() {
           const cookies = Object.fromEntries(
             document.cookie.split(';').map((item) => item.trim().split(/=(.*)/s).slice(0, 2)),
           );
-          const sapisid = cookies.SAPISID || cookies['__Secure-3PAPISID'] || cookies['__Secure-1PAPISID'];
-          if (!sapisid) return null;
           const timestamp = Math.floor(Date.now() / 1000);
           const origin = 'https://flow.google.com';
-          const raw = `${timestamp} ${sapisid} ${origin}`;
-          const digest = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(raw));
-          const hash = [...new Uint8Array(digest)]
-            .map((byte) => byte.toString(16).padStart(2, '0'))
-            .join('');
-          return `SAPISIDHASH ${timestamp}_${hash}`;
+          const cookieHash = async (value) => {
+            const raw = `${timestamp} ${value} ${origin}`;
+            const digest = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(raw));
+            return [...new Uint8Array(digest)]
+              .map((byte) => byte.toString(16).padStart(2, '0'))
+              .join('');
+          };
+          const authParts = [];
+          if (cookies.SAPISID) authParts.push(`SAPISIDHASH ${timestamp}_${await cookieHash(cookies.SAPISID)}`);
+          if (cookies['__Secure-1PAPISID']) authParts.push(`SAPISID1PHASH ${timestamp}_${await cookieHash(cookies['__Secure-1PAPISID'])}`);
+          if (cookies['__Secure-3PAPISID']) authParts.push(`SAPISID3PHASH ${timestamp}_${await cookieHash(cookies['__Secure-3PAPISID'])}`);
+          return authParts.length ? authParts.join(' ') : null;
         },
       });
       if (result) return result;
@@ -419,6 +425,7 @@ function connectToAgent() {
     if (ws?._flowSocketId !== activeSocketId) return;
     try {
       const msg = JSON.parse(data);
+      if (msg?.method) chrome.storage.local.set({ lastAgentMessage: { method: msg.method, at: Date.now(), id: msg.id } });
 
       if (msg.method === 'api_request') {
         await handleApiRequest(msg);
@@ -426,6 +433,12 @@ function connectToAgent() {
         await handlePageCreditsRequest(msg);
       } else if (msg.method === 'page_create_project') {
         await handlePageCreateProject(msg);
+      } else if (msg.method === 'page_submit_video') {
+        await handlePageSubmitVideo(msg);
+      } else if (msg.method === 'page_video_status') {
+        await handlePageVideoStatus(msg);
+      } else if (msg.method === 'page_video_media') {
+        await handlePageVideoMedia(msg);
       } else if (msg.method === 'trpc_request') {
         await handleTrpcRequest(msg);
       } else if (msg.method === 'solve_captcha') {
@@ -517,14 +530,22 @@ async function handlePageCreateProject(msg) {
     await chrome.storage.local.set({ projectCreateTrace: { stage: 'home_ready', at: Date.now(), tabId: tab.id } });
     const point = await waitForNewProjectButton(tab.id, 15000);
     await chrome.storage.local.set({ projectCreateTrace: { stage: 'button_ready', at: Date.now(), tabId: tab.id, point } });
-    await trustedClick(tab.id, point.x, point.y);
+    const clickResult = await chrome.tabs.sendMessage(tab.id, { type: 'CLICK_NEW_PROJECT' });
+    if (!clickResult?.clicked) throw new Error(clickResult?.error || 'NEW_PROJECT_CLICK_FAILED');
     await chrome.storage.local.set({ projectCreateTrace: { stage: 'clicked', at: Date.now(), tabId: tab.id } });
-    const deadline = Date.now() + 45000;
+    const deadline = Date.now() + 90000;
+    const maxClickAttempts = 3;
+    let clickAttempts = 1;
+    let nextClickRetryAt = Date.now() + 10000;
     while (Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 250));
-      const currentTabs = await chrome.tabs.query({ url: FLOW_TAB_PATTERNS });
-      const projectTab = currentTabs.find((item) => /\/project\/([0-9a-f-]{36})/i.test(item.url || ''));
-      const match = (projectTab?.url || '').match(/\/project\/([0-9a-f-]{36})/i);
+      let projectTab = await chrome.tabs.get(tab.id).catch(() => null);
+      let match = (projectTab?.url || '').match(/\/project\/([0-9a-f-]{36})/i);
+      if (!match) {
+        const currentTabs = await chrome.tabs.query({ url: FLOW_TAB_PATTERNS });
+        projectTab = currentTabs.find((item) => /\/project\/([0-9a-f-]{36})/i.test(item.url || ''));
+        match = (projectTab?.url || '').match(/\/project\/([0-9a-f-]{36})/i);
+      }
       if (projectTab && match) {
         await chrome.tabs.update(projectTab.id, { active: true });
         const response = { id: msg.id, status: 200, data: { projectId: match[1] } };
@@ -533,6 +554,20 @@ async function handlePageCreateProject(msg) {
         await sendToAgent(response);
         await chrome.storage.local.set({ projectCreateTrace: { stage: 'response_sent', at: Date.now(), projectId: match[1] } });
         return;
+      }
+      if (
+        clickAttempts < maxClickAttempts &&
+        Date.now() >= nextClickRetryAt &&
+        /^https:\/\/flow\.google\.com\/?(?:[?#].*)?$/.test(projectTab?.url || '')
+      ) {
+        try {
+          const retryPoint = await waitForNewProjectButton(tab.id, 2000);
+          const retryResult = await chrome.tabs.sendMessage(tab.id, { type: 'CLICK_NEW_PROJECT' });
+          if (!retryResult?.clicked) throw new Error(retryResult?.error || 'NEW_PROJECT_CLICK_FAILED');
+          clickAttempts += 1;
+          await chrome.storage.local.set({ projectCreateTrace: { stage: 'click_retried', at: Date.now(), tabId: tab.id, clickAttempts } });
+        } catch (_) {}
+        nextClickRetryAt = Date.now() + 10000;
       }
     }
     throw new Error('PROJECT_NAVIGATION_TIMEOUT');
@@ -544,17 +579,206 @@ async function handlePageCreateProject(msg) {
   }
 }
 
+async function handlePageSubmitVideo(msg) {
+  let listener = null;
+  try {
+    await chrome.storage.local.set({ pageVideoSubmitTrace: { stage: 'received', at: Date.now(), requestId: msg.id } });
+    const projectId = String(msg.params?.projectId || '');
+    const tabs = await chrome.tabs.query({ url: FLOW_TAB_PATTERNS });
+    if (!tabs.length) throw new Error('NO_FLOW_TAB');
+    let tab = tabs.find((item) => (item.url || '').includes(`/project/${projectId}`)) || tabs[0];
+    if (!(tab.url || '').includes(`/project/${projectId}`)) {
+      await chrome.tabs.update(tab.id, { url: `https://flow.google.com/project/${projectId}` });
+      await waitForTabComplete(tab.id, 30000, projectId);
+    }
+
+    let submitSeen = false;
+    let resolveJob;
+    const jobPromise = new Promise((resolve) => { resolveJob = resolve; });
+    listener = (details) => {
+      if (details.tabId !== tab.id || !details.requestBody?.raw?.length) return;
+      const body = new TextDecoder().decode(details.requestBody.raw[0].bytes);
+      if (details.url.includes('rpcids=MZZa6b')) {
+        submitSeen = true;
+        return;
+      }
+      if (!submitSeen || !details.url.includes('rpcids=jwpduf')) return;
+      const decoded = decodeURIComponent(body);
+      const match = decoded.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+      if (!match || pageVideoJobs.has(match[0])) return;
+      pageVideoJobs.set(match[0], { tabId: tab.id, projectId, url: details.url, body });
+      resolveJob(match[0]);
+    };
+    chrome.webRequest.onBeforeRequest.addListener(
+      listener,
+      { urls: ['https://flow.google.com/_/AiSandboxAngularFrontend/data/batchexecute*'] },
+      ['requestBody'],
+    );
+
+    const before = await chrome.tabs.sendMessage(tab.id, { type: 'GET_PAGE_VIDEO_JOB_IDS' }).catch(() => ({ mediaIds: [] }));
+    const existingIds = new Set(before?.mediaIds || []);
+    await chrome.storage.local.set({ pageVideoSubmitTrace: { stage: 'ui_started', at: Date.now(), requestId: msg.id, tabId: tab.id } });
+    const uiResult = await chrome.tabs.sendMessage(tab.id, { type: 'SUBMIT_VIDEO_UI', payload: msg.params });
+    if (uiResult?.error) throw new Error(uiResult.error);
+    await chrome.storage.local.set({ pageVideoSubmitTrace: { stage: 'generate_clicked', at: Date.now(), requestId: msg.id, tabId: tab.id } });
+    // The current Flow page may not expose a remote job id until the video tile
+    // finishes rendering. Return a local receipt immediately after the Generate
+    // click and resolve it to the new tile during normal status polling.
+    const capturedJobId = await Promise.race([
+      jobPromise,
+      new Promise((resolve) => setTimeout(() => resolve(null), 1500)),
+    ]);
+    const jobId = capturedJobId || crypto.randomUUID();
+    if (!pageVideoJobs.has(jobId)) {
+      pageVideoJobs.set(jobId, {
+        tabId: tab.id,
+        projectId,
+        url: null,
+        body: null,
+        baselineIds: [...existingIds],
+        outputId: null,
+      });
+    }
+    const response = {
+      id: msg.id,
+      status: 200,
+      data: {
+        media: [{ name: jobId, mediaStatus: { mediaGenerationStatus: 'MEDIA_GENERATION_STATUS_ACTIVE' } }],
+        workflows: [{ name: jobId, metadata: { batchId: jobId } }],
+      },
+    };
+    fallbackToWebSocket(response);
+    await sendToAgent(response);
+    await chrome.storage.local.set({ pageVideoSubmitTrace: { stage: 'response_sent', at: Date.now(), requestId: msg.id, jobId } });
+  } catch (e) {
+    const response = { id: msg.id, status: 502, error: e.message || 'PAGE_VIDEO_SUBMIT_FAILED' };
+    await chrome.storage.local.set({ pageVideoSubmitTrace: { stage: 'failed', at: Date.now(), requestId: msg.id, error: response.error } });
+    fallbackToWebSocket(response);
+    await sendToAgent(response);
+  } finally {
+    if (listener) chrome.webRequest.onBeforeRequest.removeListener(listener);
+  }
+}
+
+async function handlePageVideoStatus(msg) {
+  try {
+    const mediaId = String(msg.params?.mediaId || '');
+    const job = pageVideoJobs.get(mediaId);
+    if (!job) throw new Error('PAGE_VIDEO_JOB_NOT_FOUND');
+    if (!job.url && !job.outputId) {
+      const current = await chrome.tabs.sendMessage(job.tabId, { type: 'GET_PAGE_VIDEO_JOB_IDS' }).catch(() => ({ mediaIds: [] }));
+      const baselineIds = new Set(job.baselineIds || []);
+      job.outputId = (current?.mediaIds || []).find((id) => !baselineIds.has(id)) || null;
+    }
+    const domMediaId = job.outputId || mediaId;
+    const dom = await chrome.tabs.sendMessage(job.tabId, { type: 'GET_PAGE_VIDEO_STATUS', mediaId: domMediaId });
+    if (Number.isInteger(dom?.tileIndex) && dom.tileIndex >= 0) job.tileIndex = dom.tileIndex;
+    let outputId = null;
+    if (job.url && job.body) {
+      const [{ result }] = await chrome.scripting.executeScript({
+        target: { tabId: job.tabId }, world: 'MAIN', args: [job.url, job.body],
+        func: async (url, body) => {
+          const response = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded;charset=UTF-8' }, body });
+          return { status: response.status, text: await response.text() };
+        },
+      });
+      if (!result || result.status !== 200) throw new Error(`PAGE_VIDEO_STATUS_HTTP_${result?.status || 0}`);
+      const ids = [...new Set(result.text.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi) || [])];
+      outputId = ids.find((id) => id !== mediaId && id !== job.projectId) || null;
+    }
+    const completed = !!dom?.completed;
+    if (completed && outputId) job.outputId = outputId;
+    const response = {
+      id: msg.id,
+      status: 200,
+      data: {
+        media: [{
+          name: mediaId,
+          mediaStatus: {
+            mediaGenerationStatus: completed
+              ? 'MEDIA_GENERATION_STATUS_SUCCEEDED'
+              : 'MEDIA_GENERATION_STATUS_ACTIVE',
+          },
+        }],
+      },
+    };
+    fallbackToWebSocket(response);
+    await sendToAgent(response);
+  } catch (e) {
+    const response = { id: msg.id, status: 502, error: e.message || 'PAGE_VIDEO_STATUS_FAILED' };
+    fallbackToWebSocket(response);
+    await sendToAgent(response);
+  }
+}
+
+async function handlePageVideoMedia(msg) {
+  let createdListener = null;
+  try {
+    const mediaId = String(msg.params?.mediaId || '');
+    const entry = [...pageVideoJobs.entries()].find(([jobId, job]) => jobId === mediaId || job.outputId === mediaId);
+    if (!entry) throw new Error('PAGE_VIDEO_JOB_NOT_FOUND');
+    const [jobId, job] = entry;
+    let resolveCreated;
+    const created = new Promise((resolve) => { resolveCreated = resolve; });
+    createdListener = (item) => resolveCreated(item);
+    chrome.downloads.onCreated.addListener(createdListener);
+    const targetMediaId = job.outputId || jobId;
+    const hover = await chrome.tabs.sendMessage(job.tabId, { type: 'GET_PAGE_VIDEO_DOWNLOAD_COORDS', mediaId: targetMediaId, tileIndex: job.tileIndex, target: 'hover' });
+    if (hover?.error) throw new Error(hover.error);
+    await trustedMove(job.tabId, hover.x, hover.y);
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    let download = null;
+    for (let attempt = 0; attempt < 2 && !download; attempt += 1) {
+      const more = await chrome.tabs.sendMessage(job.tabId, { type: 'GET_PAGE_VIDEO_DOWNLOAD_COORDS', mediaId: targetMediaId, tileIndex: job.tileIndex, target: 'more' });
+      if (more?.error) throw new Error(more.error);
+      await trustedClick(job.tabId, more.x, more.y);
+      const candidate = await chrome.tabs.sendMessage(job.tabId, { type: 'GET_PAGE_VIDEO_DOWNLOAD_COORDS', mediaId: targetMediaId, tileIndex: job.tileIndex, target: 'download' });
+      if (!candidate?.error) download = candidate;
+    }
+    if (!download) throw new Error('PAGE_VIDEO_DOWNLOAD_MENU_NOT_FOUND');
+    await trustedClick(job.tabId, download.x, download.y);
+    const resolution = await chrome.tabs.sendMessage(job.tabId, { type: 'GET_PAGE_VIDEO_DOWNLOAD_COORDS', mediaId: targetMediaId, tileIndex: job.tileIndex, target: 'resolution' });
+    if (resolution?.error) throw new Error(resolution.error);
+    await trustedClick(job.tabId, resolution.x, resolution.y);
+    const item = await Promise.race([
+      created,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('PAGE_VIDEO_DOWNLOAD_START_TIMEOUT')), 30000)),
+    ]);
+    const deadline = Date.now() + 180000;
+    let current = item;
+    while (Date.now() < deadline) {
+      const matches = await chrome.downloads.search({ id: item.id });
+      current = matches[0] || current;
+      if (current.state === 'complete') break;
+      if (current.state === 'interrupted') throw new Error(`PAGE_VIDEO_DOWNLOAD_INTERRUPTED:${current.error || 'unknown'}`);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    if (current.state !== 'complete' || !current.filename) throw new Error('PAGE_VIDEO_DOWNLOAD_TIMEOUT');
+    const response = { id: msg.id, status: 200, data: { localFilePath: current.filename, mediaId } };
+    fallbackToWebSocket(response);
+    await sendToAgent(response);
+  } catch (e) {
+    const response = { id: msg.id, status: 502, error: e.message || 'PAGE_VIDEO_MEDIA_FAILED' };
+    fallbackToWebSocket(response);
+    await sendToAgent(response);
+  } finally {
+    if (createdListener) chrome.downloads.onCreated.removeListener(createdListener);
+  }
+}
+
 async function waitForNewProjectButton(tabId, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const [{ result }] = await chrome.scripting.executeScript({
       target: { tabId },
-      func: () => {
+      func: async () => {
         const target = [...document.querySelectorAll('button, a, [role="button"]')].find((element) => {
           const text = `${element.textContent || ''} ${element.getAttribute('aria-label') || ''}`.trim();
           return element.getClientRects().length > 0 && !element.disabled && /新建项目|创建项目|New project|Create project/i.test(text);
         });
         if (!target) return null;
+        target.scrollIntoView({ block: 'center', inline: 'center' });
+        await new Promise((resolve) => setTimeout(resolve, 150));
         const rect = target.getBoundingClientRect();
         return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
       },
@@ -577,12 +801,25 @@ async function trustedClick(tabId, x, y) {
   }
 }
 
-function waitForTabComplete(tabId, timeoutMs) {
+async function trustedMove(tabId, x, y) {
+  const target = { tabId };
+  await chrome.debugger.attach(target, '1.3');
+  try {
+    await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
+  } finally {
+    await chrome.debugger.detach(target).catch(() => {});
+  }
+}
+
+function waitForTabComplete(tabId, timeoutMs, projectId = null) {
   const deadline = Date.now() + timeoutMs;
   return (async () => {
     while (Date.now() < deadline) {
       const tab = await chrome.tabs.get(tabId);
-      if (tab.status === 'complete' && /^https:\/\/flow\.google\.com\/?(?:[?#].*)?$/.test(tab.url || '')) return;
+      const expectedUrl = projectId
+        ? (tab.url || '').includes(`/project/${projectId}`)
+        : /^https:\/\/flow\.google\.com\/?(?:[?#].*)?$/.test(tab.url || '');
+      if (tab.status === 'complete' && expectedUrl) return;
       await new Promise((resolve) => setTimeout(resolve, 200));
     }
     throw new Error('FLOW_HOME_TIMEOUT');
@@ -835,20 +1072,22 @@ async function handleApiRequest(msg) {
     },
   };
   const pageAuthHeader = await createFlowPageAuthHeader();
+  const freshFlowBearer = flowKey && metrics.tokenCapturedAt &&
+    Date.now() - metrics.tokenCapturedAt <= FLOW_BEARER_MAX_AGE_MS ? flowKey : null;
 
   if (captchaAction) {
-    await handleApiRequestInServiceWorker(normalizedMsg, pageAuthHeader);
+    await handleApiRequestInServiceWorker(normalizedMsg, pageAuthHeader, freshFlowBearer);
     return;
   }
 
   await ensureOffscreenDocument();
-  chrome.runtime.sendMessage({ type: 'OFFSCREEN_API_REQUEST', msg: normalizedMsg, flowKey, pageAuthHeader }).catch((e) => {
+  chrome.runtime.sendMessage({ type: 'OFFSCREEN_API_REQUEST', msg: normalizedMsg, flowKey: freshFlowBearer, pageAuthHeader }).catch((e) => {
     sendToAgent({ id, status: 500, error: e.message || 'OFFSCREEN_REQUEST_FAILED' });
   });
   return;
 }
 
-async function handleApiRequestInServiceWorker(msg, pageAuthHeader = null) {
+async function handleApiRequestInServiceWorker(msg, pageAuthHeader = null, flowKey = null) {
   const { id, params } = msg;
   const { url, method, headers, body, captchaAction } = params;
 
@@ -899,7 +1138,7 @@ async function handleApiRequestInServiceWorker(msg, pageAuthHeader = null) {
     }
 
     // Step 3: Use flowKey for auth
-    const activeAuthorization = pageAuthHeader || (flowKey ? `Bearer ${flowKey}` : null);
+    const activeAuthorization = (flowKey ? `Bearer ${flowKey}` : null) || pageAuthHeader;
     if (!activeAuthorization) {
       sendToAgent({ id, status: 503, error: 'NO_FLOW_KEY' });
       if (hasCaptcha) { metrics.failedCount++; metrics.lastError = 'NO_FLOW_KEY'; }
@@ -911,7 +1150,7 @@ async function handleApiRequestInServiceWorker(msg, pageAuthHeader = null) {
 
     const fetchHeaders = { ...(headers || {}) };
     fetchHeaders['authorization'] = activeAuthorization;
-    if (pageAuthHeader) fetchHeaders['x-origin'] = 'https://flow.google.com';
+    if (!flowKey && pageAuthHeader) fetchHeaders['x-origin'] = 'https://flow.google.com';
 
     // Step 4: Make the API call from browser context
     const response = await fetch(url, {

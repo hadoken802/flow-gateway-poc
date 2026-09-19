@@ -5,6 +5,7 @@ import binascii
 import json
 import logging
 import mimetypes
+import shutil
 import uuid
 from pathlib import Path
 
@@ -119,8 +120,6 @@ async def submit_omni_video(body: OmniVideoRequest):
     client = get_flow_client()
     if not client.connected:
         raise HTTPException(503, "Extension not connected")
-    if client._flow_key is None:
-        raise HTTPException(503, "Flow key not present")
 
     image_paths = _request_image_paths(body)
     for image_path in image_paths:
@@ -205,8 +204,6 @@ async def resume_omni_video(body: OmniVideoResumeRequest):
     client = get_flow_client()
     if not client.connected:
         raise HTTPException(503, "Extension not connected")
-    if client._flow_key is None:
-        raise HTTPException(503, "Flow key not present")
 
     request_batch_id = body.request_batch_id or str(uuid.uuid4())
     extension_request_id = body.extension_request_id or str(uuid.uuid4())
@@ -604,6 +601,17 @@ async def _download_completed(job: dict) -> None:
     await crud.update_omni_test_job(job["job_id"], raw_response_shape=json.dumps(sanitized_response_shape(data)))
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     dest = OUTPUT_DIR / f"{job['job_id']}.mp4"
+    local_file_path = data.get("localFilePath") if isinstance(data, dict) else None
+    if local_file_path:
+        source = Path(local_file_path)
+        if not _valid_existing_mp4(source):
+            raise ValueError("Video download failed: browser download is not a valid MP4")
+        shutil.copyfile(source, dest)
+        await crud.update_omni_test_job(
+            job["job_id"], video_path=str(dest), status="completed", error_code=None,
+            error_message=None, completed_at=crud._now(),
+        )
+        return
     encoded = resolve_encoded_video(data)
     if encoded:
         logger.info(
@@ -687,12 +695,8 @@ async def _retry_download_existing_job(job: dict, wait_schedule=None) -> None:
 
 async def _upload_image(client, image_path: Path, project_id: str) -> dict:
     image_bytes = image_path.read_bytes()
-    b64 = base64.b64encode(image_bytes).decode()
     mime = mimetypes.guess_type(str(image_path))[0] or "image/png"
-    result = await client.upload_image(b64, mime_type=mime, project_id=project_id, file_name=image_path.name)
-    if result.get("error") or (isinstance(result.get("status"), int) and result["status"] >= 400):
-        raise HTTPException(result.get("status", 502), result.get("error", result.get("data")))
-    return result
+    return client.prepare_page_upload(image_bytes, mime_type=mime, project_id=project_id, file_name=image_path.name)
 
 
 async def _download_mp4(url: str, dest: Path) -> None:

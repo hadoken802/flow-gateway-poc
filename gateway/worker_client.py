@@ -38,6 +38,7 @@ class WorkerClient:
             "account_id": info.get("account_id"),
             "extension_connected": bool(flow_status.get("connected")),
             "flow_key_present": bool(flow_status.get("flow_key_present")),
+            "page_ui_ready": bool(flow_status.get("page_ui_ready")),
             **credits_info,
         }
 

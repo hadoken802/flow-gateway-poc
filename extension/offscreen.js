@@ -16,13 +16,13 @@ async function handleApiRequest(msg, flowKey, pageAuthHeader) {
 
   try {
     const fetchHeaders = { ...(headers || {}) };
-    const authorization = pageAuthHeader || (flowKey ? `Bearer ${flowKey}` : null);
+    const authorization = (flowKey ? `Bearer ${flowKey}` : null) || pageAuthHeader;
     if (!authorization) {
       sendResponse({ id, status: 503, error: 'NO_FLOW_KEY' });
       return;
     }
     fetchHeaders.authorization = authorization;
-    if (pageAuthHeader) fetchHeaders['x-origin'] = 'https://flow.google.com';
+    if (!flowKey && pageAuthHeader) fetchHeaders['x-origin'] = 'https://flow.google.com';
 
     console.log(`[FlowAgentOffscreen] get_media/request start id=${String(id).slice(0, 8)} at=${startedAt}`);
     const response = await fetch(url, {
