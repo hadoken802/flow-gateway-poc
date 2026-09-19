@@ -758,12 +758,12 @@ TASK_CENTER_HTML = """
 async function api(path, options){const r=await fetch(path, options); if(!r.ok) throw new Error(await r.text()); return await r.json();}
 function td(v){return `<td>${v??''}</td>`}
 function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-let accountRows=[],nodeRows=[],taskRows=[],showAllTasks=false,refreshPromise=null;
+let accountRows=[],nodeRows=[],taskRows=[],showAllTasks=false,refreshPromise=null,gatewayDryRun=false;
 async function refresh(){
   if(refreshPromise)return refreshPromise;
   refreshPromise=(async()=>{try{
     const [s,accountsData,tasksData]=await Promise.all([api('/api/v1/system/status'),api('/api/v1/accounts'),api('/api/v1/tasks')]);
-    accountRows=accountsData;taskRows=tasksData;
+    gatewayDryRun=Boolean(s.dry_run);accountRows=accountsData;taskRows=tasksData;
     renderAccounts();renderTasks();renderAdvanced();renderMetrics(s);
     nodeRows=await api('/api/v1/nodes');
     renderAccounts();renderAdvanced();renderMetrics(s);
@@ -794,14 +794,16 @@ function renderAccounts(){
   accountList.innerHTML='<div class="list-row list-head"><span>账号</span><span>状态</span><span>积分</span><span></span></div>'+(rows.length?rows.map(([id,v])=>{const state=accountState(v.account,v.node),credits=v.account?.credits??v.node?.credits??'—';return `<div class="list-row"><strong>${esc(id)}</strong><span class="state"><i class="dot ${state.tone}"></i>${esc(state.label)}</span><span class="credits">${esc(credits)}</span><span>${accountAction(id,state)}</span></div>`}).join(''):'<div class="empty">暂无账号</div>');
 }
 function renderMetrics(s){const rows=mergedAccounts(),bad=rows.filter(([,v])=>accountState(v.account,v.node).key!=='ready').length,total=rows.length,gatewayOk=s.gateway?.status==='ok';metrics.innerHTML=`<div class="metric"><span class="dot ${gatewayOk?'':'danger'}"></span>Gateway<b>${gatewayOk?'正常':'异常'}</b></div><div class="metric">可用账号<b>${s.accounts_ready||0} / ${total}</b></div><div class="metric">当前生成<b>${s.active_count||0}</b></div><div class="metric">排队<b>${s.queued_count||0}</b></div><div class="metric">异常账号<b>${bad}</b></div>`}
-function taskState(t){const map={completed:'已完成',failed:'失败',queued:'排队中',processing:'生成中',downloading:'下载中',cancelled:'已取消'};return map[t.status]||t.status||'未知'}
+function isDryRunTask(t){return t.submitted_at==='dry-run'||String(t.video_path||'').endsWith('.dry-run.txt')}
+function taskState(t){if(t.status==='completed'&&isDryRunTask(t))return '演练完成（未生成视频）';const map={completed:'已完成',failed:'失败',queued:'排队中',processing:'生成中',downloading:'下载中',cancelled:'已取消'};return map[t.status]||t.status||'未知'}
 function zhStatus(value){const map={ready:'正常',busy:'生成中',offline:'离线',needs_login:'需要登录',low_credits:'积分不足',paused:'已暂停',cooldown:'冷却中',completed:'已完成',failed:'失败',queued:'排队中',processing:'生成中',downloading:'下载中',cancelled:'已取消',live:'正常',unknown:'未知',extension_ready:'扩展已就绪',extension_missing:'缺少扩展'};return map[String(value??'').toLowerCase()]??value??''}
 function zhBool(value){return value===true||value===1?'是':value===false||value===0?'否':value??''}
-function taskAction(t){if(t.status==='completed'&&t.video_path)return `<a class="link-button" target="_blank" href="/api/v1/client/tasks/${encodeURIComponent(t.task_id)}/download">打开视频</a>`;if(t.status==='failed'||t.error_code||t.last_error_category)return `<button onclick="showTaskReason('${esc(t.task_id)}')">查看原因</button>`;return ''}
+function taskAction(t){if(t.status==='completed'&&t.video_path&&!isDryRunTask(t))return `<a class="link-button" target="_blank" href="/api/v1/client/tasks/${encodeURIComponent(t.task_id)}/download">打开视频</a>`;if(t.status==='failed'||t.error_code||t.last_error_category)return `<button onclick="showTaskReason('${esc(t.task_id)}')">查看原因</button>`;return ''}
 function renderTasks(){const newest=[...taskRows].reverse(),rows=showAllTasks?newest:newest.slice(0,8);taskList.innerHTML='<div class="list-row task-row list-head"><span>任务</span><span>状态</span><span>账号</span><span></span></div>'+(rows.length?rows.map(t=>`<div class="list-row task-row"><strong>${esc(t.name||t.external_task_id||'未命名任务')}</strong><span>${esc(taskState(t))}</span><span>${esc(t.assigned_account_id||t.account_id||'—')}</span><span>${taskAction(t)}</span></div>`).join(''):'<div class="empty">暂无任务</div>');allTasksButton.textContent=showAllTasks?'只看最近任务':'查看全部任务'}
 function toggleAllTasks(){showAllTasks=!showAllTasks;renderTasks()}
 async function createSimpleTask(){
   const files=[...taskImage.files],promptText=taskPrompt.value.trim();
+  if(gatewayDryRun){createTaskResult.className='form-result error';createTaskResult.textContent='当前是演练模式，不会生成真实视频';return}
   if(!files.length){createTaskResult.className='form-result error';createTaskResult.textContent='请先选择图片';return}
   if(!promptText){createTaskResult.className='form-result error';createTaskResult.textContent='请输入提示词';return}
   createTaskButton.disabled=true;createTaskButton.textContent='正在创建…';createTaskResult.className='form-result muted';createTaskResult.textContent='正在上传图片…';

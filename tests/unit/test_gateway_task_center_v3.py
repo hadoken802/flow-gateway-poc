@@ -178,3 +178,11 @@ def test_account_actions_show_progress_and_auto_refresh_does_not_overlap():
     assert "本地服务已启动，正在检查状态…" in TASK_CENTER_HTML
     assert "操作失败" in TASK_CENTER_HTML
     assert TASK_CENTER_HTML.index("worker_online&&!node?.extension_connected") < TASK_CENTER_HTML.index("if(status==='offline')")
+
+
+def test_dry_run_tasks_are_not_presented_as_real_videos():
+    from gateway.main import TASK_CENTER_HTML
+
+    assert "演练完成（未生成视频）" in TASK_CENTER_HTML
+    assert "!isDryRunTask(t)" in TASK_CENTER_HTML
+    assert "当前是演练模式，不会生成真实视频" in TASK_CENTER_HTML
