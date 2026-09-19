@@ -46,7 +46,7 @@ def test_extension_reads_current_flow_page_credits_and_returns_over_websocket():
 def test_extension_version_invalidates_stale_service_worker_cache():
     manifest = json.loads(Path("extension/manifest.json").read_text(encoding="utf-8"))
 
-    assert tuple(map(int, manifest["version"].split("."))) >= (0, 2, 5)
+    assert tuple(map(int, manifest["version"].split("."))) >= (0, 2, 6)
     assert "debugger" in manifest["permissions"]
 
 
@@ -79,7 +79,9 @@ def test_extension_creates_project_by_clicking_current_flow_page():
     assert "const currentTabs = await chrome.tabs.query" in background
     assert "data: { projectId: match[1] }" in background
     assert "Input.dispatchMouseEvent" in background
-    assert "sendToAgent({ id: msg.id, status: 200" in background
+    assert "const response = { id: msg.id, status: 200" in background
+    assert "await sendToAgent(response)" in background
+    assert "stage: 'project_found'" in background
 
 
 @pytest.mark.asyncio

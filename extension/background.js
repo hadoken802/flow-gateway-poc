@@ -418,15 +418,20 @@ async function handlePageCreditsRequest(msg) {
 
 async function handlePageCreateProject(msg) {
   try {
+    await chrome.storage.local.set({ projectCreateTrace: { stage: 'received', at: Date.now(), requestId: msg.id } });
     const tabs = await chrome.tabs.query({ url: FLOW_TAB_PATTERNS });
     if (!tabs.length) throw new Error('NO_FLOW_TAB');
     const tab = tabs[0];
+    await chrome.storage.local.set({ projectCreateTrace: { stage: 'tab_selected', at: Date.now(), tabId: tab.id, url: tab.url } });
     if (!/^https:\/\/flow\.google\.com\/?(?:[?#].*)?$/.test(tab.url || '')) {
       await chrome.tabs.update(tab.id, { url: 'https://flow.google.com/' });
       await waitForTabComplete(tab.id, 30000);
     }
+    await chrome.storage.local.set({ projectCreateTrace: { stage: 'home_ready', at: Date.now(), tabId: tab.id } });
     const point = await waitForNewProjectButton(tab.id, 15000);
+    await chrome.storage.local.set({ projectCreateTrace: { stage: 'button_ready', at: Date.now(), tabId: tab.id, point } });
     await trustedClick(tab.id, point.x, point.y);
+    await chrome.storage.local.set({ projectCreateTrace: { stage: 'clicked', at: Date.now(), tabId: tab.id } });
     const deadline = Date.now() + 45000;
     while (Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 250));
@@ -435,13 +440,20 @@ async function handlePageCreateProject(msg) {
       const match = (projectTab?.url || '').match(/\/project\/([0-9a-f-]{36})/i);
       if (projectTab && match) {
         await chrome.tabs.update(projectTab.id, { active: true });
-        sendToAgent({ id: msg.id, status: 200, data: { projectId: match[1] } });
+        const response = { id: msg.id, status: 200, data: { projectId: match[1] } };
+        await chrome.storage.local.set({ projectCreateTrace: { stage: 'project_found', at: Date.now(), tabId: projectTab.id, projectId: match[1] } });
+        fallbackToWebSocket(response);
+        await sendToAgent(response);
+        await chrome.storage.local.set({ projectCreateTrace: { stage: 'response_sent', at: Date.now(), projectId: match[1] } });
         return;
       }
     }
     throw new Error('PROJECT_NAVIGATION_TIMEOUT');
   } catch (e) {
-    sendToAgent({ id: msg.id, status: 502, error: e.message || 'PAGE_CREATE_PROJECT_FAILED' });
+    const response = { id: msg.id, status: 502, error: e.message || 'PAGE_CREATE_PROJECT_FAILED' };
+    await chrome.storage.local.set({ projectCreateTrace: { stage: 'failed', at: Date.now(), error: response.error } });
+    fallbackToWebSocket(response);
+    await sendToAgent(response);
   }
 }
 
@@ -530,36 +542,41 @@ function fallbackToWebSocket(msg) {
   if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
 }
 
-function sendToAgent(msg) {
+async function sendToAgent(msg) {
   // API responses (with msg.id) go via HTTP — immune to WS disconnect
   if (msg.id) {
     const agentHttpUrl = getAgentHttpUrl();
     if (!agentHttpUrl) {
       fallbackToWebSocket(msg);
-      return;
+      return false;
     }
-    fetch(agentHttpUrl + '/api/ext/callback', {
+    try {
+      const response = await fetch(agentHttpUrl + '/api/ext/callback', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(msg),
-    }).then(async (response) => {
+      });
       if (!response.ok) {
         fallbackToWebSocket(msg);
-        return;
+        return false;
       }
       let data = null;
       try {
         data = await response.json();
       } catch (_) {
         fallbackToWebSocket(msg);
-        return;
+        return false;
       }
       if (data?.ok !== true) fallbackToWebSocket(msg);
-    }).catch(() => fallbackToWebSocket(msg));
-    return;
+      return data?.ok === true;
+    } catch (_) {
+      fallbackToWebSocket(msg);
+      return false;
+    }
   }
   // Non-response messages (ping, status) or no secret yet — use WS
   fallbackToWebSocket(msg);
+  return true;
 }
 
 function getAgentHttpUrl() {
