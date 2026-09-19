@@ -12,7 +12,15 @@
 chrome.runtime.onMessage.addListener((msg, _, reply) => {
   if (msg.type === 'CLICK_NEW_PROJECT') {
     clickNewProject()
-      .then(() => reply({ clicked: true }))
+      .then((target) => {
+        // Reply before navigation destroys this content-script context.
+        reply({ clicked: true });
+        setTimeout(() => {
+          target.scrollIntoView({ block: 'center', inline: 'center' });
+          target.focus();
+          target.click();
+        }, 0);
+      })
       .catch((e) => reply({ error: e.message || 'NEW_PROJECT_CLICK_FAILED' }));
     return true;
   }
@@ -74,9 +82,7 @@ async function clickNewProject() {
   if (!target) throw new Error('NEW_PROJECT_BUTTON_NOT_FOUND');
   // The Angular shell can report document complete before the button handler is hydrated.
   await new Promise((resolve) => setTimeout(resolve, 1000));
-  target.scrollIntoView({ block: 'center', inline: 'center' });
-  target.focus();
-  target.click();
+  return target;
 }
 
 async function readPageCredits() {

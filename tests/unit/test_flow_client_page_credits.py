@@ -46,7 +46,7 @@ def test_extension_reads_current_flow_page_credits_and_returns_over_websocket():
 def test_extension_version_invalidates_stale_service_worker_cache():
     manifest = json.loads(Path("extension/manifest.json").read_text(encoding="utf-8"))
 
-    assert tuple(map(int, manifest["version"].split("."))) >= (0, 2, 3)
+    assert tuple(map(int, manifest["version"].split("."))) >= (0, 2, 4)
 
 
 @pytest.mark.asyncio
@@ -73,6 +73,7 @@ def test_extension_creates_project_by_clicking_current_flow_page():
     assert "CLICK_NEW_PROJECT" in content
     assert "const deadline = Date.now() + 15000" in content
     assert "新建项目|创建项目|New project|Create project" in content
+    assert content.index("reply({ clicked: true })") < content.index("target.click()")
     assert "msg.method === 'page_create_project'" in background
     assert "const currentTabs = await chrome.tabs.query" in background
     assert "data: { projectId: match[1] }" in background
