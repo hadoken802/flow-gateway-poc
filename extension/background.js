@@ -337,6 +337,8 @@ function connectToAgent() {
         await handleApiRequest(msg);
       } else if (msg.method === 'page_credits') {
         await handlePageCreditsRequest(msg);
+      } else if (msg.method === 'page_create_project') {
+        await handlePageCreateProject(msg);
       } else if (msg.method === 'trpc_request') {
         await handleTrpcRequest(msg);
       } else if (msg.method === 'solve_captcha') {
@@ -412,6 +414,45 @@ async function handlePageCreditsRequest(msg) {
   } catch (e) {
     fallbackToWebSocket({ id: msg.id, status: 500, error: e.message || 'PAGE_CREDITS_FAILED' });
   }
+}
+
+async function handlePageCreateProject(msg) {
+  try {
+    const tabs = await chrome.tabs.query({ url: FLOW_TAB_PATTERNS });
+    if (!tabs.length) throw new Error('NO_FLOW_TAB');
+    const tab = tabs[0];
+    if (!/^https:\/\/flow\.google\.com\/?(?:[?#].*)?$/.test(tab.url || '')) {
+      await chrome.tabs.update(tab.id, { url: 'https://flow.google.com/' });
+      await waitForTabComplete(tab.id, 30000);
+    }
+    const clicked = await chrome.tabs.sendMessage(tab.id, { type: 'CLICK_NEW_PROJECT' });
+    if (!clicked?.clicked) throw new Error(clicked?.error || 'NEW_PROJECT_CLICK_FAILED');
+    const deadline = Date.now() + 30000;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const current = await chrome.tabs.get(tab.id);
+      const match = (current.url || '').match(/\/project\/([0-9a-f-]{36})/i);
+      if (match) {
+        fallbackToWebSocket({ id: msg.id, status: 200, data: { projectId: match[1] } });
+        return;
+      }
+    }
+    throw new Error('PROJECT_NAVIGATION_TIMEOUT');
+  } catch (e) {
+    fallbackToWebSocket({ id: msg.id, status: 502, error: e.message || 'PAGE_CREATE_PROJECT_FAILED' });
+  }
+}
+
+function waitForTabComplete(tabId, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  return (async () => {
+    while (Date.now() < deadline) {
+      const tab = await chrome.tabs.get(tabId);
+      if (tab.status === 'complete' && /^https:\/\/flow\.google\.com\/?(?:[?#].*)?$/.test(tab.url || '')) return;
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    throw new Error('FLOW_HOME_TIMEOUT');
+  })();
 }
 
 function scheduleReconnect() {

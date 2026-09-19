@@ -10,6 +10,20 @@
 })();
 
 chrome.runtime.onMessage.addListener((msg, _, reply) => {
+  if (msg.type === 'CLICK_NEW_PROJECT') {
+    try {
+      const target = [...document.querySelectorAll('button, a, [role="button"]')].find((element) => {
+        const text = `${element.textContent || ''} ${element.getAttribute('aria-label') || ''}`.trim();
+        return element.getClientRects().length > 0 && !element.disabled && /新建项目|创建项目|New project|Create project/i.test(text);
+      });
+      if (!target) throw new Error('NEW_PROJECT_BUTTON_NOT_FOUND');
+      target.click();
+      reply({ clicked: true });
+    } catch (e) {
+      reply({ error: e.message || 'NEW_PROJECT_CLICK_FAILED' });
+    }
+    return;
+  }
   if (msg.type === 'GET_PAGE_CREDITS') {
     readPageCredits()
       .then((credits) => reply({ credits }))

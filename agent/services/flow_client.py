@@ -395,22 +395,13 @@ class FlowClient:
     # ─── High-level API Methods ──────────────────────────────
 
     async def create_project(self, project_title: str, tool_name: str = "PINHOLE") -> dict:
-        """Create a project on Google Flow via tRPC endpoint.
-
-        Returns the full response including projectId.
-        """
-        url = "https://labs.google/fx/api/trpc/project.createProject"
-        body = {"json": {"projectTitle": project_title, "toolName": tool_name}}
-
-        return await self._send("trpc_request", {
-            "url": url,
-            "method": "POST",
-            "headers": {
-                "content-type": "application/json",
-                "accept": "*/*",
-            },
-            "body": body,
-        }, timeout=30)
+        """Create a project through the authenticated current Flow page."""
+        result = await self._send("page_create_project", {"projectTitle": project_title, "toolName": tool_name}, timeout=45)
+        data = result.get("data", result)
+        project_id = data.get("projectId") if isinstance(data, dict) else None
+        if not project_id:
+            return {"error": result.get("error", "PAGE_CREATE_PROJECT_FAILED")}
+        return {"data": {"result": {"data": {"json": {"result": {"projectId": project_id}}}}}}
 
     async def generate_images(self, prompt: str, project_id: str,
                                aspect_ratio: str = "IMAGE_ASPECT_RATIO_PORTRAIT",
