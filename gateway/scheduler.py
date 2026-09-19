@@ -11,7 +11,7 @@ from . import scheduler_kernel
 from .config import GatewaySettings
 from .db import connect
 from .models import ACTIVE_TASK_STATUSES
-from .worker_client import WorkerClient
+from .worker_client import WorkerClient, WorkerSubmitError
 from .worker_provider import WorkerConfig, WorkerSnapshot, build_worker_provider
 
 logger = logging.getLogger(__name__)
@@ -809,6 +809,41 @@ class GatewayScheduler:
                         self._audit("fencing_lost", task_id=task_id, action="after_submit")
                         return
                     self._audit("worker_submit_completed", task_id=task_id, worker_account_id=worker.account_id, worker_job_id=result.get("job_id") or result.get("worker_job_id"))
+                except WorkerSubmitError as exc:
+                    if 400 <= exc.status_code < 500:
+                        async with self.assignment_lock:
+                            self._audit("account_released", task_id=task_id, account_id=account_id, release_reason="worker_rejected_before_remote_submit")
+                            account = await crud.get_account(self.db, account_id)
+                            details = str(exc.response or exc)[:500]
+                            await crud.guarded_release_account(
+                                self.db,
+                                task_id,
+                                account_id,
+                                token["lease_owner"],
+                                token["lease_version"],
+                                int((account or {}).get("lock_version") or 0),
+                                "failed_before_remote_submit",
+                                error_code=type(exc).__name__[:120],
+                                error_message=str(exc)[:500],
+                                last_error_code=type(exc).__name__[:120],
+                                last_error_message=details,
+                                remaining_credits=task.get("remaining_credits"),
+                            )
+                        return
+                    async with self.assignment_lock:
+                        await crud.guarded_update_task(
+                            self.db,
+                            task_id,
+                            token["lease_owner"],
+                            token["lease_version"],
+                            "submission_unknown",
+                            error_code=type(exc).__name__[:120],
+                            error_message=str(exc)[:500],
+                            last_error_code=type(exc).__name__[:120],
+                            last_error_message=str(exc.response or exc)[:500],
+                            remaining_credits=task.get("remaining_credits"),
+                        )
+                    return
                 except Exception as exc:
                     async with self.assignment_lock:
                         self._audit("account_released", task_id=task_id, account_id=account_id, release_reason="worker_submit_failed")

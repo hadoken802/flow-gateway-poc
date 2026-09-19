@@ -143,3 +143,32 @@ async def test_worker_uploads_all_images_as_ordered_reference_media(monkeypatch,
     assert uploads == ["1.png", "2.jpg"]
     assert submitted["reference_media_ids"] == ["media-1.png", "media-2.jpg"]
     assert response["input_media_ids"] == ["media-1.png", "media-2.jpg"]
+
+
+@pytest.mark.asyncio
+async def test_flow_client_upload_retries_legacy_payload_after_invalid_argument(monkeypatch):
+    from agent.services.flow_client import FlowClient
+
+    client = FlowClient()
+    requests = []
+
+    async def fake_send(method, params, timeout):
+        requests.append((method, params, timeout))
+        if len(requests) == 1:
+            return {"status": 400, "data": {"error": {"status": "INVALID_ARGUMENT"}}}
+        return {"status": 200, "data": {"mediaGenerationId": {"mediaGenerationId": "media-legacy"}}}
+
+    monkeypatch.setattr(client, "_send", fake_send)
+
+    result = await client.upload_image("base64", mime_type="image/png", project_id="project-1", file_name="shoe.png")
+
+    assert len(requests) == 2
+    assert requests[0][1]["body"]["imageBytes"] == "base64"
+    assert requests[1][1]["body"]["imageInput"] == {
+        "rawImageBytes": "base64",
+        "mimeType": "image/png",
+        "isUserUploaded": True,
+        "aspectRatio": "IMAGE_ASPECT_RATIO_PORTRAIT",
+    }
+    assert requests[1][1]["body"]["clientContext"]["tool"] == "ASSET_MANAGER"
+    assert result["_mediaId"] == "media-legacy"

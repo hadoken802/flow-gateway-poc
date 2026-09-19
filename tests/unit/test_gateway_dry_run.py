@@ -1022,6 +1022,11 @@ async def test_real_mode_upstream_403_saves_worker_job_and_requires_manual_submi
     assert task["worker_job_id"] == "job-upstream-403"
     assert task["error_code"] == "UPSTREAM_UNUSUAL_ACTIVITY"
     assert task["account_id"] == "FLOW-002"
+    for _ in range(100):
+        accounts = {a["account_id"]: a for a in await scheduler.list_accounts()}
+        if accounts["FLOW-002"]["current_task_id"] is None:
+            break
+        await asyncio.sleep(0.02)
     assert accounts["FLOW-002"]["current_task_id"] is None
     assert accounts["FLOW-002"]["lock_owner"] is None
     assert task["lease_owner"] is None
@@ -1606,6 +1611,49 @@ async def test_submission_unknown_does_not_switch_account_or_resubmit():
         assert current["status"] == "submission_unknown"
         assert current["assigned_account_id"] == "FLOW-001"
         assert client.submits == []
+    finally:
+        await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_worker_4xx_before_job_creation_releases_account_as_failed_before_remote_submit():
+    from gateway import crud
+    from gateway.config import GatewaySettings
+    from gateway.worker_client import WorkerSubmitError
+
+    class RejectedUploadWorkerClient(FakeRealWorkerClient):
+        async def submit_omni_video(self, worker, payload):
+            self.submits.append((worker.account_id, dict(payload)))
+            raise WorkerSubmitError(400, "Worker submit failed: HTTP 400", {
+                "detail": {"error": {"status": "INVALID_ARGUMENT"}},
+            })
+
+    workers = RUN_ROOT / "upload_400_workers.json"
+    write_workers(workers, ["FLOW-001"])
+    client = RejectedUploadWorkerClient({"FLOW-001": {"credits": 100}})
+    scheduler = make_scheduler(
+        GatewaySettings(db_path=local_db("upload_400"), workers_path=workers, dry_run=False, real_submit_max_attempts=1),
+        client,
+    )
+    await scheduler.start()
+    try:
+        task = await create_unscheduled_task(
+            scheduler,
+            {"idempotency_key": "upload-400", "image_path": "D:/img.png", "prompt": "p"},
+        )
+        await scheduler.schedule_once()
+        failed = await wait_for_task_status(scheduler, task["task_id"], {"failed_before_remote_submit"})
+        deadline = asyncio.get_event_loop().time() + 1
+        while True:
+            account = await crud.get_account(scheduler.db, "FLOW-001")
+            if account["current_task_id"] is None or asyncio.get_event_loop().time() >= deadline:
+                break
+            await asyncio.sleep(0.01)
+
+        assert failed["status"] == "failed_before_remote_submit"
+        assert failed["last_error_message"] == "{'detail': {'error': {'status': 'INVALID_ARGUMENT'}}}"
+        assert account["current_task_id"] is None
+        assert account["reserved_credits"] == 0
     finally:
         await scheduler.stop()
 

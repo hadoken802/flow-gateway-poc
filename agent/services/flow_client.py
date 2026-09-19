@@ -721,13 +721,39 @@ class FlowClient:
             "body": body,
         }, timeout=60)
 
-        # Extract media.name for convenience (used as mediaId in video gen)
+        # Flow currently serves two upload request formats across frontend
+        # rollouts. A schema mismatch is a definite pre-submit failure, so it
+        # is safe to retry once with the older imageInput envelope.
+        if result.get("status") == 400:
+            legacy_body = {
+                "imageInput": {
+                    "rawImageBytes": image_base64,
+                    "mimeType": mime_type,
+                    "isUserUploaded": True,
+                    "aspectRatio": "IMAGE_ASPECT_RATIO_PORTRAIT",
+                },
+                "clientContext": {
+                    "sessionId": f";{int(time.time() * 1000)}",
+                    "tool": "ASSET_MANAGER",
+                },
+            }
+            result = await self._send("api_request", {
+                "url": url,
+                "method": "POST",
+                "headers": random_headers(),
+                "body": legacy_body,
+            }, timeout=60)
+
+        # Extract the media id returned by either upload format.
         if not _is_ws_error(result):
             data = result.get("data", {})
             if isinstance(data, dict):
                 media = data.get("media", {})
                 if isinstance(media, dict) and media.get("name"):
                     result["_mediaId"] = media["name"]
+                legacy_media = data.get("mediaGenerationId", {})
+                if not result.get("_mediaId") and isinstance(legacy_media, dict):
+                    result["_mediaId"] = legacy_media.get("mediaGenerationId")
 
         return result
 
