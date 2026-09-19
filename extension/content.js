@@ -11,18 +11,10 @@
 
 chrome.runtime.onMessage.addListener((msg, _, reply) => {
   if (msg.type === 'CLICK_NEW_PROJECT') {
-    try {
-      const target = [...document.querySelectorAll('button, a, [role="button"]')].find((element) => {
-        const text = `${element.textContent || ''} ${element.getAttribute('aria-label') || ''}`.trim();
-        return element.getClientRects().length > 0 && !element.disabled && /新建项目|创建项目|New project|Create project/i.test(text);
-      });
-      if (!target) throw new Error('NEW_PROJECT_BUTTON_NOT_FOUND');
-      target.click();
-      reply({ clicked: true });
-    } catch (e) {
-      reply({ error: e.message || 'NEW_PROJECT_CLICK_FAILED' });
-    }
-    return;
+    clickNewProject()
+      .then(() => reply({ clicked: true }))
+      .catch((e) => reply({ error: e.message || 'NEW_PROJECT_CLICK_FAILED' }));
+    return true;
   }
   if (msg.type === 'GET_PAGE_CREDITS') {
     readPageCredits()
@@ -67,6 +59,25 @@ window.addEventListener('TRPC_MEDIA_URLS', (e) => {
     body,
   }).catch(() => {});
 });
+
+async function clickNewProject() {
+  const deadline = Date.now() + 15000;
+  let target = null;
+  while (Date.now() < deadline) {
+    target = [...document.querySelectorAll('button, a, [role="button"]')].find((element) => {
+      const text = `${element.textContent || ''} ${element.getAttribute('aria-label') || ''}`.trim();
+      return element.getClientRects().length > 0 && !element.disabled && /新建项目|创建项目|New project|Create project/i.test(text);
+    });
+    if (target) break;
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  if (!target) throw new Error('NEW_PROJECT_BUTTON_NOT_FOUND');
+  // The Angular shell can report document complete before the button handler is hydrated.
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+  target.scrollIntoView({ block: 'center', inline: 'center' });
+  target.focus();
+  target.click();
+}
 
 async function readPageCredits() {
   const parse = () => {

@@ -425,14 +425,17 @@ async function handlePageCreateProject(msg) {
       await chrome.tabs.update(tab.id, { url: 'https://flow.google.com/' });
       await waitForTabComplete(tab.id, 30000);
     }
+    await new Promise((resolve) => setTimeout(resolve, 1000));
     const clicked = await chrome.tabs.sendMessage(tab.id, { type: 'CLICK_NEW_PROJECT' });
     if (!clicked?.clicked) throw new Error(clicked?.error || 'NEW_PROJECT_CLICK_FAILED');
-    const deadline = Date.now() + 30000;
+    const deadline = Date.now() + 45000;
     while (Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 250));
-      const current = await chrome.tabs.get(tab.id);
-      const match = (current.url || '').match(/\/project\/([0-9a-f-]{36})/i);
-      if (match) {
+      const currentTabs = await chrome.tabs.query({ url: FLOW_TAB_PATTERNS });
+      const projectTab = currentTabs.find((item) => /\/project\/([0-9a-f-]{36})/i.test(item.url || ''));
+      const match = (projectTab?.url || '').match(/\/project\/([0-9a-f-]{36})/i);
+      if (projectTab && match) {
+        await chrome.tabs.update(projectTab.id, { active: true });
         fallbackToWebSocket({ id: msg.id, status: 200, data: { projectId: match[1] } });
         return;
       }

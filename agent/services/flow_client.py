@@ -396,7 +396,9 @@ class FlowClient:
 
     async def create_project(self, project_title: str, tool_name: str = "PINHOLE") -> dict:
         """Create a project through the authenticated current Flow page."""
-        result = await self._send("page_create_project", {"projectTitle": project_title, "toolName": tool_name}, timeout=45)
+        result = await self._send("page_create_project", {"projectTitle": project_title, "toolName": tool_name}, timeout=75)
+        if result.get("error"):
+            logger.error("Flow page project creation failed: %s", result["error"])
         data = result.get("data", result)
         project_id = data.get("projectId") if isinstance(data, dict) else None
         if not project_id:

@@ -46,7 +46,7 @@ def test_extension_reads_current_flow_page_credits_and_returns_over_websocket():
 def test_extension_version_invalidates_stale_service_worker_cache():
     manifest = json.loads(Path("extension/manifest.json").read_text(encoding="utf-8"))
 
-    assert tuple(map(int, manifest["version"].split("."))) >= (0, 2, 2)
+    assert tuple(map(int, manifest["version"].split("."))) >= (0, 2, 3)
 
 
 @pytest.mark.asyncio
@@ -62,7 +62,7 @@ async def test_create_project_uses_authenticated_flow_page(monkeypatch):
 
     result = await client.create_project("测试项目")
 
-    assert calls == [("page_create_project", {"projectTitle": "测试项目", "toolName": "PINHOLE"}, 45)]
+    assert calls == [("page_create_project", {"projectTitle": "测试项目", "toolName": "PINHOLE"}, 75)]
     assert result["data"]["result"]["data"]["json"]["result"]["projectId"] == "eb7ee09c-bd8d-4d7c-bbbb-a8191b4a0dc0"
 
 
@@ -71,8 +71,10 @@ def test_extension_creates_project_by_clicking_current_flow_page():
     background = Path("extension/background.js").read_text(encoding="utf-8")
 
     assert "CLICK_NEW_PROJECT" in content
+    assert "const deadline = Date.now() + 15000" in content
     assert "新建项目|创建项目|New project|Create project" in content
     assert "msg.method === 'page_create_project'" in background
+    assert "const currentTabs = await chrome.tabs.query" in background
     assert "data: { projectId: match[1] }" in background
 
 
