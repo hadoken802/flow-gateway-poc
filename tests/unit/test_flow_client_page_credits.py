@@ -46,8 +46,10 @@ def test_extension_reads_current_flow_page_credits_and_returns_over_websocket():
 def test_extension_version_invalidates_stale_service_worker_cache():
     manifest = json.loads(Path("extension/manifest.json").read_text(encoding="utf-8"))
 
-    assert tuple(map(int, manifest["version"].split("."))) >= (0, 2, 6)
+    assert tuple(map(int, manifest["version"].split("."))) >= (0, 2, 7)
     assert "debugger" in manifest["permissions"]
+    assert manifest["background"]["service_worker"] == "background-loader-027.js"
+    assert "background.js?v=0.2.7" in Path("extension/background-loader-027.js").read_text(encoding="utf-8")
 
 
 @pytest.mark.asyncio
