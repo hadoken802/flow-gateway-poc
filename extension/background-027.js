@@ -1,0 +1,1137 @@
+/**
+ * Flow Kit — Chrome Extension Background Service Worker
+ *
+ * Connects to local Python agent via WebSocket (agent runs WS server).
+ * Captures bearer token, solves reCAPTCHA, proxies API calls through browser.
+ */
+
+const DEFAULT_ACCOUNT_ID = '';
+const DEFAULT_AGENT_WS_URL = '';
+const FLOW_URL = 'https://flow.google.com/';
+const FLOW_TAB_PATTERNS = [
+  'https://flow.google.com/*',
+  'https://labs.google/fx/tools/flow*',
+  'https://labs.google/fx/*/tools/flow*',
+];
+const KEEPALIVE_INTERVAL_MS = 20000;
+// NOTE: This is a browser-restricted public API key — safe to ship in extension bundles.
+const API_KEY = '';
+
+let ws = null;
+let reconnectTimer = null;
+let keepaliveTimer = null;
+let initialized = false;
+let activeSocketId = 0;
+let accountId = DEFAULT_ACCOUNT_ID;
+let wsUrl = DEFAULT_AGENT_WS_URL;
+let apiUrl = '';
+let flowKey = null;
+let pageCredits = null;
+let pageCreditsCapturedAt = null;
+let callbackSecret = null;  // Auth secret for HTTP callback, received from server on WS connect
+let state = 'off'; // off | idle | running
+let manualDisconnect = false;
+let metrics = {
+  tokenCapturedAt: null,
+  requestCount: 0,   // captcha-consuming requests only (gen image/video/upscale)
+  successCount: 0,
+  failedCount: 0,
+  lastError: null,
+};
+
+function resetBootstrapSensitiveState() {
+  flowKey = null;
+  callbackSecret = null;
+  metrics = {
+    tokenCapturedAt: null,
+    requestCount: 0,
+    successCount: 0,
+    failedCount: 0,
+    lastError: null,
+  };
+  manualDisconnect = false;
+  clearReconnectTimer();
+  if (ws) {
+    const old = ws;
+    ws = null;
+    old.close();
+    recordBootstrapDiagnostic('old_websocket_closed');
+  }
+}
+
+function safeWs() {
+  try {
+    const url = new URL(wsUrl);
+    return { host: url.hostname, port: Number(url.port) };
+  } catch (_) {
+    return {};
+  }
+}
+
+function safeWsErrorCode(eventOrError) {
+  const message = eventOrError?.message || eventOrError?.reason || '';
+  if (message.toLowerCase().includes('refused')) return 'connection_refused';
+  if (eventOrError?.code) return 'connection_closed';
+  if (eventOrError?.name === 'SyntaxError') return 'invalid_url';
+  if (eventOrError?.name) return 'runtime_error';
+  return 'unknown';
+}
+
+function validBootstrapDiagnosticTarget() {
+  try {
+    const url = new URL(apiUrl);
+    return url.protocol === 'http:' && url.hostname === '127.0.0.1' && Number(url.port) >= 1 && Number(url.port) <= 65535;
+  } catch (_) {
+    return false;
+  }
+}
+
+function recordBootstrapDiagnostic(event, error_code = null) {
+  if (!accountId || !validBootstrapDiagnosticTarget()) return;
+  const payload = {
+    type: 'bootstrap_diagnostic',
+    source: 'background',
+    event,
+    account_id: accountId,
+    ws: safeWs(),
+    at: new Date().toISOString(),
+  };
+  if (error_code) payload.error_code = error_code;
+  fetch(`${apiUrl}/api/ext/bootstrap-diagnostic`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  }).catch(() => {});
+}
+
+// ─── URL → Log Type Classifier ─────────────────────────────
+
+// Visible log types — only these appear in the request log
+const _VISIBLE_TYPES = new Set(['GEN_IMG', 'GEN_VID', 'GEN_VID_REF', 'UPSCALE', 'TRACKING', 'URL_REFRESH']);
+
+function _classifyApiUrl(url) {
+  if (url.includes('uploadImage'))                     return 'UPLOAD';
+  if (url.includes('batchGenerateImages'))              return 'GEN_IMG';
+  if (url.includes('UpsampleVideo'))                   return 'UPSCALE';
+  if (url.includes('ReferenceImages'))                 return 'GEN_VID_REF';
+  if (url.includes('batchAsyncGenerateVideo'))          return 'GEN_VID';
+  if (url.includes('batchCheckAsync'))                  return 'POLL';
+  if (url.includes('upsampleImage'))                   return 'UPS_IMG';
+  if (url.includes('/media/'))                         return 'MEDIA';
+  if (url.includes('/credits'))                        return 'CREDITS';
+  return 'API';
+}
+
+// ─── Request Log ────────────────────────────────────────────
+
+let requestLog = [];
+
+function addRequestLog(entry) {
+  requestLog.unshift(entry);
+  if (requestLog.length > 100) requestLog.pop();
+  broadcastRequestLog();
+}
+
+function updateRequestLog(id, updates) {
+  const entry = requestLog.find((e) => e.id === id);
+  if (entry) Object.assign(entry, updates);
+  broadcastRequestLog();
+}
+
+function broadcastRequestLog() {
+  chrome.runtime.sendMessage({ type: 'REQUEST_LOG_UPDATE', log: requestLog }).catch(() => {});
+}
+
+// ─── Startup ────────────────────────────────────────────────
+
+chrome.runtime.onInstalled.addListener(init);
+chrome.runtime.onStartup.addListener(init);
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name === 'reconnect') connectToAgent();
+  if (alarm.name === 'keepAlive') keepAlive();
+  if (alarm.name === 'token-refresh') {
+    await captureTokenFromFlowTab();
+  }
+});
+
+async function init() {
+  if (initialized) return;
+  initialized = true;
+  const data = await chrome.storage.local.get(['flowKey', 'pageCredits', 'pageCreditsCapturedAt', 'metrics', 'callbackSecret', 'account_id', 'ws_url', 'api_url']);
+  if (data.flowKey) flowKey = data.flowKey;
+  if (Number.isInteger(data.pageCredits) && data.pageCredits >= 0) pageCredits = data.pageCredits;
+  if (Number.isInteger(data.pageCreditsCapturedAt)) pageCreditsCapturedAt = data.pageCreditsCapturedAt;
+  if (data.metrics) Object.assign(metrics, data.metrics);
+  if (data.callbackSecret) callbackSecret = data.callbackSecret;
+  accountId = data.account_id || '';
+  wsUrl = data.ws_url || '';
+  apiUrl = data.api_url || '';
+  recordBootstrapDiagnostic('service_worker_started');
+  if (accountId && wsUrl) connectToAgent();
+  chrome.alarms.create('keepAlive', { periodInMinutes: 0.4 });
+}
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local') return;
+  if (changes.account_id) accountId = changes.account_id.newValue || '';
+  if (changes.ws_url) wsUrl = changes.ws_url.newValue || '';
+  if (changes.api_url) apiUrl = changes.api_url.newValue || '';
+  if (changes.account_id || changes.ws_url || changes.api_url) {
+    recordBootstrapDiagnostic('storage_change_observed');
+    manualDisconnect = false;
+    clearReconnectTimer();
+    if (ws) {
+      const old = ws;
+      ws = null;
+      old.close();
+      recordBootstrapDiagnostic('old_websocket_closed');
+    }
+    connectToAgent();
+  }
+});
+
+// ─── Token Capture ──────────────────────────────────────────
+
+chrome.webRequest.onBeforeSendHeaders.addListener(
+  (details) => {
+    if (!details?.requestHeaders?.length) return;
+    const authHeader = details.requestHeaders.find(
+      (h) => h.name?.toLowerCase() === 'authorization',
+    );
+    const value = authHeader?.value || '';
+    if (!value.startsWith('Bearer ya29.')) return;
+
+    const token = value.replace(/^Bearer\s+/i, '').trim();
+    if (!token) return;
+
+    // Always update — even if same token string, refresh the timestamp
+    flowKey = token;
+    metrics.tokenCapturedAt = Date.now();
+    chrome.storage.local.set({ flowKey, metrics });
+    console.log('[FlowAgent] Bearer token captured');
+
+    // Notify agent
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'token_captured', flowKey }));
+    }
+  },
+  { urls: ['https://aisandbox-pa.googleapis.com/*', 'https://flow.google.com/*', 'https://labs.google/*'] },
+  ['requestHeaders', 'extraHeaders'],
+);
+
+let _openingFlowTab = false;
+
+async function captureTokenFromFlowTab() {
+  const tabs = await chrome.tabs.query({
+    url: FLOW_TAB_PATTERNS,
+  });
+  if (!tabs.length) {
+    if (_openingFlowTab) {
+      console.log('[FlowAgent] Flow tab already opening, skipping');
+      return;
+    }
+    _openingFlowTab = true;
+    try {
+      console.log('[FlowAgent] No Flow tab found — opening one in background');
+      await chrome.tabs.create({ url: FLOW_URL, active: false });
+      await sleep(3000);
+      const retryTabs = await chrome.tabs.query({
+        url: FLOW_TAB_PATTERNS,
+      });
+      if (!retryTabs.length) {
+        console.log('[FlowAgent] Flow tab not ready yet after open');
+        return;
+      }
+      await chrome.scripting.executeScript({
+        target: { tabId: retryTabs[0].id },
+        files: ['content.js'],
+      });
+      console.log('[FlowAgent] Token refresh triggered on newly opened Flow tab');
+    } catch (e) {
+      console.error('[FlowAgent] Token refresh failed after opening tab:', e);
+    } finally {
+      _openingFlowTab = false;
+    }
+    return;
+  }
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: tabs[0].id },
+      files: ['content.js'],
+    });
+    console.log('[FlowAgent] Token refresh triggered on Flow tab');
+  } catch (e) {
+    console.error('[FlowAgent] Token refresh failed:', e);
+  }
+}
+
+// ─── WebSocket to Agent ─────────────────────────────────────
+
+function connectToAgent() {
+  if (manualDisconnect) return;
+  if (!accountId || !wsUrl) return;
+  if (ws?.readyState === WebSocket.CONNECTING) return;
+  if (ws?.readyState === WebSocket.OPEN) return;
+  clearReconnectTimer();
+
+  try {
+    if (ws) {
+      const old = ws;
+      ws = null;
+      old.close();
+      recordBootstrapDiagnostic('old_websocket_closed');
+    }
+    const socketId = ++activeSocketId;
+    recordBootstrapDiagnostic('websocket_connect_attempt');
+    ws = new WebSocket(wsUrl);
+    console.log(`[FlowAgent] Connecting account=${accountId} ws=${wsUrl}`);
+    ws._flowSocketId = socketId;
+  } catch (e) {
+    console.error('[FlowAgent] WS connect error:', e);
+    scheduleReconnect();
+    return;
+  }
+
+  ws.onopen = () => {
+    if (ws?._flowSocketId !== activeSocketId) return;
+    console.log('[FlowAgent] Connected to agent');
+    recordBootstrapDiagnostic('websocket_open');
+    chrome.alarms.clear('reconnect');
+    startKeepaliveTimer();
+    setState('idle');
+    ws.send(JSON.stringify({
+      type: 'register',
+      account_id: accountId,
+      profile_id: accountId,
+    }));
+    recordBootstrapDiagnostic('register_sent');
+
+    // Token refresh alarm — 45 min gives buffer before ~60 min expiry
+    chrome.alarms.create('token-refresh', { periodInMinutes: 45 });
+
+    // Send current state + resend token if we have one
+    ws.send(JSON.stringify({
+      type: 'extension_ready',
+      flowKeyPresent: !!flowKey,
+      tokenAge: flowKey && metrics.tokenCapturedAt ? Date.now() - metrics.tokenCapturedAt : null,
+    }));
+    recordBootstrapDiagnostic('extension_ready_sent');
+    if (flowKey) {
+      ws.send(JSON.stringify({ type: 'token_captured', flowKey }));
+    }
+    if (Number.isInteger(pageCredits)) {
+      ws.send(JSON.stringify({
+        type: 'credits_captured',
+        credits: pageCredits,
+        capturedAt: pageCreditsCapturedAt,
+      }));
+    }
+  };
+
+  ws.onmessage = async ({ data }) => {
+    if (ws?._flowSocketId !== activeSocketId) return;
+    try {
+      const msg = JSON.parse(data);
+
+      if (msg.method === 'api_request') {
+        await handleApiRequest(msg);
+      } else if (msg.method === 'page_credits') {
+        await handlePageCreditsRequest(msg);
+      } else if (msg.method === 'page_create_project') {
+        await handlePageCreateProject(msg);
+      } else if (msg.method === 'trpc_request') {
+        await handleTrpcRequest(msg);
+      } else if (msg.method === 'solve_captcha') {
+        await handleSolveCaptcha(msg);
+      } else if (msg.method === 'get_status') {
+        sendToAgent({
+          id: msg.id,
+          result: {
+            state,
+            flowKeyPresent: !!flowKey,
+            manualDisconnect,
+            tokenAge: metrics.tokenCapturedAt ? Date.now() - metrics.tokenCapturedAt : null,
+            metrics,
+          },
+        });
+      } else if (msg.type === 'callback_secret') {
+        callbackSecret = msg.secret;
+        chrome.storage.local.set({ callbackSecret: msg.secret });
+        console.log('[FlowAgent] Received callback secret');
+      } else if (msg.type === 'keepalive_ack') {
+        // application-level keepalive response
+      } else if (msg.type === 'pong') {
+        // keepalive response
+      }
+    } catch (e) {
+      console.error('[FlowAgent] Message error:', e);
+    }
+  };
+
+  ws.onclose = (event) => {
+    if (ws?._flowSocketId !== activeSocketId) return;
+    clearKeepaliveTimer();
+    setState('off');
+    chrome.alarms.clear('token-refresh');
+    const reason = event.reason || '';
+    const tooLarge = event.code === 1009 || reason.toLowerCase().includes('message too big') || reason.toLowerCase().includes('payloadtoobig');
+    metrics.lastError = tooLarge ? 'websocket_message_too_large' : `WS_CLOSED_${event.code}`;
+    chrome.storage.local.set({ metrics });
+    console.warn(`[FlowAgent] WS closed code=${event.code} reason=${reason || ''} error=${metrics.lastError}`);
+    recordBootstrapDiagnostic('websocket_close', safeWsErrorCode(event));
+    if (!manualDisconnect) scheduleReconnect();
+  };
+
+  ws.onerror = (e) => {
+    console.error('[FlowAgent] WS error:', e);
+    recordBootstrapDiagnostic('websocket_error', safeWsErrorCode(e));
+    metrics.lastError = 'WS_ERROR';
+    chrome.storage.local.set({ metrics });
+  };
+}
+
+async function handlePageCreditsRequest(msg) {
+  try {
+    const tabs = await chrome.tabs.query({ url: FLOW_TAB_PATTERNS });
+    if (!tabs.length) {
+      fallbackToWebSocket({ id: msg.id, status: 503, error: 'NO_FLOW_TAB' });
+      return;
+    }
+    const response = await chrome.tabs.sendMessage(tabs[0].id, { type: 'GET_PAGE_CREDITS' });
+    const credits = response?.credits;
+    if (!Number.isInteger(credits) || credits < 0) {
+      fallbackToWebSocket({ id: msg.id, status: 502, error: response?.error || 'PAGE_CREDITS_INVALID' });
+      return;
+    }
+    pageCredits = credits;
+    pageCreditsCapturedAt = Date.now();
+    await chrome.storage.local.set({ pageCredits, pageCreditsCapturedAt });
+    fallbackToWebSocket({
+      id: msg.id,
+      status: 200,
+      data: { credits, creditsSource: 'flow_page', capturedAt: pageCreditsCapturedAt },
+    });
+  } catch (e) {
+    fallbackToWebSocket({ id: msg.id, status: 500, error: e.message || 'PAGE_CREDITS_FAILED' });
+  }
+}
+
+async function handlePageCreateProject(msg) {
+  try {
+    await chrome.storage.local.set({ projectCreateTrace: { stage: 'received', at: Date.now(), requestId: msg.id } });
+    const tabs = await chrome.tabs.query({ url: FLOW_TAB_PATTERNS });
+    if (!tabs.length) throw new Error('NO_FLOW_TAB');
+    const tab = tabs[0];
+    await chrome.storage.local.set({ projectCreateTrace: { stage: 'tab_selected', at: Date.now(), tabId: tab.id, url: tab.url } });
+    if (!/^https:\/\/flow\.google\.com\/?(?:[?#].*)?$/.test(tab.url || '')) {
+      await chrome.tabs.update(tab.id, { url: 'https://flow.google.com/' });
+      await waitForTabComplete(tab.id, 30000);
+    }
+    await chrome.storage.local.set({ projectCreateTrace: { stage: 'home_ready', at: Date.now(), tabId: tab.id } });
+    const point = await waitForNewProjectButton(tab.id, 15000);
+    await chrome.storage.local.set({ projectCreateTrace: { stage: 'button_ready', at: Date.now(), tabId: tab.id, point } });
+    await trustedClick(tab.id, point.x, point.y);
+    await chrome.storage.local.set({ projectCreateTrace: { stage: 'clicked', at: Date.now(), tabId: tab.id } });
+    const deadline = Date.now() + 45000;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const currentTabs = await chrome.tabs.query({ url: FLOW_TAB_PATTERNS });
+      const projectTab = currentTabs.find((item) => /\/project\/([0-9a-f-]{36})/i.test(item.url || ''));
+      const match = (projectTab?.url || '').match(/\/project\/([0-9a-f-]{36})/i);
+      if (projectTab && match) {
+        await chrome.tabs.update(projectTab.id, { active: true });
+        const response = { id: msg.id, status: 200, data: { projectId: match[1] } };
+        await chrome.storage.local.set({ projectCreateTrace: { stage: 'project_found', at: Date.now(), tabId: projectTab.id, projectId: match[1] } });
+        fallbackToWebSocket(response);
+        await sendToAgent(response);
+        await chrome.storage.local.set({ projectCreateTrace: { stage: 'response_sent', at: Date.now(), projectId: match[1] } });
+        return;
+      }
+    }
+    throw new Error('PROJECT_NAVIGATION_TIMEOUT');
+  } catch (e) {
+    const response = { id: msg.id, status: 502, error: e.message || 'PAGE_CREATE_PROJECT_FAILED' };
+    await chrome.storage.local.set({ projectCreateTrace: { stage: 'failed', at: Date.now(), error: response.error } });
+    fallbackToWebSocket(response);
+    await sendToAgent(response);
+  }
+}
+
+async function waitForNewProjectButton(tabId, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const [{ result }] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const target = [...document.querySelectorAll('button, a, [role="button"]')].find((element) => {
+          const text = `${element.textContent || ''} ${element.getAttribute('aria-label') || ''}`.trim();
+          return element.getClientRects().length > 0 && !element.disabled && /新建项目|创建项目|New project|Create project/i.test(text);
+        });
+        if (!target) return null;
+        const rect = target.getBoundingClientRect();
+        return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+      },
+    });
+    if (result && Number.isFinite(result.x) && Number.isFinite(result.y)) return result;
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  throw new Error('NEW_PROJECT_BUTTON_NOT_FOUND');
+}
+
+async function trustedClick(tabId, x, y) {
+  const target = { tabId };
+  await chrome.debugger.attach(target, '1.3');
+  try {
+    await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
+    await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 });
+    await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
+  } finally {
+    await chrome.debugger.detach(target).catch(() => {});
+  }
+}
+
+function waitForTabComplete(tabId, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  return (async () => {
+    while (Date.now() < deadline) {
+      const tab = await chrome.tabs.get(tabId);
+      if (tab.status === 'complete' && /^https:\/\/flow\.google\.com\/?(?:[?#].*)?$/.test(tab.url || '')) return;
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    throw new Error('FLOW_HOME_TIMEOUT');
+  })();
+}
+
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectToAgent();
+  }, 5000);
+  chrome.alarms.create('reconnect', { delayInMinutes: 0.083 }); // service worker backup
+}
+
+function clearReconnectTimer() {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  chrome.alarms.clear('reconnect');
+}
+
+function keepAlive() {
+  if (ws?.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'keepalive', at: Date.now() }));
+  } else {
+    connectToAgent();
+  }
+}
+
+function startKeepaliveTimer() {
+  if (keepaliveTimer) return;
+  keepaliveTimer = setInterval(() => keepAlive(), KEEPALIVE_INTERVAL_MS);
+}
+
+function clearKeepaliveTimer() {
+  if (!keepaliveTimer) return;
+  clearInterval(keepaliveTimer);
+  keepaliveTimer = null;
+}
+
+function fallbackToWebSocket(msg) {
+  if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+}
+
+async function sendToAgent(msg) {
+  // API responses (with msg.id) go via HTTP — immune to WS disconnect
+  if (msg.id) {
+    const agentHttpUrl = getAgentHttpUrl();
+    if (!agentHttpUrl) {
+      fallbackToWebSocket(msg);
+      return false;
+    }
+    try {
+      const response = await fetch(agentHttpUrl + '/api/ext/callback', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(msg),
+      });
+      if (!response.ok) {
+        fallbackToWebSocket(msg);
+        return false;
+      }
+      let data = null;
+      try {
+        data = await response.json();
+      } catch (_) {
+        fallbackToWebSocket(msg);
+        return false;
+      }
+      if (data?.ok !== true) fallbackToWebSocket(msg);
+      return data?.ok === true;
+    } catch (_) {
+      fallbackToWebSocket(msg);
+      return false;
+    }
+  }
+  // Non-response messages (ping, status) or no secret yet — use WS
+  fallbackToWebSocket(msg);
+  return true;
+}
+
+function getAgentHttpUrl() {
+  try {
+    if (!apiUrl) return null;
+    const url = new URL(apiUrl);
+    const port = Number(url.port);
+    if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || port < 1 || port > 65535) {
+      return null;
+    }
+    const httpUrl = `http://127.0.0.1:${port}`;
+    console.log(`[FlowAgent] HTTP callback target ${httpUrl}`);
+    return httpUrl;
+  } catch {
+    return null;
+  }
+}
+
+// ─── reCAPTCHA Solving ──────────────────────────────────────
+
+async function requestCaptchaFromTab(tabId, requestId, pageAction) {
+  try {
+    return await chrome.tabs.sendMessage(tabId, {
+      type: 'GET_CAPTCHA',
+      requestId,
+      pageAction,
+    });
+  } catch (error) {
+    const msg = error?.message || '';
+    const shouldInject =
+      msg.includes('Receiving end does not exist') ||
+      msg.includes('Could not establish connection');
+    if (!shouldInject) throw error;
+
+    // Inject content script and retry
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ['content.js'],
+    });
+    await sleep(200);
+    return await chrome.tabs.sendMessage(tabId, {
+      type: 'GET_CAPTCHA',
+      requestId,
+      pageAction,
+    });
+  }
+}
+
+async function solveCaptcha(requestId, captchaAction) {
+  const tabs = await chrome.tabs.query({
+    url: FLOW_TAB_PATTERNS,
+  });
+
+  if (!tabs.length) {
+    // Auto-open Flow tab and wait briefly before returning error
+    try {
+      await chrome.tabs.create({ url: FLOW_URL, active: false });
+      await sleep(3000);
+      // Retry tab query after opening
+      const retryTabs = await chrome.tabs.query({
+        url: FLOW_TAB_PATTERNS,
+      });
+      if (!retryTabs.length) return { error: 'NO_FLOW_TAB' };
+      const resp = await Promise.race([
+        requestCaptchaFromTab(retryTabs[0].id, requestId, captchaAction),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('CAPTCHA_TIMEOUT')), 30000)),
+      ]);
+      return resp;
+    } catch (e) {
+      return { error: e.message || 'NO_FLOW_TAB' };
+    }
+  }
+
+  try {
+    const resp = await Promise.race([
+      requestCaptchaFromTab(tabs[0].id, requestId, captchaAction),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('CAPTCHA_TIMEOUT')), 30000)),
+    ]);
+    return resp;
+  } catch (e) {
+    return { error: e.message };
+  }
+}
+
+async function handleSolveCaptcha(msg) {
+  const { id, params } = msg;
+  const result = await solveCaptcha(id, params?.captchaAction || 'VIDEO_GENERATION');
+
+  // Standalone captcha solve counts as captcha-consuming
+  metrics.requestCount++;
+  if (result?.token) {
+    metrics.successCount++;
+  } else {
+    metrics.failedCount++;
+    metrics.lastError = result?.error || 'NO_TOKEN';
+  }
+  chrome.storage.local.set({ metrics });
+
+  sendToAgent({ id, result });
+}
+
+// ─── API Request Proxy ──────────────────────────────────────
+
+async function handleTrpcRequest(msg) {
+  const { id, params } = msg;
+  const { url, method = 'POST', headers = {}, body } = params;
+
+  if (!url || !url.startsWith('https://labs.google/')) {
+    sendToAgent({ id, error: 'INVALID_TRPC_URL' });
+    return;
+  }
+
+  setState('running');
+  // TRPC calls don't consume captcha — don't count in metrics
+
+  const logId = id;
+  const logType = url.includes('createProject') ? 'CREATE_PROJECT' : 'TRPC';
+  // TRPC calls are silent — don't show in request log
+
+  const fetchHeaders = { 'Content-Type': 'application/json', ...headers };
+  if (flowKey) {
+    fetchHeaders['authorization'] = `Bearer ${flowKey}`;
+  }
+
+  try {
+    const resp = await fetch(url, {
+      method,
+      headers: fetchHeaders,
+      body: body ? JSON.stringify(body) : undefined,
+      credentials: 'include',
+    });
+    const data = await resp.json();
+    chrome.storage.local.set({ metrics });
+    updateRequestLog(logId, { status: 'success' });
+    sendToAgent({ id, status: resp.status, data });
+  } catch (e) {
+    console.error('[FlowAgent] tRPC request failed:', e);
+    chrome.storage.local.set({ metrics });
+    updateRequestLog(logId, { status: 'failed', error: e.message || 'TRPC_FETCH_FAILED' });
+    sendToAgent({ id, error: e.message || 'TRPC_FETCH_FAILED' });
+  } finally {
+    setState('idle');
+  }
+}
+
+async function handleApiRequest(msg) {
+  const { id, params } = msg;
+  const { url, captchaAction } = params;
+
+  if (!url) {
+    sendToAgent({ id, error: 'MISSING_URL' });
+    return;
+  }
+
+  if (!url.startsWith('https://aisandbox-pa.googleapis.com/')) {
+    sendToAgent({ id, error: 'INVALID_URL' });
+    return;
+  }
+
+  if (captchaAction) {
+    await handleApiRequestInServiceWorker(msg);
+    return;
+  }
+
+  await ensureOffscreenDocument();
+  chrome.runtime.sendMessage({ type: 'OFFSCREEN_API_REQUEST', msg, flowKey }).catch((e) => {
+    sendToAgent({ id, status: 500, error: e.message || 'OFFSCREEN_REQUEST_FAILED' });
+  });
+  return;
+}
+
+async function handleApiRequestInServiceWorker(msg) {
+  const { id, params } = msg;
+  const { url, method, headers, body, captchaAction } = params;
+
+  setState('running');
+  const hasCaptcha = !!captchaAction;
+  if (hasCaptcha) metrics.requestCount++;
+
+  const logId = id;
+  const logType = _classifyApiUrl(url);
+  if (_VISIBLE_TYPES.has(logType)) {
+    const payloadSummary = body ? JSON.stringify(body).slice(0, 200) : null;
+    addRequestLog({ id: logId, type: logType, time: new Date().toISOString(), status: 'processing', error: null, outputUrl: null, url, payloadSummary });
+  }
+
+  try {
+    // Step 1: Solve captcha if needed
+    let captchaToken = null;
+    if (captchaAction) {
+      const captchaResult = await solveCaptcha(id, captchaAction);
+      captchaToken = captchaResult?.token || null;
+      if (!captchaToken) {
+        // Cannot proceed without captcha — API will 403
+        const err = captchaResult?.error || 'CAPTCHA_FAILED';
+        console.error(`[FlowAgent] Captcha failed for ${captchaAction}: ${err}`);
+        sendToAgent({ id, status: 403, error: `CAPTCHA_FAILED: ${err}` });
+        if (hasCaptcha) { metrics.failedCount++; metrics.lastError = `CAPTCHA_FAILED: ${err}`; }
+        chrome.storage.local.set({ metrics });
+        updateRequestLog(logId, { status: 'failed', error: `CAPTCHA_FAILED: ${err}` });
+        setState('idle');
+        return;
+      }
+    }
+
+    // Step 2: Inject captcha token into body
+    let finalBody = body;
+    if (captchaToken && finalBody) {
+      finalBody = JSON.parse(JSON.stringify(finalBody)); // deep clone
+      if (finalBody.clientContext?.recaptchaContext) {
+        finalBody.clientContext.recaptchaContext.token = captchaToken;
+      }
+      if (finalBody.requests && Array.isArray(finalBody.requests)) {
+        for (const req of finalBody.requests) {
+          if (req.clientContext?.recaptchaContext) {
+            req.clientContext.recaptchaContext.token = captchaToken;
+          }
+        }
+      }
+    }
+
+    // Step 3: Use flowKey for auth
+    const activeFlowKey = flowKey;
+    if (!activeFlowKey) {
+      sendToAgent({ id, status: 503, error: 'NO_FLOW_KEY' });
+      if (hasCaptcha) { metrics.failedCount++; metrics.lastError = 'NO_FLOW_KEY'; }
+      chrome.storage.local.set({ metrics });
+      updateRequestLog(logId, { status: 'failed', error: 'NO_FLOW_KEY' });
+      setState('idle');
+      return;
+    }
+
+    const fetchHeaders = { ...(headers || {}) };
+    fetchHeaders['authorization'] = `Bearer ${activeFlowKey}`;
+
+    // Step 4: Make the API call from browser context
+    const response = await fetch(url, {
+      method: method || 'POST',
+      headers: fetchHeaders,
+      credentials: 'include',
+      body: method === 'GET' ? undefined : JSON.stringify(finalBody),
+    });
+
+    let responseData;
+    const responseText = await response.text();
+    try {
+      responseData = JSON.parse(responseText);
+    } catch {
+      responseData = responseText;
+    }
+
+    sendToAgent({
+      id,
+      status: response.status,
+      data: responseData,
+    });
+
+    const responseSummary = responseText ? responseText.slice(0, 300) : null;
+    if (response.ok) {
+      if (hasCaptcha) { metrics.successCount++; metrics.lastError = null; }
+      updateRequestLog(logId, { status: 'success', httpStatus: response.status, responseSummary });
+    } else {
+      if (hasCaptcha) { metrics.failedCount++; metrics.lastError = `API_${response.status}`; }
+      updateRequestLog(logId, { status: 'failed', error: `API_${response.status}`, httpStatus: response.status, responseSummary });
+    }
+  } catch (e) {
+    sendToAgent({
+      id,
+      status: 500,
+      error: e.message || 'API_REQUEST_FAILED',
+    });
+    if (hasCaptcha) { metrics.failedCount++; metrics.lastError = e.message; }
+    updateRequestLog(logId, { status: 'failed', error: e.message || 'API_REQUEST_FAILED' });
+  }
+
+  chrome.storage.local.set({ metrics });
+  setState('idle');
+}
+
+async function ensureOffscreenDocument() {
+  if (!chrome.offscreen?.createDocument) return;
+  const offscreenUrl = chrome.runtime.getURL('offscreen.html');
+  if (chrome.runtime.getContexts) {
+    const contexts = await chrome.runtime.getContexts({
+      contextTypes: ['OFFSCREEN_DOCUMENT'],
+      documentUrls: [offscreenUrl],
+    });
+    if (contexts.length) return;
+  }
+  await chrome.offscreen.createDocument({
+    url: 'offscreen.html',
+    reasons: ['WORKERS'],
+    justification: 'Run long Google Flow media fetches outside the MV3 service worker.',
+  });
+}
+
+// ─── State & Popup ──────────────────────────────────────────
+
+function setState(newState) {
+  state = newState;
+  const badges = { idle: '●', running: '▶', off: '○' };
+  const colors = { idle: '#22c55e', running: '#f59e0b', off: '#6b7280' };
+  chrome.action.setBadgeText({ text: badges[state] || '' });
+  chrome.action.setBadgeBackgroundColor({ color: colors[state] || '#000' });
+  broadcastStatus();
+}
+
+function broadcastStatus() {
+  chrome.runtime.sendMessage({ type: 'STATUS_PUSH' }).catch(() => {});
+}
+
+chrome.runtime.onMessage.addListener((msg, _, reply) => {
+  if (msg.type === 'OFFSCREEN_API_RESPONSE') {
+    sendToAgent(msg.payload);
+    reply({ ok: true });
+    return true;
+  }
+
+  if (msg.type === 'STATUS') {
+    reply({
+      connected: ws?.readyState === WebSocket.OPEN,
+      agentConnected: ws?.readyState === WebSocket.OPEN,
+      account_id: accountId,
+      ws_url: wsUrl,
+      flowKeyPresent: !!flowKey,
+      manualDisconnect,
+      tokenAge: metrics.tokenCapturedAt ? Date.now() - metrics.tokenCapturedAt : null,
+      metrics: {
+        requestCount: metrics.requestCount,
+        successCount: metrics.successCount,
+        failedCount: metrics.failedCount,
+        lastError: metrics.lastError,
+      },
+      state,
+    });
+  }
+
+  if (msg.type === 'DISCONNECT') {
+    manualDisconnect = true;
+    if (ws) ws.close();
+    reply({ ok: true });
+    return true;
+  }
+
+  if (msg.type === 'RECONNECT') {
+    manualDisconnect = false;
+    if (msg.account_id) accountId = msg.account_id;
+    if (msg.ws_url) wsUrl = msg.ws_url;
+    if (msg.api_url) apiUrl = msg.api_url;
+    recordBootstrapDiagnostic('reconnect_received');
+    clearReconnectTimer();
+    if (ws) {
+      const old = ws;
+      ws = null;
+      old.close();
+      recordBootstrapDiagnostic('old_websocket_closed');
+    }
+    connectToAgent();
+    reply({ ok: true });
+    return true;
+  }
+
+  if (msg.type === 'BOOTSTRAP_RESET') {
+    recordBootstrapDiagnostic('bootstrap_reset_received');
+    resetBootstrapSensitiveState();
+    recordBootstrapDiagnostic('bootstrap_reset_completed');
+    reply({ ok: true });
+    return true;
+  }
+
+  if (msg.type === 'REQUEST_LOG') {
+    reply({ log: requestLog });
+    return true;
+  }
+
+  if (msg.type === 'OPEN_FLOW_TAB') {
+    chrome.tabs.query({
+      url: FLOW_TAB_PATTERNS,
+    }).then((tabs) => {
+      if (tabs.length) {
+        chrome.tabs.update(tabs[0].id, { active: true });
+        reply({ ok: true, tabId: tabs[0].id });
+      } else {
+        chrome.tabs.create({ url: FLOW_URL })
+          .then((tab) => reply({ ok: true, tabId: tab.id }))
+          .catch((e) => reply({ error: e.message }));
+      }
+    }).catch((e) => reply({ error: e.message }));
+    return true;
+  }
+
+  if (msg.type === 'REFRESH_TOKEN') {
+    captureTokenFromFlowTab()
+      .then(() => reply({ ok: true }))
+      .catch((e) => reply({ error: e.message }));
+    return true;
+  }
+
+  if (msg.type === 'TEST_CAPTCHA') {
+    solveCaptcha(`test-${Date.now()}`, msg.pageAction || 'IMAGE_GENERATION')
+      .then((r) => reply(r))
+      .catch((e) => reply({ error: e.message }));
+    return true;
+  }
+
+  if (msg.type === 'TRPC_MEDIA_URLS') {
+    handleTrpcMediaUrls(msg.trpcUrl, msg.body);
+    reply({ ok: true });
+    return true;
+  }
+
+  return true;
+});
+
+// ─── TRPC Media URL Extractor ──────────────────────────────
+
+function handleTrpcMediaUrls(trpcUrl, bodyText) {
+  try {
+    // Extract all fresh GCS signed URLs
+    const urlRegex = /https:\/\/storage\.googleapis\.com\/ai-sandbox-videofx\/(?:image|video)\/[0-9a-f-]{36}\?[^"'\s]+/g;
+    const matches = bodyText.match(urlRegex) || [];
+    if (!matches.length) return;
+
+    // Deduplicate and parse
+    const urlMap = {};
+    for (const rawUrl of matches) {
+      // Unescape JSON-escaped URLs
+      const url = rawUrl.replace(/\\u0026/g, '&').replace(/\\/g, '');
+      const mediaMatch = url.match(/\/(image|video)\/([0-9a-f-]{36})\?/);
+      if (mediaMatch) {
+        const [, mediaType, mediaId] = mediaMatch;
+        // Keep last occurrence (freshest)
+        urlMap[mediaId] = { mediaType, url, mediaId };
+      }
+    }
+
+    const entries = Object.values(urlMap);
+    if (!entries.length) return;
+
+    console.log(`[FlowAgent] Captured ${entries.length} fresh media URLs from TRPC`);
+    // URL refresh is silent — don't show in request log
+
+    // Forward to agent for DB update
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: 'media_urls_refresh',
+        urls: entries,
+      }));
+    }
+  } catch (e) {
+    console.error('[FlowAgent] Failed to extract TRPC media URLs:', e);
+  }
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// ─── Human-like Telemetry ──────────────────────────────────
+// Periodically send tracking events to Google's analytics endpoints
+// to mimic normal browser behavior.
+
+const _UA = navigator.userAgent;
+let _telemetrySessionId = `;${Date.now()}`;
+
+function _rand(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
+
+function _buildBatchLogPayload() {
+  const events = [];
+  const types = ['FLOW_IMAGE_LATENCY', 'FLOW_VIDEO_LATENCY'];
+  const count = _rand(1, 3);
+  for (let i = 0; i < count; i++) {
+    events.push({
+      event: types[_rand(0, types.length - 1)],
+      eventProperties: [
+        { key: 'CURRENT_TIME_MS', doubleValue: Date.now() },
+        { key: 'DURATION_MS', doubleValue: _rand(150, 800) },
+        { key: 'USER_AGENT', stringValue: _UA },
+        { key: 'IS_DESKTOP', booleanValue: true },
+      ],
+      eventMetadata: { sessionId: _telemetrySessionId },
+      eventTime: new Date().toISOString(),
+    });
+  }
+  return { appEvents: events };
+}
+
+function _buildFrontendEventsPayload() {
+  const eventTypes = [
+    'FLOW_IMAGE_LATENCY', 'FLOW_VIDEO_LATENCY', 'GRID_SCROLL_DEPTH',
+    'FLOW_PROJECT_OPEN', 'FLOW_SCENE_VIEW',
+  ];
+  const count = _rand(1, 4);
+  const events = [];
+  for (let i = 0; i < count; i++) {
+    const et = eventTypes[_rand(0, eventTypes.length - 1)];
+    const params = {
+      USER_AGENT: { '@type': 'type.googleapis.com/google.protobuf.StringValue', value: _UA },
+      IS_DESKTOP: { '@type': 'type.googleapis.com/google.protobuf.StringValue', value: 'true' },
+    };
+    if (et.includes('LATENCY')) {
+      params.CURRENT_TIME_MS = { '@type': 'type.googleapis.com/google.protobuf.StringValue', value: String(Date.now()) };
+      params.DURATION_MS = { '@type': 'type.googleapis.com/google.protobuf.StringValue', value: String(_rand(100, 600)) };
+    }
+    if (et === 'GRID_SCROLL_DEPTH') {
+      params.MEDIA_GENERATION_PAYGATE_TIER = { '@type': 'type.googleapis.com/google.protobuf.StringValue', value: 'PAYGATE_TIER_TWO' };
+    }
+    events.push({
+      eventType: et,
+      metadata: {
+        sessionId: _telemetrySessionId,
+        createTime: new Date().toISOString(),
+        additionalParams: params,
+      },
+    });
+  }
+  return { events };
+}
+
+async function sendTelemetry() {
+  if (!flowKey || state === 'off') return;
+
+  const headers = {
+    'Content-Type': 'text/plain;charset=UTF-8',
+    'authorization': `Bearer ${flowKey}`,
+  };
+
+  // Telemetry is silent — don't show in request log
+  try {
+    if (Math.random() < 0.5) {
+      await fetch(`https://aisandbox-pa.googleapis.com/v1:batchLog`, {
+        method: 'POST', headers, credentials: 'include',
+        body: JSON.stringify(_buildBatchLogPayload()),
+      });
+    } else {
+      await fetch(`https://aisandbox-pa.googleapis.com/v1/flow:batchLogFrontendEvents`, {
+        method: 'POST', headers, credentials: 'include',
+        body: JSON.stringify(_buildFrontendEventsPayload()),
+      });
+    }
+  } catch {}
+}
+
+// Send telemetry at random intervals (45-120s) to look organic
+function scheduleTelemetry() {
+  const delay = _rand(45, 120) * 1000;
+  setTimeout(async () => {
+    await sendTelemetry();
+    scheduleTelemetry(); // reschedule with new random interval
+  }, delay);
+}
+
+// Refresh session ID every ~30min like a real user
+setInterval(() => { _telemetrySessionId = `;${Date.now()}`; }, _rand(25, 35) * 60 * 1000);
+
+scheduleTelemetry();
+
+console.log('[FlowAgent] Extension loaded');

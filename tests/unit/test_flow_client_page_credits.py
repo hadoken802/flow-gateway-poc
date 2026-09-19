@@ -48,8 +48,9 @@ def test_extension_version_invalidates_stale_service_worker_cache():
 
     assert tuple(map(int, manifest["version"].split("."))) >= (0, 2, 7)
     assert "debugger" in manifest["permissions"]
-    assert manifest["background"]["service_worker"] == "background-loader-027.js"
-    assert "background.js?v=0.2.7" in Path("extension/background-loader-027.js").read_text(encoding="utf-8")
+    assert manifest["background"]["service_worker"] == "background-027.js"
+    versioned_background = Path("extension/background-027.js").read_text(encoding="utf-8")
+    assert "msg.method === 'page_create_project'" in versioned_background
 
 
 @pytest.mark.asyncio
