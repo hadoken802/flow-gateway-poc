@@ -425,9 +425,8 @@ async function handlePageCreateProject(msg) {
       await chrome.tabs.update(tab.id, { url: 'https://flow.google.com/' });
       await waitForTabComplete(tab.id, 30000);
     }
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-    const clicked = await chrome.tabs.sendMessage(tab.id, { type: 'CLICK_NEW_PROJECT' });
-    if (!clicked?.clicked) throw new Error(clicked?.error || 'NEW_PROJECT_CLICK_FAILED');
+    const point = await waitForNewProjectButton(tab.id, 15000);
+    await trustedClick(tab.id, point.x, point.y);
     const deadline = Date.now() + 45000;
     while (Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 250));
@@ -436,13 +435,46 @@ async function handlePageCreateProject(msg) {
       const match = (projectTab?.url || '').match(/\/project\/([0-9a-f-]{36})/i);
       if (projectTab && match) {
         await chrome.tabs.update(projectTab.id, { active: true });
-        fallbackToWebSocket({ id: msg.id, status: 200, data: { projectId: match[1] } });
+        sendToAgent({ id: msg.id, status: 200, data: { projectId: match[1] } });
         return;
       }
     }
     throw new Error('PROJECT_NAVIGATION_TIMEOUT');
   } catch (e) {
-    fallbackToWebSocket({ id: msg.id, status: 502, error: e.message || 'PAGE_CREATE_PROJECT_FAILED' });
+    sendToAgent({ id: msg.id, status: 502, error: e.message || 'PAGE_CREATE_PROJECT_FAILED' });
+  }
+}
+
+async function waitForNewProjectButton(tabId, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const [{ result }] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const target = [...document.querySelectorAll('button, a, [role="button"]')].find((element) => {
+          const text = `${element.textContent || ''} ${element.getAttribute('aria-label') || ''}`.trim();
+          return element.getClientRects().length > 0 && !element.disabled && /新建项目|创建项目|New project|Create project/i.test(text);
+        });
+        if (!target) return null;
+        const rect = target.getBoundingClientRect();
+        return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+      },
+    });
+    if (result && Number.isFinite(result.x) && Number.isFinite(result.y)) return result;
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  throw new Error('NEW_PROJECT_BUTTON_NOT_FOUND');
+}
+
+async function trustedClick(tabId, x, y) {
+  const target = { tabId };
+  await chrome.debugger.attach(target, '1.3');
+  try {
+    await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
+    await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 });
+    await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
+  } finally {
+    await chrome.debugger.detach(target).catch(() => {});
   }
 }
 

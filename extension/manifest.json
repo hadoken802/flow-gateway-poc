@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "Flow Kit",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "Local agent bridge for Google Flow API — captures tokens, solves reCAPTCHA, proxies API calls",
-  "permissions": ["storage", "alarms", "tabs", "webRequest", "scripting", "declarativeNetRequest", "sidePanel", "offscreen"],
+  "permissions": ["storage", "alarms", "tabs", "webRequest", "scripting", "debugger", "declarativeNetRequest", "sidePanel", "offscreen"],
   "host_permissions": [
     "https://flow.google.com/*",
     "https://labs.google/*",
