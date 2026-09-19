@@ -163,3 +163,15 @@ def test_simple_task_form_uploads_image_and_creates_task():
     assert "'/api/v1/client/files'" in TASK_CENTER_HTML
     assert "'/api/v1/client/tasks'" in TASK_CENTER_HTML
     assert "input_file_ids:[saved.file_id]" in TASK_CENTER_HTML
+
+
+def test_account_actions_show_progress_and_auto_refresh_does_not_overlap():
+    from gateway.main import TASK_CENTER_HTML
+
+    assert "if(refreshPromise)return refreshPromise" in TASK_CENTER_HTML
+    assert "nodeRows=await api('/api/v1/nodes')" in TASK_CENTER_HTML
+    assert "startNode('${esc(id)}',this)" in TASK_CENTER_HTML
+    assert "'启动中…'" in TASK_CENTER_HTML
+    assert "本地服务已启动，正在检查状态…" in TASK_CENTER_HTML
+    assert "操作失败" in TASK_CENTER_HTML
+    assert TASK_CENTER_HTML.index("worker_online&&!node?.extension_connected") < TASK_CENTER_HTML.index("if(status==='offline')")

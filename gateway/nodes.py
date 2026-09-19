@@ -40,10 +40,11 @@ async def list_nodes(scheduler, registry: AccountRegistry | None = None, manager
     registry = registry or AccountRegistry()
     status_provider = manager or ReadOnlyRuntimeStatusProvider()
     gateway_accounts = {item["account_id"]: item for item in await crud.list_accounts(scheduler.db)}
-    nodes = []
-    for account in registry.list_accounts():
-        nodes.append(await _node_snapshot(account.account_id, scheduler, registry, status_provider, gateway_accounts.get(account.account_id)))
-    return nodes
+    accounts = registry.list_accounts()
+    return list(await asyncio.gather(*(
+        _node_snapshot(account.account_id, scheduler, registry, status_provider, gateway_accounts.get(account.account_id))
+        for account in accounts
+    )))
 
 
 async def get_node(scheduler, account_id: str, registry: AccountRegistry | None = None, manager: RuntimeManager | None = None) -> dict | None:

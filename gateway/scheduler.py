@@ -137,12 +137,20 @@ class GatewayScheduler:
     async def refresh_workers(self):
         async with self.assignment_lock:
             await self.async_refresh_worker_snapshot()
+            enabled_workers = [worker for worker in self.workers if worker.enabled]
+            inspection_results = await asyncio.gather(
+                *(self.worker_client.inspect(worker) for worker in enabled_workers),
+                return_exceptions=True,
+            )
+            inspections = dict(zip((worker.account_id for worker in enabled_workers), inspection_results))
             for worker in self.workers:
                 if not worker.enabled:
                     await crud.upsert_account(self.db, worker, status="offline", credits=None)
                     continue
                 try:
-                    info = await self.worker_client.inspect(worker)
+                    info = inspections[worker.account_id]
+                    if isinstance(info, BaseException):
+                        raise info
                     credits = info.get("credits")
                     account = await crud.get_account(self.db, worker.account_id)
                     stored_credits = (account or {}).get("credits")

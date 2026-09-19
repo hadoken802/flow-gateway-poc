@@ -214,6 +214,35 @@ async def test_three_workers_are_classified_by_credits(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_worker_status_checks_run_concurrently():
+    from gateway.config import GatewaySettings
+
+    states = {account_id: {"credits": 50} for account_id in ("FLOW-001", "FLOW-002", "FLOW-003")}
+
+    class ConcurrentInspectClient(FakeWorkerClient):
+        def __init__(self, values):
+            super().__init__(values)
+            self.started = set()
+            self.all_started = asyncio.Event()
+
+        async def inspect(self, worker):
+            self.started.add(worker.account_id)
+            if len(self.started) == len(self.states):
+                self.all_started.set()
+            await asyncio.wait_for(self.all_started.wait(), timeout=0.5)
+            return await super().inspect(worker)
+
+    client = ConcurrentInspectClient(states)
+    scheduler = make_scheduler(GatewaySettings(db_path=local_db("concurrent_inspect")), client)
+
+    await scheduler.start()
+
+    assert client.started == set(states)
+    assert all(account["status"] == "ready" for account in await scheduler.list_accounts())
+    await scheduler.stop()
+
+
+@pytest.mark.asyncio
 async def test_missing_worker_credits_preserve_previous_value_and_status():
     from gateway.config import GatewaySettings
 

@@ -758,13 +758,17 @@ TASK_CENTER_HTML = """
 async function api(path, options){const r=await fetch(path, options); if(!r.ok) throw new Error(await r.text()); return await r.json();}
 function td(v){return `<td>${v??''}</td>`}
 function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-let accountRows=[],nodeRows=[],taskRows=[],showAllTasks=false;
+let accountRows=[],nodeRows=[],taskRows=[],showAllTasks=false,refreshPromise=null;
 async function refresh(){
-  try{
-    const [s,accountsData,tasksData,nodesData]=await Promise.all([api('/api/v1/system/status'),api('/api/v1/accounts'),api('/api/v1/tasks'),api('/api/v1/nodes')]);
-    accountRows=accountsData;taskRows=tasksData;nodeRows=nodesData;
+  if(refreshPromise)return refreshPromise;
+  refreshPromise=(async()=>{try{
+    const [s,accountsData,tasksData]=await Promise.all([api('/api/v1/system/status'),api('/api/v1/accounts'),api('/api/v1/tasks')]);
+    accountRows=accountsData;taskRows=tasksData;
     renderAccounts();renderTasks();renderAdvanced();renderMetrics(s);
-  }catch(e){metrics.innerHTML=`<div class="metric"><span class="dot danger"></span>Gateway<b>异常</b></div>`;console.error(e)}
+    nodeRows=await api('/api/v1/nodes');
+    renderAccounts();renderAdvanced();renderMetrics(s);
+  }catch(e){metrics.innerHTML=`<div class="metric"><span class="dot danger"></span>Gateway<b>异常</b></div>`;console.error(e)}finally{refreshPromise=null}})();
+  return refreshPromise;
 }
 function mergedAccounts(){
   const merged=new Map();accountRows.forEach(a=>merged.set(a.account_id,{account:a,node:null}));nodeRows.forEach(n=>merged.set(n.account_id,{account:merged.get(n.account_id)?.account||null,node:n}));return [...merged.entries()].sort((a,b)=>a[0].localeCompare(b[0]));
@@ -774,17 +778,17 @@ function accountState(account,node){
   const cooldown=cooldownRemaining(account?.cooldown_until||node?.cooldown_until);if(cooldown)return {key:'cooldown',label:`冷却中 · 剩余 ${cooldown}`,tone:'warn'};
   const status=String(account?.status||'').toLowerCase(), worker=String(node?.worker_status||'').toLowerCase(), oauth=String(node?.oauth_status||'').toLowerCase();
   if(node&&!node.worker_online)return {key:'offline',label:'本地服务未启动',tone:'danger'};
-  if(status==='offline')return {key:'offline',label:'离线',tone:'danger'};
   if(node?.worker_online&&!node?.extension_connected)return {key:'extension',label:'浏览器扩展未连接',tone:'warn'};
   if(node?.extension_connected&&node?.runtime?.account_match===false)return {key:'mismatch',label:'登录账号不匹配',tone:'danger'};
   if(node?.extension_connected&&node?.runtime?.account_match&&(account?.quota_confidence==='stale'||oauth.includes('credits_http_')))return {key:'quota',label:'登录正常，额度验证失败',tone:'warn'};
+  if(status==='offline')return {key:'offline',label:'离线',tone:'danger'};
   if(status==='needs_login')return {key:'login',label:'需要登录',tone:'warn'};
   if(oauth.includes('oauth')||oauth.includes('login')||node?.extension_status==='extension_missing')return {key:'login',label:'需要登录',tone:'warn'};
   if(node&&oauth!=='live'&&oauth!=='unknown'&&oauth)return {key:'oauth',label:'OAuth 异常',tone:'danger'};
   if(status==='ready'||status==='busy')return {key:'ready',label:status==='busy'?'生成中':'正常',tone:''};
   return {key:'other',label:status||worker||'未知',tone:'warn'};
 }
-function accountAction(id,state){if(state.key==='login'||state.key==='oauth'||state.key==='mismatch')return `<button onclick="openNodeLogin('${esc(id)}',this)">${state.key==='login'?'登录':'重新登录'}</button>`;if(state.key==='extension')return `<button onclick="openNodeLogin('${esc(id)}',this)">重新连接</button>`;if(state.key==='quota')return `<button onclick="refreshNodeSession('${esc(id)}')">重新验证</button>`;if(state.key==='offline')return `<button onclick="startNode('${esc(id)}')">启动</button>`;return ''}
+function accountAction(id,state){if(state.key==='login'||state.key==='oauth'||state.key==='mismatch')return `<button onclick="openNodeLogin('${esc(id)}',this)">${state.key==='login'?'登录':'重新登录'}</button>`;if(state.key==='extension')return `<button onclick="openNodeLogin('${esc(id)}',this)">重新连接</button>`;if(state.key==='quota')return `<button onclick="refreshNodeSession('${esc(id)}',this)">重新验证</button>`;if(state.key==='offline')return `<button onclick="startNode('${esc(id)}',this)">启动</button>`;return ''}
 function renderAccounts(){
   const rows=mergedAccounts();accountSummary.textContent=`${rows.length} 个账号`;
   accountList.innerHTML='<div class="list-row list-head"><span>账号</span><span>状态</span><span>积分</span><span></span></div>'+(rows.length?rows.map(([id,v])=>{const state=accountState(v.account,v.node),credits=v.account?.credits??v.node?.credits??'—';return `<div class="list-row"><strong>${esc(id)}</strong><span class="state"><i class="dot ${state.tone}"></i>${esc(state.label)}</span><span class="credits">${esc(credits)}</span><span>${accountAction(id,state)}</span></div>`}).join(''):'<div class="empty">暂无账号</div>');
@@ -945,11 +949,12 @@ async function importNodes(){
   nodeResult.textContent=JSON.stringify(await api('/api/v1/nodes/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({format,content})}),null,2);
   await loadNodes();
 }
-async function startNode(id){nodeResult.textContent=JSON.stringify(await api(`/api/v1/nodes/${id}/start`,{method:'POST'}),null,2); await refresh()}
+async function runNodeAction(id,button,workingText,path,successText){const oldText=button?.textContent||'';if(button){button.disabled=true;button.textContent=workingText}nodeResult.className='muted';nodeResult.textContent=`${id}：${workingText}`;try{const data=await api(path,{method:'POST'});nodeResult.className=data.ok?'ok':'error';nodeResult.textContent=data.ok?`${id}：${successText}`:`${id}：操作失败`;accountRows=await api('/api/v1/accounts');renderAccounts();setTimeout(refresh,1000)}catch(e){nodeResult.className='error';nodeResult.textContent=`${id}：操作失败，${e.message}`;if(button){button.disabled=false;button.textContent=oldText}}}
+async function startNode(id,button){await runNodeAction(id,button,'启动中…',`/api/v1/nodes/${id}/start`,'本地服务已启动，正在检查状态…')}
 async function stopNode(id){nodeResult.textContent=JSON.stringify(await api(`/api/v1/nodes/${id}/stop`,{method:'POST'}),null,2); await refresh()}
 async function restartNode(id){nodeResult.textContent=JSON.stringify(await api(`/api/v1/nodes/${id}/restart`,{method:'POST'}),null,2); await refresh()}
 async function openNodeLogin(id,button){const oldText=button.textContent;button.disabled=true;button.textContent='正在打开…';nodeResult.className='muted';nodeResult.textContent=`正在打开 ${id} 的登录窗口…`;try{const data=await api(`/api/v1/nodes/${id}/open-login`,{method:'POST'});nodeResult.className=data.ok?'ok':'error';nodeResult.textContent=data.ok?`${id} 的登录窗口已打开`:`${id} 的登录窗口打开失败`;await refresh()}catch(e){nodeResult.className='error';nodeResult.textContent=`打开登录窗口失败：${e.message}`}finally{button.disabled=false;button.textContent=oldText}}
-async function refreshNodeSession(id){nodeResult.textContent=JSON.stringify(await api(`/api/v1/nodes/${id}/refresh-session`,{method:'POST'}),null,2); await refresh()}
+async function refreshNodeSession(id,button){await runNodeAction(id,button,'验证中…',`/api/v1/nodes/${id}/refresh-session`,'验证完成')}
 async function checkLoginEnable(id){nodeResult.textContent=JSON.stringify(await api(`/api/v1/nodes/${id}/check-login-enable`,{method:'POST'}),null,2); await refresh()}
 async function enableNode(id){nodeResult.textContent=JSON.stringify(await api(`/api/v1/nodes/${id}/enable`,{method:'POST'}),null,2); await refresh()}
 async function disableNode(id){nodeResult.textContent=JSON.stringify(await api(`/api/v1/nodes/${id}/disable`,{method:'POST'}),null,2); await refresh()}
