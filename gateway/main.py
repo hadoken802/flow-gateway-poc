@@ -702,9 +702,9 @@ TASK_CENTER_HTML = """
     <div class="status-grid" id="metrics"></div>
   </section>
   <section>
-    <div class="section-head"><h2>创建任务</h2><span class="muted">上传一张图片并填写提示词</span></div>
+    <div class="section-head"><h2>创建任务</h2><span class="muted">上传一张或多张图片并填写提示词</span></div>
     <div class="create-form">
-      <label class="file-field"><input id="taskImage" type="file" accept="image/jpeg,image/png,image/webp"></label>
+      <label class="file-field"><input id="taskImage" type="file" accept="image/jpeg,image/png,image/webp" multiple></label>
       <textarea id="taskPrompt" placeholder="输入视频生成提示词，例如：镜头缓慢推进，主体自然轻微移动，光线柔和稳定……"></textarea>
       <div class="submit-stack"><button id="createTaskButton" type="button" class="primary" onclick="createSimpleTask()">创建任务</button><span class="muted">默认 10 秒 · 9:16</span></div>
     </div>
@@ -801,16 +801,16 @@ function taskAction(t){if(t.status==='completed'&&t.video_path)return `<a class=
 function renderTasks(){const newest=[...taskRows].reverse(),rows=showAllTasks?newest:newest.slice(0,8);taskList.innerHTML='<div class="list-row task-row list-head"><span>任务</span><span>状态</span><span>账号</span><span></span></div>'+(rows.length?rows.map(t=>`<div class="list-row task-row"><strong>${esc(t.name||t.external_task_id||'未命名任务')}</strong><span>${esc(taskState(t))}</span><span>${esc(t.assigned_account_id||t.account_id||'—')}</span><span>${taskAction(t)}</span></div>`).join(''):'<div class="empty">暂无任务</div>');allTasksButton.textContent=showAllTasks?'只看最近任务':'查看全部任务'}
 function toggleAllTasks(){showAllTasks=!showAllTasks;renderTasks()}
 async function createSimpleTask(){
-  const file=taskImage.files[0],promptText=taskPrompt.value.trim();
-  if(!file){createTaskResult.className='form-result error';createTaskResult.textContent='请先选择图片';return}
+  const files=[...taskImage.files],promptText=taskPrompt.value.trim();
+  if(!files.length){createTaskResult.className='form-result error';createTaskResult.textContent='请先选择图片';return}
   if(!promptText){createTaskResult.className='form-result error';createTaskResult.textContent='请输入提示词';return}
   createTaskButton.disabled=true;createTaskButton.textContent='正在创建…';createTaskResult.className='form-result muted';createTaskResult.textContent='正在上传图片…';
   try{
-    const form=new FormData();form.append('file',file);
-    const uploaded=await api('/api/v1/client/files',{method:'POST',body:form}),saved=uploaded.files?.[0];
-    if(!saved?.ok||!saved.file_id)throw new Error(saved?.error||'图片上传失败');
+    const form=new FormData();files.forEach(file=>form.append('files',file));
+    const uploaded=await api('/api/v1/client/files',{method:'POST',body:form}),saved=uploaded.files||[],failed=saved.find(item=>!item.file_id);
+    if(saved.length!==files.length||failed)throw new Error(failed?.error||'图片上传失败');
     createTaskResult.textContent='正在加入队列…';
-    const task=await api('/api/v1/client/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:promptText,input_file_ids:[saved.file_id],duration:10,aspect_ratio:'9:16',external_task_id:file.name.replace(/\.[^.]+$/,'')})});
+    const task=await api('/api/v1/client/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:promptText,input_file_ids:saved.map(item=>item.file_id),duration:10,aspect_ratio:'9:16',external_task_id:files[0].name.replace(/\.[^.]+$/,'')})});
     createTaskResult.className='form-result ok';createTaskResult.textContent=`任务已创建，状态：${taskState(task)}`;taskImage.value='';taskPrompt.value='';await refresh();
   }catch(e){createTaskResult.className='form-result error';createTaskResult.textContent=`创建失败：${e.message}`}
   finally{createTaskButton.disabled=false;createTaskButton.textContent='创建任务'}
