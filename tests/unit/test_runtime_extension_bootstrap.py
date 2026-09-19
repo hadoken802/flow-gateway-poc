@@ -145,7 +145,7 @@ class FakeRuntime:
 
 
 class FakeCdp:
-    def __init__(self, extension_id=EXPECTED_FLOWKIT_EXTENSION_ID, discover_sequence=None, service_worker="background.js", target_sets=None):
+    def __init__(self, extension_id=EXPECTED_FLOWKIT_EXTENSION_ID, discover_sequence=None, service_worker="background-027.js", target_sets=None):
         self.extension_id_value = extension_id
         self.opened_urls = []
         self.ready_calls = []
@@ -191,7 +191,7 @@ class FakeCdp:
             return []
         return [
             {"type": "page", "url": f"chrome-extension://{self.extension_id_value}/options.html?bootstrap=1&nonce=SECRET"},
-            {"type": "service_worker", "url": f"chrome-extension://{self.extension_id_value}/background.js"},
+            {"type": "service_worker", "url": f"chrome-extension://{self.extension_id_value}/{self.service_worker}"},
         ]
 
     def target_summary(self, targets, expected_extension_id, options_page, service_worker):
@@ -1269,7 +1269,7 @@ def test_other_background_service_worker_is_ignored_for_flowkit_bootstrap(tmp_pa
     ready_template(registry.profiles_root)
     runtime_id = "admccjkmockfdflocgggjfgdacdodkdf"
     cdp = FakeCdp(extension_id=None, target_sets=[
-        [{"type": "service_worker", "url": f"chrome-extension://{runtime_id}/background.js"}],
+        [{"type": "service_worker", "url": f"chrome-extension://{runtime_id}/background-027.js"}],
     ])
     runtime = FakeRuntime(status={"extension_connected": True, "extension_account_id": "FLOW-006", "account_match": True})
     bootstrapper = ExtensionBootstrapper(registry, runtime=runtime, cdp=cdp, profiles_root=registry.profiles_root, sleep=lambda _: None)
@@ -1609,8 +1609,8 @@ def test_bootstrap_ignores_other_extension_and_accepts_expected_flowkit_id(tmp_p
     ready_template(registry.profiles_root)
     other_id = "admccjkmockfdflocgggjfgdacdodkdf"
     cdp = FakeCdp(target_sets=[[
-        {"type": "service_worker", "url": f"chrome-extension://{other_id}/background.js"},
-        {"type": "service_worker", "url": f"chrome-extension://{EXPECTED_FLOWKIT_EXTENSION_ID}/background.js"},
+        {"type": "service_worker", "url": f"chrome-extension://{other_id}/background-027.js"},
+        {"type": "service_worker", "url": f"chrome-extension://{EXPECTED_FLOWKIT_EXTENSION_ID}/background-027.js"},
     ]])
     runtime = FakeRuntime(status={"extension_connected": True, "extension_account_id": "FLOW-006", "account_match": True})
     bootstrapper = ExtensionBootstrapper(registry, runtime=runtime, cdp=cdp, profiles_root=registry.profiles_root, sleep=lambda _: None)
@@ -1657,8 +1657,8 @@ def test_bootstrap_rejects_ambiguous_matching_service_workers(tmp_path):
     add_account(registry, "FLOW-006")
     ready_template(registry.profiles_root)
     cdp = FakeCdp(extension_id=None, target_sets=[[
-        {"type": "service_worker", "url": "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/background.js"},
-        {"type": "service_worker", "url": "chrome-extension://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/background.js"},
+        {"type": "service_worker", "url": "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/background-027.js"},
+        {"type": "service_worker", "url": "chrome-extension://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/background-027.js"},
     ]])
     runtime = FakeRuntime()
     bootstrapper = ExtensionBootstrapper(registry, runtime=runtime, cdp=cdp, profiles_root=registry.profiles_root, sleep=lambda _: None)
@@ -2485,3 +2485,27 @@ def test_template_default_config_does_not_connect_flow001():
     assert "const DEFAULT_AGENT_WS_URL = ''" in background
     assert "if (accountId && wsUrl) connectToAgent()" in background
     assert "new WebSocket(wsUrl)" in background
+
+
+def test_background_reuses_flow_page_api_key_for_worker_proxy_requests():
+    text = Path("extension/background.js").read_text(encoding="utf-8")
+    offscreen = Path("extension/offscreen.js").read_text(encoding="utf-8")
+    manifest = json.loads(Path("extension/manifest.json").read_text(encoding="utf-8"))
+    runtime_text = Path("extension") / manifest["background"]["service_worker"]
+
+    assert "flowApiKeyFromUrl(details.url)" in text
+    assert "x-goog-api-key" in text
+    assert "discoverFlowApiKeyFromPage()" in text
+    assert "src.includes('boq-labs-ai-sandbox')" in text
+    assert "chrome.storage.local.set({ flowApiKey })" in text
+    assert "withFlowApiKey(url)" in text
+    assert "searchParams.set('key', flowApiKey)" in text
+    assert "createFlowPageAuthHeader()" in text
+    assert "SAPISIDHASH ${timestamp}_${hash}" in text
+    assert "trustedPageInitiator" in text
+    assert "pageAuthHeader || (flowKey ? `Bearer ${flowKey}` : null)" in text
+    assert "pageAuthHeader || (flowKey ? `Bearer ${flowKey}` : null)" in offscreen
+    assert "fetchHeaders['x-origin'] = 'https://flow.google.com'" in text
+    assert "fetchHeaders['x-origin'] = 'https://flow.google.com'" in offscreen
+    assert "console.log(flowApiKey)" not in text
+    assert runtime_text.read_text(encoding="utf-8") == text

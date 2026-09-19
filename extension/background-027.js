@@ -26,6 +26,7 @@ let accountId = DEFAULT_ACCOUNT_ID;
 let wsUrl = DEFAULT_AGENT_WS_URL;
 let apiUrl = '';
 let flowKey = null;
+let flowApiKey = null;
 let pageCredits = null;
 let pageCreditsCapturedAt = null;
 let callbackSecret = null;  // Auth secret for HTTP callback, received from server on WS connect
@@ -66,6 +67,81 @@ function safeWs() {
   } catch (_) {
     return {};
   }
+}
+
+function flowApiKeyFromUrl(rawUrl) {
+  try {
+    const url = new URL(rawUrl);
+    if (url.protocol !== 'https:' || url.hostname !== 'aisandbox-pa.googleapis.com') return null;
+    return (url.searchParams.get('key') || '').trim() || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function withFlowApiKey(rawUrl) {
+  try {
+    const url = new URL(rawUrl);
+    if (url.protocol !== 'https:' || url.hostname !== 'aisandbox-pa.googleapis.com') return rawUrl;
+    if (!url.searchParams.get('key') && flowApiKey) url.searchParams.set('key', flowApiKey);
+    return url.toString();
+  } catch (_) {
+    return rawUrl;
+  }
+}
+
+async function discoverFlowApiKeyFromPage() {
+  const tabs = await chrome.tabs.query({ url: FLOW_TAB_PATTERNS });
+  for (const tab of tabs) {
+    try {
+      const [{ result }] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: async () => {
+          const source = [...document.scripts]
+            .map((script) => script.src)
+            .find((src) => src.includes('boq-labs-ai-sandbox'));
+          if (!source) return null;
+          const text = await fetch(source).then((response) => response.text());
+          const match = text.match(/AIza[0-9A-Za-z_-]{20,60}/);
+          return match?.[0] || null;
+        },
+      });
+      if (result) {
+        flowApiKey = result;
+        await chrome.storage.local.set({ flowApiKey });
+        return flowApiKey;
+      }
+    } catch (_) {}
+  }
+  return null;
+}
+
+async function createFlowPageAuthHeader() {
+  const tabs = await chrome.tabs.query({ url: FLOW_TAB_PATTERNS });
+  for (const tab of tabs) {
+    try {
+      const [{ result }] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: async () => {
+          const cookies = Object.fromEntries(
+            document.cookie.split(';').map((item) => item.trim().split(/=(.*)/s).slice(0, 2)),
+          );
+          const sapisid = cookies.SAPISID || cookies['__Secure-3PAPISID'] || cookies['__Secure-1PAPISID'];
+          if (!sapisid) return null;
+          const timestamp = Math.floor(Date.now() / 1000);
+          const origin = 'https://flow.google.com';
+          const raw = `${timestamp} ${sapisid} ${origin}`;
+          const digest = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(raw));
+          const hash = [...new Uint8Array(digest)]
+            .map((byte) => byte.toString(16).padStart(2, '0'))
+            .join('');
+          return `SAPISIDHASH ${timestamp}_${hash}`;
+        },
+      });
+      if (result) return result;
+    } catch (_) {}
+  }
+  return null;
 }
 
 function safeWsErrorCode(eventOrError) {
@@ -157,8 +233,9 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 async function init() {
   if (initialized) return;
   initialized = true;
-  const data = await chrome.storage.local.get(['flowKey', 'pageCredits', 'pageCreditsCapturedAt', 'metrics', 'callbackSecret', 'account_id', 'ws_url', 'api_url']);
+  const data = await chrome.storage.local.get(['flowKey', 'flowApiKey', 'pageCredits', 'pageCreditsCapturedAt', 'metrics', 'callbackSecret', 'account_id', 'ws_url', 'api_url']);
   if (data.flowKey) flowKey = data.flowKey;
+  if (data.flowApiKey) flowApiKey = data.flowApiKey;
   if (Number.isInteger(data.pageCredits) && data.pageCredits >= 0) pageCredits = data.pageCredits;
   if (Number.isInteger(data.pageCreditsCapturedAt)) pageCreditsCapturedAt = data.pageCreditsCapturedAt;
   if (data.metrics) Object.assign(metrics, data.metrics);
@@ -194,7 +271,17 @@ chrome.storage.onChanged.addListener((changes, area) => {
 
 chrome.webRequest.onBeforeSendHeaders.addListener(
   (details) => {
+    const apiKeyHeader = details?.requestHeaders?.find(
+      (header) => header.name?.toLowerCase() === 'x-goog-api-key',
+    );
+    const observedApiKey = flowApiKeyFromUrl(details.url) || apiKeyHeader?.value?.trim() || null;
+    if (observedApiKey && observedApiKey !== flowApiKey) {
+      flowApiKey = observedApiKey;
+      chrome.storage.local.set({ flowApiKey });
+    }
     if (!details?.requestHeaders?.length) return;
+    const trustedPageInitiator = /^https:\/\/(flow\.google\.com|labs\.google)(?:\/|$)/i.test(details.initiator || '');
+    if (!trustedPageInitiator) return;
     const authHeader = details.requestHeaders.find(
       (h) => h.name?.toLowerCase() === 'authorization',
     );
@@ -736,19 +823,32 @@ async function handleApiRequest(msg) {
     return;
   }
 
+  if (!flowApiKeyFromUrl(url) && !flowApiKey) {
+    await discoverFlowApiKeyFromPage();
+  }
+
+  const normalizedMsg = {
+    ...msg,
+    params: {
+      ...params,
+      url: withFlowApiKey(url),
+    },
+  };
+  const pageAuthHeader = await createFlowPageAuthHeader();
+
   if (captchaAction) {
-    await handleApiRequestInServiceWorker(msg);
+    await handleApiRequestInServiceWorker(normalizedMsg, pageAuthHeader);
     return;
   }
 
   await ensureOffscreenDocument();
-  chrome.runtime.sendMessage({ type: 'OFFSCREEN_API_REQUEST', msg, flowKey }).catch((e) => {
+  chrome.runtime.sendMessage({ type: 'OFFSCREEN_API_REQUEST', msg: normalizedMsg, flowKey, pageAuthHeader }).catch((e) => {
     sendToAgent({ id, status: 500, error: e.message || 'OFFSCREEN_REQUEST_FAILED' });
   });
   return;
 }
 
-async function handleApiRequestInServiceWorker(msg) {
+async function handleApiRequestInServiceWorker(msg, pageAuthHeader = null) {
   const { id, params } = msg;
   const { url, method, headers, body, captchaAction } = params;
 
@@ -799,8 +899,8 @@ async function handleApiRequestInServiceWorker(msg) {
     }
 
     // Step 3: Use flowKey for auth
-    const activeFlowKey = flowKey;
-    if (!activeFlowKey) {
+    const activeAuthorization = pageAuthHeader || (flowKey ? `Bearer ${flowKey}` : null);
+    if (!activeAuthorization) {
       sendToAgent({ id, status: 503, error: 'NO_FLOW_KEY' });
       if (hasCaptcha) { metrics.failedCount++; metrics.lastError = 'NO_FLOW_KEY'; }
       chrome.storage.local.set({ metrics });
@@ -810,7 +910,8 @@ async function handleApiRequestInServiceWorker(msg) {
     }
 
     const fetchHeaders = { ...(headers || {}) };
-    fetchHeaders['authorization'] = `Bearer ${activeFlowKey}`;
+    fetchHeaders['authorization'] = activeAuthorization;
+    if (pageAuthHeader) fetchHeaders['x-origin'] = 'https://flow.google.com';
 
     // Step 4: Make the API call from browser context
     const response = await fetch(url, {

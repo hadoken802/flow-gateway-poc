@@ -5,22 +5,24 @@
 
 chrome.runtime.onMessage.addListener((message) => {
   if (message?.type !== 'OFFSCREEN_API_REQUEST') return false;
-  handleApiRequest(message.msg, message.flowKey);
+  handleApiRequest(message.msg, message.flowKey, message.pageAuthHeader);
   return true;
 });
 
-async function handleApiRequest(msg, flowKey) {
+async function handleApiRequest(msg, flowKey, pageAuthHeader) {
   const startedAt = Date.now();
   const { id, params } = msg;
   const { url, method, headers, body } = params || {};
 
   try {
     const fetchHeaders = { ...(headers || {}) };
-    if (!flowKey) {
+    const authorization = pageAuthHeader || (flowKey ? `Bearer ${flowKey}` : null);
+    if (!authorization) {
       sendResponse({ id, status: 503, error: 'NO_FLOW_KEY' });
       return;
     }
-    fetchHeaders.authorization = `Bearer ${flowKey}`;
+    fetchHeaders.authorization = authorization;
+    if (pageAuthHeader) fetchHeaders['x-origin'] = 'https://flow.google.com';
 
     console.log(`[FlowAgentOffscreen] get_media/request start id=${String(id).slice(0, 8)} at=${startedAt}`);
     const response = await fetch(url, {
