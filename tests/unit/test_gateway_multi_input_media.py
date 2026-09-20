@@ -181,11 +181,14 @@ def test_page_submit_selects_each_uploaded_asset_and_verifies_prompt_attachments
     wait_active = "asset.classList.contains('asset-item-active')"
     verify_increment = "promptIngredientCount() === previousIngredientCount + 1"
     verify_total = "promptIngredientCount() !== images.length"
+    retry_attach = "for (let attempt = 0; attempt < 5; attempt += 1)"
 
     assert "const promptIngredientCount" in injected
     assert select_uploaded in injected
     assert wait_active in injected
     assert verify_increment in injected
     assert verify_total in injected
-    assert injected.index(select_uploaded) < injected.index("attach.click()")
-    assert injected.index("attach.click()") < injected.index(verify_increment)
+    assert retry_attach in injected
+    assert "press(attach)" in injected
+    assert injected.index(select_uploaded) < injected.index("press(attach)")
+    assert injected.index("press(attach)") < injected.index(verify_increment)

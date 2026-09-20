@@ -158,12 +158,24 @@ async function submitVideoThroughPage(payload) {
       10000,
       'attach_media',
     );
-    attach.click();
-    await waitFor(
-      () => promptIngredientCount() === previousIngredientCount + 1,
-      10000,
-      `prompt_media:${image.fileName}`,
-    );
+    await delay(750);
+    let attached = false;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      press(attach);
+      try {
+        await waitFor(
+          () => promptIngredientCount() === previousIngredientCount + 1,
+          3000,
+          `prompt_media:${image.fileName}`,
+        );
+        attached = true;
+        break;
+      } catch (error) {
+        if (!String(error?.message || '').startsWith('PAGE_ELEMENT_TIMEOUT:prompt_media:')) throw error;
+      }
+      await delay(500);
+    }
+    if (!attached) throw new Error(`PAGE_ELEMENT_TIMEOUT:prompt_media:${image.fileName}`);
   }
 
   if (promptIngredientCount() !== images.length) throw new Error('PAGE_VIDEO_MEDIA_ATTACH_MISMATCH');
