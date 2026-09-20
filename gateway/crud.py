@@ -113,6 +113,7 @@ async def update_account_controls(db, account_id, **fields):
         "quota_source",
         "quota_confidence",
         "health_score",
+        "consecutive_failures",
     }
     updates = {key: value for key, value in fields.items() if key in allowed}
     if not updates:

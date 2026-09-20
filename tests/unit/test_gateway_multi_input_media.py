@@ -192,3 +192,12 @@ def test_page_submit_selects_each_uploaded_asset_and_verifies_prompt_attachments
     assert "press(attach)" in injected
     assert injected.index(select_uploaded) < injected.index("press(attach)")
     assert injected.index("press(attach)") < injected.index(verify_increment)
+
+
+def test_page_video_defaults_to_720p_and_downloads_original_resolution():
+    injected = Path("extension/injected.js").read_text(encoding="utf-8")
+    content = Path("extension/content.js").read_text(encoding="utf-8")
+
+    assert "payload.resolution || '720p'" in injected
+    assert "/原始尺寸|Original/i.test(text)" in content
+    assert "/360p/i.test(text) && /原始尺寸|Original/i.test(text)" not in content

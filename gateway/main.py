@@ -115,6 +115,19 @@ async def resume_account(account_id: str):
     return account
 
 
+@app.post("/api/pool/accounts/{account_id}/health/reset")
+async def reset_account_health(account_id: str):
+    account = await crud.update_account_controls(
+        scheduler.db,
+        account_id,
+        health_score=100,
+        consecutive_failures=0,
+    )
+    if not account:
+        raise HTTPException(404, "Account not found")
+    return account
+
+
 @app.post("/api/pool/accounts/{account_id}/cooldown")
 async def set_account_cooldown(account_id: str, payload: dict):
     account = await crud.update_account_controls(
@@ -706,7 +719,7 @@ TASK_CENTER_HTML = """
     <div class="create-form">
       <label class="file-field"><input id="taskImage" type="file" accept="image/jpeg,image/png,image/webp" multiple></label>
       <textarea id="taskPrompt" placeholder="输入视频生成提示词，例如：镜头缓慢推进，主体自然轻微移动，光线柔和稳定……"></textarea>
-      <div class="submit-stack"><button id="createTaskButton" type="button" class="primary" onclick="createSimpleTask()">创建任务</button><span class="muted">默认 10 秒 · 9:16</span></div>
+      <div class="submit-stack"><button id="createTaskButton" type="button" class="primary" onclick="createSimpleTask()">创建任务</button><span class="muted">默认 10 秒 · 9:16 · 720p</span></div>
     </div>
     <div id="createTaskResult" class="form-result muted"></div>
   </section>
@@ -820,7 +833,7 @@ async function createSimpleTask(){
 function toggleQuickAdd(){quickAddPanel.classList.toggle('open');if(quickAddPanel.classList.contains('open'))quickFlowNumber.focus()}
 async function showTaskReason(id){const data=await api(`/api/v1/tasks/${id}`),t=data.task||data;alert(t.error_message||t.last_error_message||t.error_code||t.last_error_category||'没有可用的失败原因')}
 function renderAdvanced(){
-  accounts.innerHTML='<tr><th>账号</th><th>状态</th><th>积分</th><th>预留积分</th><th>健康度</th><th>当前任务</th><th>冷却截止</th><th>权重</th><th>操作</th></tr>'+accountRows.map(a=>`<tr>${td(a.account_id)}${td(zhStatus(a.status))}${td(a.credits)}${td(a.reserved_credits)}${td(a.health_score)}${td(a.current_task_id)}${td(a.cooldown_until)}${td(a.account_weight)}<td><button onclick="pauseAccount('${a.account_id}')">暂停</button> <button onclick="resumeAccount('${a.account_id}')">恢复</button> <button onclick="cooldownAccount('${a.account_id}')">设置冷却</button> <button onclick="clearCooldown('${a.account_id}')">清除冷却</button> <button onclick="setWeight('${a.account_id}')">设置权重</button> <button onclick="setCredits('${a.account_id}')">设置积分</button></td></tr>`).join('');
+  accounts.innerHTML='<tr><th>账号</th><th>状态</th><th>积分</th><th>预留积分</th><th>健康度</th><th>当前任务</th><th>冷却截止</th><th>权重</th><th>操作</th></tr>'+accountRows.map(a=>`<tr>${td(a.account_id)}${td(zhStatus(a.status))}${td(a.credits)}${td(a.reserved_credits)}${td(a.health_score)}${td(a.current_task_id)}${td(a.cooldown_until)}${td(a.account_weight)}<td><button onclick="pauseAccount('${a.account_id}')">暂停</button> <button onclick="resumeAccount('${a.account_id}')">解除暂停</button> <button onclick="resetAccountHealth('${a.account_id}')">重置健康度</button> <button onclick="cooldownAccount('${a.account_id}')">设置冷却</button> <button onclick="clearCooldown('${a.account_id}')">清除冷却</button> <button onclick="setWeight('${a.account_id}')">设置权重</button> <button onclick="setCredits('${a.account_id}')">设置积分</button></td></tr>`).join('');
   nodesTable.innerHTML='<tr><th>账号</th><th>Worker</th><th>CDP/WS</th><th>进程</th><th>运行状态</th><th>OAuth</th><th>账号匹配 / 所有权</th><th>额度可信度</th><th>已启用</th><th>操作</th></tr>'+nodeRows.map(n=>`<tr>${td(n.account_id)}${td(`${n.worker_host}:${n.worker_port}`)}${td(`${n.cdp_host}:${n.cdp_port}<br>WS ${n.extension_ws_port||''}`)}${td(`Worker ${n.worker_pid||''}<br>Chrome ${n.chrome_pid||''}`)}${td(zhStatus(n.worker_status))}${td(zhStatus(n.oauth_status))}${td(`${zhBool(n.runtime?.account_match)}<br>${zhStatus(n.runtime?.ownership_status||n.runtime?.worker_ownership_verified)}`)}${td(zhStatus(n.quota_confidence))}${td(zhBool(n.enabled))}<td><button onclick="startNode('${n.account_id}')">启动</button> <button onclick="stopNode('${n.account_id}')">停止</button> <button onclick="restartNode('${n.account_id}')">重启</button> <button onclick="refreshNodeSession('${n.account_id}')">刷新登录</button> <button onclick="checkLoginEnable('${n.account_id}')">检查登录并启用</button> <button onclick="enableNode('${n.account_id}')">启用</button> <button onclick="disableNode('${n.account_id}')">停用</button> <button onclick="editNode('${n.account_id}',${n.worker_port},${n.cdp_port})">编辑端口</button> <button onclick="nodeDetail('${n.account_id}')">诊断</button></td></tr>`).join('');
   renderAdvancedTasks();
 }
@@ -835,6 +848,7 @@ async function loadImportFile(){const f=importFile.files[0]; if(!f) return; impo
 async function importTasks(){try{const format=importFormat.value; const content=importContent.value; importResult.textContent=JSON.stringify(await api('/api/v1/tasks/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({format,content})}),null,2); await refresh();}catch(e){importResult.textContent=e.message}}
 async function pauseAccount(id){await api(`/api/pool/accounts/${id}/pause`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}); await refresh()}
 async function resumeAccount(id){await api(`/api/pool/accounts/${id}/resume`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}); await refresh()}
+async function resetAccountHealth(id){await api(`/api/pool/accounts/${id}/health/reset`,{method:'POST'}); await refresh()}
 async function cooldownAccount(id){const seconds=prompt('冷却秒数','300'); if(!seconds) return; await api(`/api/pool/accounts/${id}/cooldown`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({seconds:Number(seconds),reason:'task_center'})}); await refresh()}
 async function clearCooldown(id){await api(`/api/pool/accounts/${id}/cooldown/clear`,{method:'POST'}); await refresh()}
 async function setWeight(id){const weight=prompt('账号权重','1'); if(!weight) return; await api(`/api/pool/accounts/${id}/weight`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({account_weight:Number(weight)})}); await refresh()}

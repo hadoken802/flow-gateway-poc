@@ -48,6 +48,28 @@ async def add_account(db, account_id="FLOW-001", credits=100, **fields):
 
 
 @pytest.mark.asyncio
+async def test_reset_health_controls_do_not_change_credits(tmp_path):
+    db = await connect(tmp_path / "gateway.db")
+    try:
+        await add_account(db, "FLOW-001", 580, health_score=0)
+        await db.execute("UPDATE flow_accounts SET consecutive_failures=7 WHERE account_id='FLOW-001'")
+        await db.commit()
+
+        account = await crud.update_account_controls(
+            db,
+            "FLOW-001",
+            health_score=100,
+            consecutive_failures=0,
+        )
+
+        assert account["health_score"] == 100
+        assert account["consecutive_failures"] == 0
+        assert account["credits"] == 580
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
 async def test_v2_schema_migrates_kernel_tables_and_columns(tmp_path):
     db = await connect(tmp_path / "gateway.db")
     try:

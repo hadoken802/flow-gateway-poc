@@ -430,6 +430,7 @@ class FlowClient:
             "images": uploads,
             "duration": 10,
             "aspectRatio": "9:16",
+            "resolution": "720p",
         }, timeout=180)
         if not _is_ws_error(result):
             data = result.get("data", {})

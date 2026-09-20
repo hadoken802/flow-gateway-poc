@@ -178,6 +178,14 @@ def test_account_actions_show_progress_and_auto_refresh_does_not_overlap():
     assert TASK_CENTER_HTML.index("worker_online&&!node?.extension_connected") < TASK_CENTER_HTML.index("if(status==='offline')")
 
 
+def test_advanced_account_controls_distinguish_unpause_from_health_reset():
+    from gateway.main import TASK_CENTER_HTML
+
+    assert ">解除暂停</button>" in TASK_CENTER_HTML
+    assert ">重置健康度</button>" in TASK_CENTER_HTML
+    assert "/health/reset" in TASK_CENTER_HTML
+
+
 def test_dry_run_tasks_are_not_presented_as_real_videos():
     from gateway.main import TASK_CENTER_HTML
 

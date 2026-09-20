@@ -187,7 +187,7 @@ async function getPageVideoDownloadCoords(mediaId, target, tileIndex = -1) {
       const item = [...document.querySelectorAll('[role=menuitem],button')]
         .find((element) => {
           const text = (element.innerText || element.textContent || '').trim();
-          return element.getClientRects().length > 0 && /360p/i.test(text) && /原始尺寸|Original/i.test(text);
+          return element.getClientRects().length > 0 && /原始尺寸|Original/i.test(text);
         });
       if (item) {
         const rect = item.getBoundingClientRect();

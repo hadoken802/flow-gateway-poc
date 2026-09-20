@@ -102,7 +102,7 @@ async function submitVideoThroughPage(payload) {
   }
   press(settings);
   await delay(300);
-  for (const wanted of ['视频', payload.aspectRatio || '9:16', '360p', `${payload.duration || 10} 秒`, 'x1']) {
+  for (const wanted of ['视频', payload.aspectRatio || '9:16', payload.resolution || '720p', `${payload.duration || 10} 秒`, 'x1']) {
     const option = await waitFor(() => [...document.querySelectorAll('.cdk-overlay-container [role=radio],.cdk-overlay-container button')]
       .find((element) => {
         const lines = (element.innerText || '').split('\n').map((line) => line.trim()).filter(Boolean);
