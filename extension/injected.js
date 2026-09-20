@@ -61,6 +61,7 @@ window.addEventListener('SUBMIT_VIDEO_UI', async ({ detail }) => {
 async function submitVideoThroughPage(payload) {
   const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const findButton = (predicate) => [...document.querySelectorAll('button')].find(predicate);
+  const promptIngredientCount = () => document.querySelectorAll('flow-ingredient-chip').length;
   const press = (element) => {
     if (!element) return;
     for (const type of ['pointerdown', 'mousedown', 'mouseup', 'click']) {
@@ -79,7 +80,10 @@ async function submitVideoThroughPage(payload) {
 
   const clear = findButton((button) => button.getAttribute('aria-label') === '清除提示');
   clear?.click();
-  await delay(200);
+  await waitFor(() => promptIngredientCount() === 0, 10000, 'clear_prompt_media');
+
+  const images = payload.images || [];
+  if (!images.length) throw new Error('PAGE_VIDEO_IMAGES_REQUIRED');
 
   let settings = findButton((button) => button.getAttribute('aria-label') === '设置触发器');
   if (!settings) {
@@ -110,7 +114,7 @@ async function submitVideoThroughPage(payload) {
   }
   press(settings);
 
-  for (const image of payload.images || []) {
+  for (const image of images) {
     const add = await waitFor(() => findButton((button) => button.getAttribute('aria-label') === '在提示框中添加素材'), 30000, 'add_media');
     if (!findButton((button) => button.innerText.includes('上传媒体内容'))) {
       add.click();
@@ -140,14 +144,29 @@ async function submitVideoThroughPage(payload) {
     fileInput.files = transfer.files;
     fileInput.dispatchEvent(new Event('change', { bubbles: true }));
 
+    const asset = await waitFor(() => [...document.querySelectorAll('button[role=option]')]
+      .find((button) => {
+        const lines = (button.innerText || '').split('\n').map((line) => line.trim()).filter(Boolean);
+        return button.getAttribute('role') === 'option' && lines.includes(image.fileName);
+      }), 90000, `uploaded_asset:${image.fileName}`);
+    asset.click();
+    await waitFor(() => asset.classList.contains('asset-item-active'), 10000, `active_asset:${image.fileName}`);
+
+    const previousIngredientCount = promptIngredientCount();
     const attach = await waitFor(
       () => findButton((button) => button.innerText.includes('添加到提示')),
-      90000,
+      10000,
       'attach_media',
     );
     attach.click();
-    await delay(500);
+    await waitFor(
+      () => promptIngredientCount() === previousIngredientCount + 1,
+      10000,
+      `prompt_media:${image.fileName}`,
+    );
   }
+
+  if (promptIngredientCount() !== images.length) throw new Error('PAGE_VIDEO_MEDIA_ATTACH_MISMATCH');
 
   const editor = await waitFor(() => document.querySelector('[contenteditable=true]'), 30000, 'prompt_editor');
   editor.focus();

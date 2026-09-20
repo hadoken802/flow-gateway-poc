@@ -172,3 +172,20 @@ async def test_flow_client_upload_retries_legacy_payload_after_invalid_argument(
     }
     assert requests[1][1]["body"]["clientContext"]["tool"] == "ASSET_MANAGER"
     assert result["_mediaId"] == "media-legacy"
+
+
+def test_page_submit_selects_each_uploaded_asset_and_verifies_prompt_attachments():
+    injected = Path("extension/injected.js").read_text(encoding="utf-8")
+
+    select_uploaded = "button.getAttribute('role') === 'option' && lines.includes(image.fileName)"
+    wait_active = "asset.classList.contains('asset-item-active')"
+    verify_increment = "promptIngredientCount() === previousIngredientCount + 1"
+    verify_total = "promptIngredientCount() !== images.length"
+
+    assert "const promptIngredientCount" in injected
+    assert select_uploaded in injected
+    assert wait_active in injected
+    assert verify_increment in injected
+    assert verify_total in injected
+    assert injected.index(select_uploaded) < injected.index("attach.click()")
+    assert injected.index("attach.click()") < injected.index(verify_increment)
