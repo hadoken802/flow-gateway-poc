@@ -464,11 +464,18 @@ async def test_check_login_enable_requires_live_quota(gateway_db, registry):
 
 @pytest.mark.asyncio
 async def test_check_login_enable_turns_on_live_node(gateway_db, registry, monkeypatch):
-    from gateway import nodes
+    from gateway import crud, nodes
 
     scheduler = FakeScheduler(gateway_db)
     manager = FakeManager(registry)
     await nodes.create_node(scheduler, {"account_id": "FLOW-007", "worker_port": 18107, "extension_ws_port": 19206, "cdp_port": 19306}, registry)
+    await crud.update_account_controls(
+        gateway_db,
+        "FLOW-007",
+        status="needs_login",
+        manual_paused=1,
+        manual_pause_reason="authentication_expired",
+    )
 
     async def fake_read_worker_credits(account):
         return {"ok": True, "credits": 1000}
@@ -481,3 +488,7 @@ async def test_check_login_enable_turns_on_live_node(gateway_db, registry, monke
     assert result["result"] == "enabled"
     assert registry.get("FLOW-007").enabled is True
     assert registry.get("FLOW-007").status == "login_verified"
+    account = await crud.get_account(gateway_db, "FLOW-007")
+    assert account["status"] == "ready"
+    assert account["manual_paused"] == 0
+    assert account["manual_pause_reason"] is None

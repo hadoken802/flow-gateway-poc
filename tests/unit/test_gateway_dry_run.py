@@ -1684,6 +1684,71 @@ async def test_worker_4xx_before_job_creation_releases_account_as_failed_before_
 
 
 @pytest.mark.asyncio
+async def test_worker_401_before_remote_submit_marks_login_required_and_switches_account(monkeypatch):
+    from gateway import crud
+    from gateway.config import GatewaySettings
+    from gateway.scheduler_kernel import RETRY_POLICIES, RetryPolicy
+    from gateway.worker_client import WorkerSubmitError
+
+    class ExpiredLoginWorkerClient(FakeRealWorkerClient):
+        async def submit_omni_video(self, worker, payload):
+            if worker.account_id == "FLOW-001":
+                self.submits.append((worker.account_id, dict(payload)))
+                raise WorkerSubmitError(401, "Worker submit failed: HTTP 401", {
+                    "detail": {"error": {"code": 401, "status": "UNAUTHENTICATED"}},
+                })
+            return await super().submit_omni_video(worker, payload)
+
+    monkeypatch.setitem(
+        RETRY_POLICIES,
+        "authentication_expired",
+        RetryPolicy(True, "generation", 2, 0, True, 50, 0, True),
+    )
+    workers = RUN_ROOT / "submit_401_switch_workers.json"
+    write_workers(workers, ["FLOW-001", "FLOW-002"])
+    client = ExpiredLoginWorkerClient(
+        {"FLOW-001": {"credits": 100}, "FLOW-002": {"credits": 100}},
+        RUN_ROOT / "submit_401_switch_outputs",
+    )
+    scheduler = make_scheduler(
+        GatewaySettings(
+            db_path=local_db("submit_401_switch"),
+            workers_path=workers,
+            dry_run=False,
+            real_submit_max_attempts=2,
+            max_concurrency=2,
+        ),
+        client,
+    )
+    await scheduler.start()
+    try:
+        task = await create_unscheduled_task(
+            scheduler,
+            {"idempotency_key": "submit-401-switch", "image_path": "D:/img.png", "prompt": "p"},
+            generation_max_attempts=1,
+        )
+        await scheduler.schedule_once()
+        final = await wait_for_task_status(scheduler, task["task_id"], {"completed"})
+        account_a = await crud.get_account(scheduler.db, "FLOW-001")
+
+        assert final["status"] == "completed"
+        assert final["assigned_account_id"] == "FLOW-002"
+        assert [item[0] for item in client.submits] == ["FLOW-001", "FLOW-002"]
+        assert [item[0] for item in client.projects] == ["FLOW-001", "FLOW-002"]
+        assert account_a["status"] == "needs_login"
+        assert account_a["manual_paused"] == 1
+        assert account_a["manual_pause_reason"] == "authentication_expired"
+        assert account_a["current_task_id"] is None
+        assert account_a["reserved_credits"] == 0
+
+        await scheduler.refresh_workers()
+        refreshed_account_a = await crud.get_account(scheduler.db, "FLOW-001")
+        assert refreshed_account_a["status"] == "needs_login"
+    finally:
+        await scheduler.stop()
+
+
+@pytest.mark.asyncio
 async def test_download_failed_does_not_increment_generation_or_resubmit():
     from gateway import crud
     from gateway.config import GatewaySettings

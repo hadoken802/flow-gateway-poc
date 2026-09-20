@@ -113,7 +113,7 @@ RETRY_POLICIES = {
     "flow_rate_limited": RetryPolicy(True, "generation", 2, 600, True, 10, 600, False),
     "account_unusual_activity": RetryPolicy(True, "generation", 1, 300, True, 40, 3600, True),
     "recaptcha_required": RetryPolicy(True, "generation", 1, 300, True, 40, 3600, True),
-    "authentication_expired": RetryPolicy(True, "generation", 1, 300, True, 50, 0, True),
+    "authentication_expired": RetryPolicy(True, "generation", 2, 0, True, 50, 0, True),
     "account_not_bound": RetryPolicy(False, "none", 0, 0, False, 30, 0, True),
     "ownership_not_verified": RetryPolicy(False, "none", 0, 0, False, 20, 0, True),
     "quota_insufficient": RetryPolicy(False, "none", 0, 0, True, 0, 0, False),
@@ -150,7 +150,7 @@ def classify_error(error_code: str | None, error_message: str | None = None) -> 
         return "account_unusual_activity"
     if "recaptcha" in text:
         return "recaptcha_required"
-    if "permission_denied" in text or "403" in text:
+    if "unauthenticated" in text or "http 401" in text or " 401" in text or "permission_denied" in text or "403" in text:
         return "authentication_expired"
     if "quota" in text or "credit" in text:
         return "quota_insufficient"

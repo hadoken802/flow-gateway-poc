@@ -90,7 +90,7 @@ class GatewaySettings:
     worker_source: str = "runtime_registry"
     dry_run_step_seconds: tuple[float, float, float] = (1.0, 2.0, 3.0)
     worker_refresh_interval_seconds: float = 1.0
-    real_submit_max_attempts: int = 1
+    real_submit_max_attempts: int = 2
     worker_submit_timeout_seconds: float = 300.0
     allowed_account_ids: tuple[str, ...] = ()
     startup_timeout_seconds: float = 60.0
@@ -116,7 +116,7 @@ class GatewaySettings:
             workers_path=Path(os.environ.get("GATEWAY_WORKERS_PATH", str(Path(__file__).parent / "workers.json"))),
             worker_source=os.environ.get("FLOWKIT_GATEWAY_WORKER_SOURCE", "runtime_registry"),
             dry_run_step_seconds=_float_tuple("DRY_RUN_STEP_SECONDS", (1.0, 2.0, 3.0)),
-            real_submit_max_attempts=_positive_int("REAL_SUBMIT_MAX_ATTEMPTS", 1),
+            real_submit_max_attempts=_positive_int("REAL_SUBMIT_MAX_ATTEMPTS", 2),
             worker_submit_timeout_seconds=_positive_float("GATEWAY_WORKER_SUBMIT_TIMEOUT_SECONDS", 300.0),
             allowed_account_ids=_account_ids("GATEWAY_ALLOWED_ACCOUNT_IDS"),
             startup_timeout_seconds=_positive_float("GATEWAY_STARTUP_TIMEOUT_SECONDS", 60.0),

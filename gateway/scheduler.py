@@ -165,6 +165,8 @@ class GatewayScheduler:
                         and not (info.get("flow_key_present") or info.get("page_ui_ready"))
                     ):
                         status = "needs_login"
+                    elif account and int(account.get("manual_paused") or 0) and account.get("manual_pause_reason") == "authentication_expired":
+                        status = "needs_login"
                     elif credits is not None and credits < self.settings.omni_10s_credit_cost:
                         status = "low_credits"
                     elif credits is None and account and account.get("status") == "low_credits":
@@ -813,11 +815,25 @@ class GatewayScheduler:
                         return
                     self._audit("worker_submit_completed", task_id=task_id, worker_account_id=worker.account_id, worker_job_id=result.get("job_id") or result.get("worker_job_id"))
                 except WorkerSubmitError as exc:
+                    details = str(exc.response or exc)[:500]
+                    category = scheduler_kernel.classify_error(type(exc).__name__, f"{exc} {details}")
+                    if exc.status_code == 401 or category == "authentication_expired":
+                        await self._handle_generation_failure(
+                            task_id,
+                            account_id,
+                            token,
+                            {
+                                "error_code": "HTTP_401_UNAUTHENTICATED",
+                                "error_message": details,
+                                "remaining_credits": task.get("remaining_credits"),
+                            },
+                            reset_project=bool(task.get("project_created_by_gateway")),
+                        )
+                        return
                     if 400 <= exc.status_code < 500:
                         async with self.assignment_lock:
                             self._audit("account_released", task_id=task_id, account_id=account_id, release_reason="worker_rejected_before_remote_submit")
                             account = await crud.get_account(self.db, account_id)
-                            details = str(exc.response or exc)[:500]
                             await crud.guarded_release_account(
                                 self.db,
                                 task_id,
@@ -1186,14 +1202,17 @@ class GatewayScheduler:
             return None
         return worker
 
-    async def _handle_generation_failure(self, task_id: str, account_id: str, token: dict, result: dict) -> None:
+    async def _handle_generation_failure(self, task_id: str, account_id: str, token: dict, result: dict, *, reset_project: bool = False) -> None:
         category = scheduler_kernel.classify_error(result.get("error_code"), result.get("error_message"))
         policy = scheduler_kernel.RETRY_POLICIES.get(category, scheduler_kernel.RETRY_POLICIES["permanent_task_error"])
         task = await crud.get_task(self.db, task_id)
         if not task:
             return
         attempts = int(task.get("generation_attempts") or 0)
-        max_attempts = int(task.get("generation_max_attempts") or 1)
+        max_attempts = max(
+            int(task.get("generation_max_attempts") or 1),
+            int(policy.max_attempts or 0),
+        )
         can_retry = bool(policy.retryable and policy.retry_stage == "generation" and attempts < max_attempts)
         next_status = "retry_wait" if can_retry else ("need_manual" if policy.manual_required else "failed")
         next_retry_at = scheduler_kernel.utc_after(policy.backoff_seconds) if next_status == "retry_wait" and policy.backoff_seconds else None
@@ -1206,6 +1225,12 @@ class GatewayScheduler:
                 "submission_confirmed_at": None,
                 "remote_submission_state": None,
             }
+            if reset_project:
+                retry_fields.update({
+                    "project_id": None,
+                    "project_created_by_gateway": 0,
+                    "project_created_at": None,
+                })
         async with self.assignment_lock:
             account = await crud.get_account(self.db, account_id)
             self._audit("account_released", task_id=task_id, account_id=account_id, release_reason=category)
@@ -1244,6 +1269,7 @@ class GatewayScheduler:
         if category == "authentication_expired":
             updates["manual_paused"] = 1
             updates["manual_pause_reason"] = category
+            updates["status"] = "needs_login"
         if updates:
             await crud.update_account_controls(self.db, account_id, **updates)
 

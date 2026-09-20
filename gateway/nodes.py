@@ -242,6 +242,15 @@ async def check_login_and_enable(scheduler, account_id: str, registry: AccountRe
             checks["quota_live"] = bool(node and node.get("quota_confidence") == "live" and node.get("credits") is not None)
     ok = all(checks.values())
     if ok:
+        account = await crud.get_account(scheduler.db, account_id)
+        if account and account.get("manual_pause_reason") == "authentication_expired":
+            await crud.update_account_controls(
+                scheduler.db,
+                account_id,
+                status="ready",
+                manual_paused=0,
+                manual_pause_reason=None,
+            )
         registry.update_account(account_id, status="login_verified")
         enabled = await set_node_enabled(scheduler, account_id, True, registry)
         return {"ok": True, "result": "enabled", "checks": checks, "refresh": refreshed, "node": enabled}
