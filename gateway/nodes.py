@@ -12,6 +12,7 @@ from urllib.parse import quote
 
 import httpx
 
+from runtime.extension_bootstrap import ExtensionBootstrapper
 from runtime.process_manager import RuntimeManager
 from runtime.gateway_projection import ReadOnlyRuntimeStatusProvider
 from runtime.port_allocator import port_can_bind, port_is_available, port_is_listening, worker_fallback_range, worker_port_base
@@ -144,7 +145,13 @@ def port_is_available_from_range(candidates, reserved: set[int]) -> int:
     raise RuntimeError("no_available_worker_port")
 
 
-async def quick_create_login(scheduler, payload: dict, registry: AccountRegistry | None = None, manager: RuntimeManager | None = None) -> dict:
+async def quick_create_login(
+    scheduler,
+    payload: dict,
+    registry: AccountRegistry | None = None,
+    manager: RuntimeManager | None = None,
+    bootstrapper: ExtensionBootstrapper | None = None,
+) -> dict:
     registry = registry or AccountRegistry()
     manager = manager or RuntimeManager(registry)
     preview = quick_add_preview(payload, registry, manager)
@@ -168,6 +175,22 @@ async def quick_create_login(scheduler, payload: dict, registry: AccountRegistry
     )
     chrome = await asyncio.to_thread(manager.open_login, preview["account_id"])
     worker = await asyncio.to_thread(manager.start_worker_only, preview["account_id"])
+    bootstrapper = bootstrapper or ExtensionBootstrapper(registry, runtime=manager)
+    bootstrap = await asyncio.to_thread(bootstrapper.bootstrap_account, preview["account_id"], repair=True)
+    if not bootstrap.ok:
+        registry.sync_workers_json()
+        await scheduler.async_refresh_worker_snapshot()
+        return {
+            "ok": False,
+            "result": "extension_bootstrap_failed",
+            "message": "Account created, but the account-specific extension configuration failed",
+            "preview": preview,
+            "created": created,
+            "bootstrap": bootstrap.to_dict(),
+            "chrome": chrome.to_dict(),
+            "worker": worker.to_dict(),
+            "node": await get_node(scheduler, preview["account_id"], registry, manager),
+        }
     await _wait_runtime_identity(registry, preview["account_id"])
     registry.sync_workers_json()
     await _open_or_refresh_flow_page(preview["cdp_port"])
@@ -178,6 +201,7 @@ async def quick_create_login(scheduler, payload: dict, registry: AccountRegistry
         "message": "Waiting for manual Google/Flow login",
         "preview": preview,
         "created": created,
+        "bootstrap": bootstrap.to_dict(),
         "chrome": chrome.to_dict(),
         "worker": worker.to_dict(),
         "node": await get_node(scheduler, preview["account_id"], registry, manager),

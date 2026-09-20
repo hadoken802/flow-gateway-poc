@@ -173,9 +173,7 @@ def test_account_actions_show_progress_and_auto_refresh_does_not_overlap():
 
     assert "if(refreshPromise)return refreshPromise" in TASK_CENTER_HTML
     assert "nodeRows=await api('/api/v1/nodes')" in TASK_CENTER_HTML
-    assert "startNode('${esc(id)}',this)" in TASK_CENTER_HTML
-    assert "'启动中…'" in TASK_CENTER_HTML
-    assert "本地服务已启动，正在检查状态…" in TASK_CENTER_HTML
+    assert "if(state.key==='offline')return `<button onclick=\"openNodeLogin('${esc(id)}',this)\">启动</button>`" in TASK_CENTER_HTML
     assert "操作失败" in TASK_CENTER_HTML
     assert TASK_CENTER_HTML.index("worker_online&&!node?.extension_connected") < TASK_CENTER_HTML.index("if(status==='offline')")
 

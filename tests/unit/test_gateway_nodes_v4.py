@@ -1,6 +1,7 @@
 import pytest
 
 from gateway.worker_provider import WorkerConfig
+from runtime.extension_bootstrap import ExtensionBootstrapResult
 from runtime.process_manager import RuntimeResult
 from runtime.registry import AccountRegistry
 
@@ -68,6 +69,15 @@ class FakeManager:
     def stop_worker_only(self, account_id):
         self.stopped.append(account_id)
         return RuntimeResult("stopped", account_id, True, details={"chrome_preserved": True})
+
+
+class FakeBootstrapper:
+    def __init__(self):
+        self.bootstrapped = []
+
+    def bootstrap_account(self, account_id, repair=False):
+        self.bootstrapped.append((account_id, repair))
+        return ExtensionBootstrapResult("extension_bootstrapped", account_id, True)
 
 
 @pytest.fixture
@@ -358,7 +368,7 @@ async def test_quick_create_login_saves_allocated_worker_port(monkeypatch, gatew
     monkeypatch.setattr("gateway.nodes.port_is_listening", lambda port, host="127.0.0.1": False)
     monkeypatch.setattr("gateway.nodes.port_can_bind", lambda port, host="127.0.0.1": True)
 
-    result = await nodes.quick_create_login(scheduler, {"flow_account_number": "7"}, registry, manager)
+    result = await nodes.quick_create_login(scheduler, {"flow_account_number": "7"}, registry, manager, FakeBootstrapper())
     account = registry.get("FLOW-007")
 
     assert result["ok"] is True
@@ -405,6 +415,7 @@ async def test_quick_create_login_creates_disabled_node_and_starts_runtime(gatew
         {"flow_account_number": "7", "worker_port": 18107, "extension_ws_port": 19206, "cdp_port": 19306},
         registry,
         manager,
+        FakeBootstrapper(),
     )
 
     account = registry.get("FLOW-007")
@@ -413,6 +424,26 @@ async def test_quick_create_login_creates_disabled_node_and_starts_runtime(gatew
     assert account.enabled is False
     assert manager.opened == ["FLOW-007"]
     assert manager.started == ["FLOW-007"]
+
+
+@pytest.mark.asyncio
+async def test_quick_create_login_bootstraps_account_specific_extension(gateway_db, registry):
+    from gateway import nodes
+
+    scheduler = FakeScheduler(gateway_db)
+    manager = FakeManager(registry)
+    bootstrapper = FakeBootstrapper()
+
+    result = await nodes.quick_create_login(
+        scheduler,
+        {"flow_account_number": "7", "worker_port": 18107, "extension_ws_port": 19206, "cdp_port": 19306},
+        registry,
+        manager,
+        bootstrapper,
+    )
+
+    assert bootstrapper.bootstrapped == [("FLOW-007", True)]
+    assert result["bootstrap"]["result"] == "extension_bootstrapped"
 
 
 @pytest.mark.asyncio
