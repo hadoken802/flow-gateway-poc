@@ -138,11 +138,25 @@ class GatewayScheduler:
         async with self.assignment_lock:
             await self.async_refresh_worker_snapshot()
             enabled_workers = [worker for worker in self.workers if worker.enabled]
+            enabled_ids = {worker.account_id for worker in enabled_workers}
+            diagnostic_workers = [
+                WorkerConfig(
+                    account_id=candidate["account_id"],
+                    api_url=candidate["worker_api_endpoint"],
+                    enabled=False,
+                    runtime_instance_id=candidate.get("runtime_instance_id"),
+                )
+                for candidate in self.worker_snapshot.candidates
+                if candidate.get("account_id")
+                and candidate.get("worker_api_endpoint")
+                and candidate["account_id"] not in enabled_ids
+            ]
+            inspected_workers = enabled_workers + diagnostic_workers
             inspection_results = await asyncio.gather(
-                *(self.worker_client.inspect(worker) for worker in enabled_workers),
+                *(self.worker_client.inspect(worker) for worker in inspected_workers),
                 return_exceptions=True,
             )
-            inspections = dict(zip((worker.account_id for worker in enabled_workers), inspection_results))
+            inspections = dict(zip((worker.account_id for worker in inspected_workers), inspection_results))
             for worker in self.workers:
                 if not worker.enabled:
                     await crud.upsert_account(self.db, worker, status="offline", credits=None)
@@ -207,6 +221,29 @@ class GatewayScheduler:
                     if account and account.get("current_task_id"):
                         await crud.update_task_status(self.db, account["current_task_id"], "waiting_recovery", error_code="worker_offline", error_message=str(exc)[:500])
                     await crud.upsert_account(self.db, worker, status="offline", credits=(account or {}).get("credits"), last_error=str(exc)[:500])
+            for worker in diagnostic_workers:
+                info = inspections.get(worker.account_id)
+                if isinstance(info, BaseException) or not isinstance(info, dict) or not info.get("token_expired"):
+                    continue
+                account = await crud.get_account(self.db, worker.account_id)
+                if not account:
+                    continue
+                credits = info.get("credits")
+                persisted_worker = WorkerConfig(
+                    account_id=worker.account_id,
+                    api_url=worker.api_url,
+                    enabled=bool(account.get("enabled")),
+                    runtime_instance_id=worker.runtime_instance_id,
+                )
+                await crud.upsert_account(
+                    self.db,
+                    persisted_worker,
+                    status="needs_login",
+                    credits=credits if credits is not None else account.get("credits"),
+                    last_error="authentication_expired",
+                    quota_source=info.get("credits_source") if credits is not None else info.get("credits_error"),
+                    quota_confidence="live" if credits is not None else "stale",
+                )
 
     async def recover_tasks(self):
         tasks = await crud.list_tasks(self.db)

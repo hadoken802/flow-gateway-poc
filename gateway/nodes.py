@@ -346,10 +346,10 @@ async def runtime_action(scheduler, account_id: str, action: str, registry: Acco
     elif action == "restart":
         stopped = await asyncio.to_thread(manager.stop_worker_only, account_id)
         started = await asyncio.to_thread(manager.start_worker_only, account_id)
-        return {"ok": bool(started.ok), "account_id": account_id, "stop": stopped.to_dict(), "start": started.to_dict(), "node": await get_node(scheduler, account_id, registry)}
+        return {"ok": bool(started.ok), "account_id": account_id, "stop": stopped.to_dict(), "start": started.to_dict(), "node": await get_node(scheduler, account_id, registry, manager)}
     else:
         raise ValueError("unsupported_runtime_action")
-    return {"ok": bool(result.ok), **result.to_dict(), "node": await get_node(scheduler, account_id, registry)}
+    return {"ok": bool(result.ok), **result.to_dict(), "node": await get_node(scheduler, account_id, registry, manager)}
 
 
 async def open_login(scheduler, account_id: str, registry: AccountRegistry | None = None, manager: RuntimeManager | None = None) -> dict | None:

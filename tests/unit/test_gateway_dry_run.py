@@ -260,6 +260,62 @@ async def test_expired_worker_token_is_not_schedulable_even_with_live_credits():
 
 
 @pytest.mark.asyncio
+async def test_expired_token_is_reflected_even_when_runtime_is_temporarily_ineligible():
+    from gateway.config import GatewaySettings
+    from gateway.scheduler import GatewayScheduler
+    from gateway.worker_provider import WorkerConfig, WorkerSnapshot
+
+    eligible = WorkerConfig("FLOW-004", "http://127.0.0.1:18103", True, "runtime-4")
+    eligible_snapshot = WorkerSnapshot(
+        workers=[eligible],
+        candidates=[{
+            "account_id": "FLOW-004",
+            "eligible": True,
+            "worker_api_endpoint": eligible.api_url,
+            "runtime_instance_id": eligible.runtime_instance_id,
+        }],
+        worker_source="runtime_registry",
+        provider_kind="test",
+        registry_snapshot_time="2026-01-01T00:00:00Z",
+    )
+    excluded_snapshot = WorkerSnapshot(
+        workers=[],
+        candidates=[{
+            "account_id": "FLOW-004",
+            "eligible": False,
+            "worker_api_endpoint": eligible.api_url,
+            "runtime_instance_id": eligible.runtime_instance_id,
+            "exclusion_reasons": ["ownership_not_verified"],
+        }],
+        worker_source="runtime_registry",
+        provider_kind="test",
+        registry_snapshot_time="2026-01-01T00:00:01Z",
+    )
+
+    class Provider:
+        def __init__(self):
+            self.calls = 0
+
+        def load_workers(self):
+            self.calls += 1
+            return eligible_snapshot if self.calls == 1 else excluded_snapshot
+
+    scheduler = GatewayScheduler(
+        GatewaySettings(db_path=local_db("expired_token_ineligible_runtime")),
+        worker_client=FakeWorkerClient({"FLOW-004": {"credits": 1043, "token_expired": True}}),
+        worker_provider=Provider(),
+    )
+    await scheduler.start()
+    try:
+        account = (await scheduler.list_accounts())[0]
+        assert account["status"] == "needs_login"
+        assert account["enabled"] == 1
+        assert scheduler.workers == []
+    finally:
+        await scheduler.stop()
+
+
+@pytest.mark.asyncio
 async def test_worker_status_checks_run_concurrently():
     from gateway.config import GatewaySettings
 

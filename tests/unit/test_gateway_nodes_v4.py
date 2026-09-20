@@ -24,6 +24,7 @@ class FakeManager:
         self.started = []
         self.stopped = []
         self.opened = []
+        self.status_calls = []
         self.inspector = type("Inspector", (), {"listening_pid": lambda self, port: None})()
         self.status_payload = {
             "runtime_status": "running",
@@ -37,6 +38,7 @@ class FakeManager:
         }
 
     def status(self, account_id):
+        self.status_calls.append(account_id)
         account = self.registry.get(account_id)
         return RuntimeResult(
             "running",
@@ -171,6 +173,7 @@ async def test_runtime_actions_use_worker_only_and_preserve_chrome(gateway_db, r
     assert stopped["details"]["chrome_preserved"] is True
     assert manager.started == ["FLOW-004"]
     assert manager.stopped == ["FLOW-004"]
+    assert manager.status_calls == ["FLOW-004", "FLOW-004"]
 
 
 @pytest.mark.asyncio
