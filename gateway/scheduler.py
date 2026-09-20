@@ -160,6 +160,8 @@ class GatewayScheduler:
                         write_credits = last_known_credits
                     if info.get("status") == "offline":
                         status = "offline"
+                    elif info.get("token_expired"):
+                        status = "needs_login"
                     elif not info.get("extension_connected") or (
                         credits is None
                         and not (info.get("flow_key_present") or info.get("page_ui_ready"))
@@ -1208,6 +1210,7 @@ class GatewayScheduler:
         task = await crud.get_task(self.db, task_id)
         if not task:
             return
+        reset_project = reset_project or category == "media_upload_failed"
         attempts = int(task.get("generation_attempts") or 0)
         max_attempts = max(
             int(task.get("generation_max_attempts") or 1),

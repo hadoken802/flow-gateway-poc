@@ -67,6 +67,8 @@ async def extension_status():
         "connected": client.connected,
         "flow_key_present": client._flow_key is not None,
         "page_ui_ready": client.connected,
+        "token_age_ms": client.flow_token_age_ms,
+        "token_expired": client.flow_token_expired,
     }
 
 

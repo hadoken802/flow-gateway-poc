@@ -26,6 +26,7 @@ class FakeWorkerClient:
             "credits_error": state.get("credits_error"),
             "extension_connected": state.get("extension_connected", True),
             "flow_key_present": state.get("flow_key_present", True),
+            "token_expired": state.get("token_expired", False),
         }
 
     async def submit_omni_video(self, *_args, **_kwargs):
@@ -234,6 +235,26 @@ async def test_live_credits_keep_logged_in_account_ready_without_flow_key():
         account = (await scheduler.list_accounts())[0]
         assert account["status"] == "ready"
         assert account["quota_confidence"] == "live"
+    finally:
+        await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_expired_worker_token_is_not_schedulable_even_with_live_credits():
+    from gateway.config import GatewaySettings
+
+    scheduler = make_scheduler(
+        GatewaySettings(db_path=local_db("expired_worker_token")),
+        FakeWorkerClient({"FLOW-004": {"credits": 1043, "token_expired": True}}),
+    )
+    await scheduler.start()
+    try:
+        account = (await scheduler.list_accounts())[0]
+        assert account["status"] == "needs_login"
+        assert scheduler.select_worker(
+            {"task_id": "expired-token-task", "estimated_quota_cost": 15},
+            account_states=[account],
+        )["ok"] is False
     finally:
         await scheduler.stop()
 
@@ -1744,6 +1765,45 @@ async def test_worker_401_before_remote_submit_marks_login_required_and_switches
         await scheduler.refresh_workers()
         refreshed_account_a = await crud.get_account(scheduler.db, "FLOW-001")
         assert refreshed_account_a["status"] == "needs_login"
+    finally:
+        await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_prompt_media_page_timeout_switches_account_and_recreates_project():
+    from gateway.config import GatewaySettings
+
+    workers = RUN_ROOT / "prompt_media_timeout_switch_workers.json"
+    write_workers(workers, ["FLOW-001", "FLOW-002"])
+    client = SwitchAccountWorkerClient(
+        {"FLOW-001": {"credits": 100}, "FLOW-002": {"credits": 100}},
+        RUN_ROOT / "prompt_media_timeout_switch_outputs",
+        {"FLOW-001": ("502", "PAGE_ELEMENT_TIMEOUT:prompt_media:file-example.png")},
+    )
+    scheduler = make_scheduler(
+        GatewaySettings(
+            db_path=local_db("prompt_media_timeout_switch"),
+            workers_path=workers,
+            dry_run=False,
+            real_submit_max_attempts=2,
+            max_concurrency=2,
+        ),
+        client,
+    )
+    await scheduler.start()
+    try:
+        task = await create_unscheduled_task(
+            scheduler,
+            {"idempotency_key": "prompt-media-timeout-switch", "image_path": "D:/img.png", "prompt": "p"},
+            generation_max_attempts=1,
+        )
+        await scheduler.schedule_once()
+        final = await wait_for_task_status(scheduler, task["task_id"], {"completed"})
+
+        assert final["status"] == "completed"
+        assert final["assigned_account_id"] == "FLOW-002"
+        assert [item[0] for item in client.submits] == ["FLOW-001", "FLOW-002"]
+        assert [item[0] for item in client.projects] == ["FLOW-001", "FLOW-002"]
     finally:
         await scheduler.stop()
 

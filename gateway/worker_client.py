@@ -39,6 +39,8 @@ class WorkerClient:
             "extension_connected": bool(flow_status.get("connected")),
             "flow_key_present": bool(flow_status.get("flow_key_present")),
             "page_ui_ready": bool(flow_status.get("page_ui_ready")),
+            "token_age_ms": flow_status.get("token_age_ms", info.get("flow_token_age_ms")),
+            "token_expired": bool(flow_status.get("token_expired", info.get("flow_token_expired"))),
             **credits_info,
         }
 

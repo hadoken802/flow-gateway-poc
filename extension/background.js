@@ -305,7 +305,7 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
 
     // Notify agent
     if (ws?.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'token_captured', flowKey }));
+      ws.send(JSON.stringify({ type: 'token_captured', flowKey, capturedAt: metrics.tokenCapturedAt }));
     }
   },
   { urls: ['https://aisandbox-pa.googleapis.com/*', 'https://flow.google.com/*', 'https://labs.google/*'] },
@@ -410,7 +410,7 @@ function connectToAgent() {
     }));
     recordBootstrapDiagnostic('extension_ready_sent');
     if (flowKey) {
-      ws.send(JSON.stringify({ type: 'token_captured', flowKey }));
+      ws.send(JSON.stringify({ type: 'token_captured', flowKey, capturedAt: metrics.tokenCapturedAt }));
     }
     if (Number.isInteger(pageCredits)) {
       ws.send(JSON.stringify({

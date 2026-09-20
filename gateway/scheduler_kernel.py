@@ -118,7 +118,7 @@ RETRY_POLICIES = {
     "ownership_not_verified": RetryPolicy(False, "none", 0, 0, False, 20, 0, True),
     "quota_insufficient": RetryPolicy(False, "none", 0, 0, True, 0, 0, False),
     "project_creation_failed": RetryPolicy(True, "generation", 2, 120, True, 5, 0, False),
-    "media_upload_failed": RetryPolicy(True, "generation", 2, 120, True, 5, 0, False),
+    "media_upload_failed": RetryPolicy(True, "generation", 2, 0, True, 10, 300, False),
     "submission_failed_confirmed": RetryPolicy(True, "generation", 1, 300, True, 10, 0, False),
     "submission_result_unknown": RetryPolicy(False, "reconcile", 0, 0, False, 0, 0, True),
     "generation_failed": RetryPolicy(True, "generation", 1, 300, True, 10, 0, False),
@@ -154,6 +154,8 @@ def classify_error(error_code: str | None, error_message: str | None = None) -> 
         return "authentication_expired"
     if "quota" in text or "credit" in text:
         return "quota_insufficient"
+    if "page_element_timeout:prompt_media" in text:
+        return "media_upload_failed"
     if "download" in text:
         return "download_failed"
     if "generation_failed" in text or "generation failed" in text:

@@ -296,6 +296,8 @@ async def worker_info():
         "output_dir": str(OUTPUT_DIR),
         "extension_connected": client.connected,
         "flow_key_present": bool(client._flow_key),
+        "flow_token_age_ms": client.flow_token_age_ms,
+        "flow_token_expired": client.flow_token_expired,
     }
 
 

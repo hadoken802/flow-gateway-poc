@@ -28,6 +28,26 @@ async def test_extension_account_match_registers(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_extension_reports_expired_flow_token_age(monkeypatch):
+    flow_client, _main = reload_for_account(monkeypatch, "FLOW-004")
+    client = flow_client.FlowClient()
+
+    await client.handle_message({
+        "type": "extension_ready",
+        "flowKeyPresent": True,
+        "tokenAge": 60 * 60 * 1000 + 1,
+    })
+    await client.handle_message({"type": "token_captured", "flowKey": "test-token"})
+
+    assert client.flow_token_expired is True
+    assert client.flow_token_age_ms >= 60 * 60 * 1000
+
+    await client.handle_message({"type": "token_captured", "flowKey": "fresh-test-token"})
+    assert client.flow_token_expired is False
+    assert client.flow_token_age_ms < 1000
+
+
+@pytest.mark.asyncio
 async def test_extension_account_mismatch_fails(monkeypatch):
     flow_client, main = reload_for_account(monkeypatch, "FLOW-002")
     client = flow_client.FlowClient()

@@ -59,6 +59,8 @@ class FlowClient:
         self._extension_registered = False
         self._pending: dict[str, asyncio.Future] = {}
         self._flow_key: Optional[str] = None
+        self._flow_key_captured_at_ms: Optional[int] = None
+        self._preserve_next_token_timestamp = False
         self._page_credits: Optional[int] = None
         self._page_credits_at: Optional[int] = None
         self._page_credits_lock = asyncio.Lock()
@@ -135,8 +137,23 @@ class FlowClient:
     def note_ws_error(self, error_code: str):
         self._ws_last_error = error_code
 
-    def set_flow_key(self, key: str):
+    def set_flow_key(self, key: str, captured_at_ms: int | None = None):
         self._flow_key = key
+        if isinstance(captured_at_ms, int) and captured_at_ms > 0:
+            self._flow_key_captured_at_ms = captured_at_ms
+        elif self._flow_key_captured_at_ms is None:
+            self._flow_key_captured_at_ms = int(time.time() * 1000)
+
+    @property
+    def flow_token_age_ms(self) -> int | None:
+        if not self._flow_key or self._flow_key_captured_at_ms is None:
+            return None
+        return max(0, int(time.time() * 1000) - self._flow_key_captured_at_ms)
+
+    @property
+    def flow_token_expired(self) -> bool:
+        age = self.flow_token_age_ms
+        return bool(age is not None and age > 60 * 60 * 1000)
 
     @property
     def page_credits(self) -> Optional[int]:
@@ -207,7 +224,15 @@ class FlowClient:
     async def handle_message(self, data: dict):
         """Handle incoming message from extension."""
         if data.get("type") == "token_captured":
-            self._flow_key = data.get("flowKey")
+            captured_at = data.get("capturedAt")
+            if self._preserve_next_token_timestamp and not isinstance(captured_at, int):
+                self._flow_key = data.get("flowKey")
+            else:
+                self.set_flow_key(
+                    data.get("flowKey"),
+                    captured_at if isinstance(captured_at, int) else int(time.time() * 1000),
+                )
+            self._preserve_next_token_timestamp = False
             logger.info("Flow key captured from extension")
             self._track_task(self._sync_tier())
             return
@@ -223,6 +248,10 @@ class FlowClient:
 
         if data.get("type") == "extension_ready":
             self.mark_extension_ready()
+            token_age = data.get("tokenAge")
+            if data.get("flowKeyPresent") and isinstance(token_age, (int, float)) and token_age >= 0:
+                self._flow_key_captured_at_ms = int(time.time() * 1000 - token_age)
+                self._preserve_next_token_timestamp = True
             logger.info("Extension ready, flowKey=%s", "yes" if data.get("flowKeyPresent") else "no")
             self._track_task(self._sync_tier())
             return
