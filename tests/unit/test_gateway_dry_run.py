@@ -214,6 +214,31 @@ async def test_three_workers_are_classified_by_credits(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_live_credits_keep_logged_in_account_ready_without_flow_key():
+    from gateway.config import GatewaySettings
+
+    settings = GatewaySettings(db_path=local_db("live_credits_without_flow_key"))
+    scheduler = make_scheduler(
+        settings,
+        FakeWorkerClient({
+            "FLOW-008": {
+                "credits": 50,
+                "extension_connected": True,
+                "flow_key_present": False,
+            }
+        }),
+    )
+
+    await scheduler.start()
+    try:
+        account = (await scheduler.list_accounts())[0]
+        assert account["status"] == "ready"
+        assert account["quota_confidence"] == "live"
+    finally:
+        await scheduler.stop()
+
+
+@pytest.mark.asyncio
 async def test_worker_status_checks_run_concurrently():
     from gateway.config import GatewaySettings
 

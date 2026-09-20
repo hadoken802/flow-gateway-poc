@@ -186,6 +186,15 @@ def test_advanced_account_controls_distinguish_unpause_from_health_reset():
     assert "/health/reset" in TASK_CENTER_HTML
 
 
+def test_verified_live_node_wins_over_stale_needs_login_account_status():
+    from gateway.main import TASK_CENTER_HTML
+
+    verified = "if(nodeVerified)return {key:'ready'"
+    stale_login = "if(status==='needs_login')return {key:'login'"
+    assert "node?.quota_confidence==='live'" in TASK_CENTER_HTML
+    assert TASK_CENTER_HTML.index(verified) < TASK_CENTER_HTML.index(stale_login)
+
+
 def test_dry_run_tasks_are_not_presented_as_real_videos():
     from gateway.main import TASK_CENTER_HTML
 

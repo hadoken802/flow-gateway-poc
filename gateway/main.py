@@ -794,6 +794,8 @@ function accountState(account,node){
   if(node?.worker_online&&!node?.extension_connected)return {key:'extension',label:'浏览器扩展未连接',tone:'warn'};
   if(node?.extension_connected&&node?.runtime?.account_match===false)return {key:'mismatch',label:'登录账号不匹配',tone:'danger'};
   if(node?.extension_connected&&node?.runtime?.account_match&&(account?.quota_confidence==='stale'||oauth.includes('credits_http_')))return {key:'quota',label:'登录正常，额度验证失败',tone:'warn'};
+  const nodeVerified=node?.worker_online&&node?.extension_connected&&node?.runtime?.account_match&&node?.quota_confidence==='live'&&node?.credits!=null&&oauth==='live';
+  if(nodeVerified)return {key:'ready',label:status==='busy'||account?.current_task_id?'生成中':'正常',tone:''};
   if(status==='offline')return {key:'offline',label:'离线',tone:'danger'};
   if(status==='needs_login')return {key:'login',label:'需要登录',tone:'warn'};
   if(oauth.includes('oauth')||oauth.includes('login')||node?.extension_status==='extension_missing')return {key:'login',label:'需要登录',tone:'warn'};

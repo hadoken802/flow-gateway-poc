@@ -160,8 +160,9 @@ class GatewayScheduler:
                         write_credits = last_known_credits
                     if info.get("status") == "offline":
                         status = "offline"
-                    elif not info.get("extension_connected") or not (
-                        info.get("flow_key_present") or info.get("page_ui_ready")
+                    elif not info.get("extension_connected") or (
+                        credits is None
+                        and not (info.get("flow_key_present") or info.get("page_ui_ready"))
                     ):
                         status = "needs_login"
                     elif credits is not None and credits < self.settings.omni_10s_credit_cost:
