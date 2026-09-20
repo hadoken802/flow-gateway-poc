@@ -195,6 +195,22 @@ def test_verified_live_node_wins_over_stale_needs_login_account_status():
     assert TASK_CENTER_HTML.index(verified) < TASK_CENTER_HTML.index(stale_login)
 
 
+def test_task_statuses_and_failure_reasons_are_presented_in_chinese():
+    from gateway.main import TASK_CENTER_HTML
+
+    assert "failed_before_remote_submit:'提交到 Flow 前失败'" in TASK_CENTER_HTML
+    assert "manual_review:'需要人工检查'" in TASK_CENTER_HTML
+    assert "alert(zhTaskReason(t))" in TASK_CENTER_HTML
+    assert "UNAUTHENTICATED" in TASK_CENTER_HTML
+    assert "登录凭证已失效" in TASK_CENTER_HTML
+    assert "WORKER_NOT_READY" in TASK_CENTER_HTML
+    assert "本地服务或浏览器扩展未就绪" in TASK_CENTER_HTML
+    assert "PAGE_ELEMENT_TIMEOUT" in TASK_CENTER_HTML
+    assert "Flow 页面操作超时" in TASK_CENTER_HTML
+    assert "系统暂未提供可识别的中文原因" in TASK_CENTER_HTML
+    assert "?zhTaskReason(t):''" in TASK_CENTER_HTML
+
+
 def test_dry_run_tasks_are_not_presented_as_real_videos():
     from gateway.main import TASK_CENTER_HTML
 
