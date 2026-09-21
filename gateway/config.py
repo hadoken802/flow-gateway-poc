@@ -2,6 +2,7 @@
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from runtime.paths import OUTPUTS_ROOT
 
 
 DEFAULT_GATEWAY_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "gateway.db"
@@ -82,6 +83,7 @@ class GatewaySettings:
     api_port: int = 8200
     max_concurrency: int = 2
     dry_run: bool = True
+    daily_probe_enabled: bool = False
     canary_only: bool = False
     canary_limit: int = 2
     omni_10s_credit_cost: int = 15
@@ -91,7 +93,7 @@ class GatewaySettings:
     dry_run_step_seconds: tuple[float, float, float] = (1.0, 2.0, 3.0)
     worker_refresh_interval_seconds: float = 1.0
     real_submit_max_attempts: int = 2
-    worker_submit_timeout_seconds: float = 300.0
+    worker_submit_timeout_seconds: float = 420.0
     allowed_account_ids: tuple[str, ...] = ()
     startup_timeout_seconds: float = 60.0
     lease_duration_seconds: float = 15 * 60
@@ -100,7 +102,7 @@ class GatewaySettings:
     allow_stale_quota_scheduling: bool = False
     client_api_key: str = ""
     admin_api_key: str = ""
-    output_root: Path = PROJECT_ROOT / "outputs"
+    output_root: Path = OUTPUTS_ROOT
 
     @classmethod
     def from_env(cls) -> "GatewaySettings":
@@ -109,6 +111,7 @@ class GatewaySettings:
             api_port=_port("GATEWAY_API_PORT", 8200),
             max_concurrency=int(os.environ.get("POOL_MAX_CONCURRENCY", "2")),
             dry_run=_bool("POOL_DRY_RUN", True),
+            daily_probe_enabled=_bool("GATEWAY_DAILY_PROBE_ENABLED", True),
             canary_only=_bool("CANARY_ONLY", False),
             canary_limit=int(os.environ.get("CANARY_LIMIT", "2")),
             omni_10s_credit_cost=int(os.environ.get("OMNI_10S_CREDIT_COST", "15")),
@@ -117,7 +120,7 @@ class GatewaySettings:
             worker_source=os.environ.get("FLOWKIT_GATEWAY_WORKER_SOURCE", "runtime_registry"),
             dry_run_step_seconds=_float_tuple("DRY_RUN_STEP_SECONDS", (1.0, 2.0, 3.0)),
             real_submit_max_attempts=_positive_int("REAL_SUBMIT_MAX_ATTEMPTS", 2),
-            worker_submit_timeout_seconds=_positive_float("GATEWAY_WORKER_SUBMIT_TIMEOUT_SECONDS", 300.0),
+            worker_submit_timeout_seconds=_positive_float("GATEWAY_WORKER_SUBMIT_TIMEOUT_SECONDS", 420.0),
             allowed_account_ids=_account_ids("GATEWAY_ALLOWED_ACCOUNT_IDS"),
             startup_timeout_seconds=_positive_float("GATEWAY_STARTUP_TIMEOUT_SECONDS", 60.0),
             lease_duration_seconds=_positive_float("GATEWAY_LEASE_DURATION_SECONDS", 15 * 60),
@@ -126,7 +129,7 @@ class GatewaySettings:
             allow_stale_quota_scheduling=_bool("GATEWAY_ALLOW_STALE_QUOTA_SCHEDULING", False),
             client_api_key=os.environ.get("FLOW_GATEWAY_CLIENT_API_KEY", ""),
             admin_api_key=os.environ.get("FLOW_GATEWAY_ADMIN_API_KEY", ""),
-            output_root=Path(os.environ.get("FLOW_GATEWAY_OUTPUT_DIR", str(PROJECT_ROOT / "outputs"))),
+            output_root=Path(os.environ.get("FLOW_GATEWAY_OUTPUT_DIR", str(OUTPUTS_ROOT))),
         )
 
 

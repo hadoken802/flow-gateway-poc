@@ -145,7 +145,7 @@ class FakeRuntime:
 
 
 class FakeCdp:
-    def __init__(self, extension_id=EXPECTED_FLOWKIT_EXTENSION_ID, discover_sequence=None, service_worker="background-027.js", target_sets=None):
+    def __init__(self, extension_id=EXPECTED_FLOWKIT_EXTENSION_ID, discover_sequence=None, service_worker="background-029.js", target_sets=None):
         self.extension_id_value = extension_id
         self.opened_urls = []
         self.ready_calls = []
@@ -1269,7 +1269,7 @@ def test_other_background_service_worker_is_ignored_for_flowkit_bootstrap(tmp_pa
     ready_template(registry.profiles_root)
     runtime_id = "admccjkmockfdflocgggjfgdacdodkdf"
     cdp = FakeCdp(extension_id=None, target_sets=[
-        [{"type": "service_worker", "url": f"chrome-extension://{runtime_id}/background-027.js"}],
+            [{"type": "service_worker", "url": f"chrome-extension://{runtime_id}/background-029.js"}],
     ])
     runtime = FakeRuntime(status={"extension_connected": True, "extension_account_id": "FLOW-006", "account_match": True})
     bootstrapper = ExtensionBootstrapper(registry, runtime=runtime, cdp=cdp, profiles_root=registry.profiles_root, sleep=lambda _: None)
@@ -1609,8 +1609,8 @@ def test_bootstrap_ignores_other_extension_and_accepts_expected_flowkit_id(tmp_p
     ready_template(registry.profiles_root)
     other_id = "admccjkmockfdflocgggjfgdacdodkdf"
     cdp = FakeCdp(target_sets=[[
-        {"type": "service_worker", "url": f"chrome-extension://{other_id}/background-027.js"},
-        {"type": "service_worker", "url": f"chrome-extension://{EXPECTED_FLOWKIT_EXTENSION_ID}/background-027.js"},
+        {"type": "service_worker", "url": f"chrome-extension://{other_id}/background-029.js"},
+        {"type": "service_worker", "url": f"chrome-extension://{EXPECTED_FLOWKIT_EXTENSION_ID}/background-029.js"},
     ]])
     runtime = FakeRuntime(status={"extension_connected": True, "extension_account_id": "FLOW-006", "account_match": True})
     bootstrapper = ExtensionBootstrapper(registry, runtime=runtime, cdp=cdp, profiles_root=registry.profiles_root, sleep=lambda _: None)
@@ -1657,8 +1657,8 @@ def test_bootstrap_rejects_ambiguous_matching_service_workers(tmp_path):
     add_account(registry, "FLOW-006")
     ready_template(registry.profiles_root)
     cdp = FakeCdp(extension_id=None, target_sets=[[
-        {"type": "service_worker", "url": "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/background-027.js"},
-        {"type": "service_worker", "url": "chrome-extension://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/background-027.js"},
+        {"type": "service_worker", "url": "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/background-029.js"},
+        {"type": "service_worker", "url": "chrome-extension://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/background-029.js"},
     ]])
     runtime = FakeRuntime()
     bootstrapper = ExtensionBootstrapper(registry, runtime=runtime, cdp=cdp, profiles_root=registry.profiles_root, sleep=lambda _: None)
@@ -2527,13 +2527,36 @@ def test_browser_headers_use_current_flow_origin():
     assert headers["referer"] == "https://flow.google.com/"
 
 
+def test_extension_does_not_let_optional_cookie_banner_block_flow_boot():
+    rules = json.loads(Path("extension/rules.json").read_text(encoding="utf-8"))
+
+    cookie_rule = next(rule for rule in rules if rule["id"] == 2)
+    assert cookie_rule["action"]["type"] == "block"
+    assert cookie_rule["condition"]["urlFilter"] == "||www.gstatic.com/glue/cookienotificationbar/"
+    assert set(cookie_rule["condition"]["resourceTypes"]) == {"stylesheet", "script"}
+
+
 def test_page_video_receipt_can_fall_back_to_rendered_video_tile():
     content = Path("extension/content.js").read_text(encoding="utf-8")
     background = Path("extension/background.js").read_text(encoding="utf-8")
 
     assert "GET_PAGE_VIDEO_JOB_IDS" in content
+    assert "document.addEventListener('DOMContentLoaded', inject, { once: true })" in content
+    assert "document.head.appendChild(s)" in content
+    assert "document.head || document.documentElement" not in content
     assert "flow-video-tile img" in content
     assert "baselineIds: [...existingIds]" in background
+    assert "waitForStablePageVideoIds(tab.id, 15000)" in background
+    assert "waitForPageVideoSubmission(tab.id, existingIds, jobPromise, 15000)" in background
+    assert "waitForPageVideoSubmission(tab.id, existingIds, jobPromise, 105000)" in background
+    assert "throw uiError || evidenceError" in background
+    assert "throw new Error('REMOTE_SUBMISSION_NOT_CONFIRMED')" in background
+    assert "baselineIds: [...existingIds]" in background
+    assert "if (!job.outputId)" in background
+    assert "async function readPageVideoIds(tabId)" in background
+    assert "async function readPageVideoStatus(tabId, mediaId, tileIndex = -1)" in background
+    assert "persistPageVideoJobs" in background
+    assert "await hydratePageVideoJobs()" in background
     assert "const jobId = capturedJobId || crypto.randomUUID()" in background
     assert "page_video_media" in background
     assert "/(^|\\n)(下载|Download)(\\n|$)/i" in content
@@ -2544,6 +2567,9 @@ def test_page_video_receipt_can_fall_back_to_rendered_video_tile():
     assert "GET_PAGE_VIDEO_DOWNLOAD_COORDS" in content
     assert "await trustedClick(job.tabId, more.x, more.y)" in background
     assert "await trustedClick(job.tabId, download.x, download.y)" in background
+    assert "await trustedMove(job.tabId, download.x, download.y)" in background
+    assert "let resolution = await chrome.tabs.sendMessage" in background
+    assert "if (resolution?.error)" in background
     assert "PAGE_VIDEO_DOWNLOAD_RESOLUTION_NOT_FOUND" in content
     assert "await trustedClick(job.tabId, resolution.x, resolution.y)" in background
     assert "target === 'hover'" in content

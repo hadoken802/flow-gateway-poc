@@ -59,7 +59,6 @@ window.addEventListener('SUBMIT_VIDEO_UI', async ({ detail }) => {
 });
 
 async function submitVideoThroughPage(payload) {
-  const stage = payload.stage || 'all';
   const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const findButton = (predicate) => [...document.querySelectorAll('button')].find(predicate);
   const promptIngredientCount = () => document.querySelectorAll('flow-ingredient-chip').length;
@@ -79,7 +78,7 @@ async function submitVideoThroughPage(payload) {
     }
   };
   const waitFor = async (finder, timeout = 30000, label = 'unknown') => {
-    const deadline = Math.min(Date.now() + timeout, payload.deadline || Infinity);
+    const deadline = Date.now() + timeout;
     while (Date.now() < deadline) {
       const value = finder();
       if (value) return value;
@@ -88,14 +87,14 @@ async function submitVideoThroughPage(payload) {
     throw new Error(`PAGE_ELEMENT_TIMEOUT:${label}`);
   };
 
-  const images = payload.images || [];
-  if (!images.length) throw new Error('PAGE_VIDEO_IMAGES_REQUIRED');
-  if (stage === 'all' || stage === 'settings') {
-  const clear = findButton((button) => /^(清除提示|Clear prompt)$/i.test(button.getAttribute('aria-label') || ''));
+  const clear = findButton((button) => button.getAttribute('aria-label') === '清除提示');
   clear?.click();
   await waitFor(() => promptIngredientCount() === 0, 10000, 'clear_prompt_media');
 
-  let settings = findButton((button) => /^(设置触发器|Settings|Open settings)$/i.test(button.getAttribute('aria-label') || ''));
+  const images = payload.images || [];
+  if (!images.length) throw new Error('PAGE_VIDEO_IMAGES_REQUIRED');
+
+  let settings = findButton((button) => button.getAttribute('aria-label') === '设置触发器');
   if (!settings) {
     let agentMode = document.querySelector('flow-agent-mode-toggle-chip button');
     if (!agentMode) {
@@ -108,7 +107,7 @@ async function submitVideoThroughPage(payload) {
     await delay(400);
     const dismiss = findButton((button) => /知道了|Got it/i.test(button.innerText || ''));
     if (dismiss) press(dismiss);
-    settings = await waitFor(() => findButton((button) => /^(设置触发器|Settings|Open settings)$/i.test(button.getAttribute('aria-label') || '')), 30000, 'settings');
+    settings = await waitFor(() => findButton((button) => button.getAttribute('aria-label') === '设置触发器'), 30000, 'settings');
   }
   const settingsOptions = () => [...document.querySelectorAll('.cdk-overlay-container [role=radio],.cdk-overlay-container button')]
     .filter((element) => element.getClientRects().length > 0);
@@ -126,25 +125,13 @@ async function submitVideoThroughPage(payload) {
   }
   settings.click();
 
-    if (stage === 'settings') return { stage, verified: true };
-  }
-
-  if (stage !== 'prompt') for (const [imageIndex, image] of images.entries()) {
-    if (Number.isInteger(payload.imageIndex) && imageIndex !== payload.imageIndex) continue;
-    const findUploadedAsset = () => [...document.querySelectorAll('button[role=option]')]
-      .filter((button) => {
-        const lines = (button.innerText || '').split('\n').map((line) => line.trim()).filter(Boolean);
-        return button.getClientRects().length > 0
-          && button.getAttribute('role') === 'option'
-          && lines.includes(image.fileName);
-      }).at(-1);
+  for (const image of images) {
     const add = await waitFor(() => findButton((button) => button.getAttribute('aria-label') === '在提示框中添加素材'), 30000, 'add_media');
     if (!findButton((button) => button.innerText.includes('上传媒体内容'))) {
       add.click();
       await delay(300);
     }
     const upload = await waitFor(() => findButton((button) => button.innerText.includes('上传媒体内容')), 30000, 'upload_media');
-    if (stage !== 'attach' && !findUploadedAsset()) {
     let fileInput = null;
     const originalClick = HTMLInputElement.prototype.click;
     HTMLInputElement.prototype.click = function () {
@@ -168,11 +155,13 @@ async function submitVideoThroughPage(payload) {
     fileInput.files = transfer.files;
     fileInput.dispatchEvent(new Event('change', { bubbles: true }));
 
-    }
-    if (stage === 'upload') {
-      await waitFor(findUploadedAsset, 90000, `uploaded_asset:${image.fileName}`);
-      return { stage, verified: true };
-    }
+    const findUploadedAsset = () => [...document.querySelectorAll('button[role=option]')]
+      .filter((button) => {
+        const lines = (button.innerText || '').split('\n').map((line) => line.trim()).filter(Boolean);
+        return button.getClientRects().length > 0
+          && button.getAttribute('role') === 'option'
+          && lines.includes(image.fileName);
+      }).at(-1);
     const previousIngredientCount = promptIngredientCount();
     let asset = await waitFor(findUploadedAsset, 90000, `uploaded_asset:${image.fileName}`);
     asset.click();
@@ -211,8 +200,6 @@ async function submitVideoThroughPage(payload) {
     if (!attached) throw new Error(`PAGE_ELEMENT_TIMEOUT:prompt_media:${image.fileName}`);
   }
 
-  if (stage === 'attach') return { stage, verified: true };
-
   if (promptIngredientCount() !== images.length) throw new Error('PAGE_VIDEO_MEDIA_ATTACH_MISMATCH');
 
   const editor = await waitFor(() => document.querySelector('[contenteditable=true]'), 30000, 'prompt_editor');
@@ -226,7 +213,7 @@ async function submitVideoThroughPage(payload) {
   editor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: String(payload.prompt || '') }));
 
   const generate = await waitFor(() => {
-    const button = findButton((item) => /^(开始生成|Generate|Start generation)$/i.test(item.getAttribute('aria-label') || ''));
+    const button = findButton((item) => item.getAttribute('aria-label') === '开始生成');
     return button && !button.disabled ? button : null;
   }, 90000, 'generate_button');
   generate.scrollIntoView({ block: 'center', inline: 'center' });

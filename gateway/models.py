@@ -11,5 +11,5 @@ TASK_STATUSES = {
 ACTIVE_TASK_STATUSES = {
     "leased", "assigning", "project_create_pending", "project_create_in_progress",
     "project_creation_unknown", "project_created", "submit_pending", "submit_in_progress",
-    "submission_unknown", "submitted", "processing", "download_pending", "downloading",
+    "submission_unknown", "submitted", "processing", "download_pending", "downloading", "waiting_recovery",
 }

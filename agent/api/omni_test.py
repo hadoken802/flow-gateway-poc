@@ -5,7 +5,6 @@ import binascii
 import json
 import logging
 import mimetypes
-import shutil
 import uuid
 from pathlib import Path
 
@@ -42,6 +41,9 @@ DOWNLOAD_RECOVERY_STATUSES = ["completed", "waiting_download", "completed_remote
 
 _poll_tasks: dict[str, asyncio.Task] = {}
 _download_locks: dict[str, asyncio.Lock] = {}
+_download_tasks: dict[str, asyncio.Task] = {}
+DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS = 250  # Browser RPC allows 240 s, including its 180 s transfer.
+DOWNLOAD_WINDOW_TIMEOUT_SECONDS = 600
 _shutdown_event = asyncio.Event()
 
 
@@ -56,11 +58,13 @@ def _track_omni_task(job_id: str, coro) -> asyncio.Task | None:
 
 async def shutdown_omni_jobs() -> None:
     _shutdown_event.set()
-    for task in list(_poll_tasks.values()):
+    tasks = list(_poll_tasks.values()) + list(_download_tasks.values())
+    for task in tasks:
         task.cancel()
-    if _poll_tasks:
-        await asyncio.gather(*list(_poll_tasks.values()), return_exceptions=True)
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
     _poll_tasks.clear()
+    _download_tasks.clear()
 
 
 class OmniVideoRequest(BaseModel):
@@ -409,24 +413,61 @@ async def retry_omni_video_download(job_id: str):
     job = await crud.get_omni_test_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
-    lock = _download_locks.setdefault(job_id, asyncio.Lock())
-    async with lock:
-        job = await crud.get_omni_test_job(job_id)
-        if job.get("video_path") and _valid_existing_mp4(Path(job["video_path"])):
-            job = await crud.update_omni_test_job(
-                job_id,
-                status="completed",
-                error_code=None,
-                error_message=None,
-            )
-            response = _public_job(job)
-            response["reused"] = True
-            return response
-        await _retry_download_existing_job(job)
-        updated = await crud.get_omni_test_job(job_id)
-        response = _public_job(updated)
-        response["reused"] = False
+    if job.get("video_path") and _valid_existing_mp4(Path(job["video_path"])):
+        job = await crud.update_omni_test_job(
+            job_id,
+            status="completed",
+            error_code=None,
+            error_message=None,
+        )
+        response = _public_job(job)
+        response["reused"] = True
         return response
+    lock = _download_locks.get(job_id)
+    pending = _download_tasks.get(job_id)
+    if (lock is not None and lock.locked()) or (pending is not None and not pending.done()):
+        return _public_job(job)
+    if _shutdown_event.is_set():
+        raise HTTPException(503, "Worker is shutting down")
+    task = asyncio.create_task(_run_requested_download(job))
+    _download_tasks[job_id] = task
+    task.add_done_callback(lambda done: _download_tasks.pop(job_id, None) if _download_tasks.get(job_id) is done else None)
+    response = _public_job(job)
+    response["reused"] = False
+    return response
+
+
+async def _run_requested_download(job: dict) -> None:
+    try:
+        await _retry_download_existing_job(job, wait_schedule=[0])
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        await crud.update_omni_test_job(job["job_id"], status="failed",
+            error_code=type(exc).__name__, error_message=str(exc)[:500])
+
+
+@router.post("/{job_id}/recover-page-result")
+async def recover_page_result(job_id: str):
+    job = await crud.get_omni_test_job(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    if job.get("status") != "failed" or job.get("output_media_id") or job.get("error_code") not in {"submit_error", "502"}:
+        raise HTTPException(409, "Only an unbound failed submission can be reconciled")
+    client = get_flow_client()
+    result = await client._send("page_reconcile_video", {"projectId": job["project_id"]}, timeout=90)
+    data = result.get("data", {})
+    if result.get("error") or data.get("projectId") != job["project_id"]:
+        raise HTTPException(409, result.get("error") or "Recovery project mismatch")
+    try:
+        media_id = str(uuid.UUID(data.get("mediaId", "")))
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(409, "Recovery did not return a unique media UUID")
+    client._page_video_jobs.add(media_id)
+    updated = await crud.update_omni_test_job(job_id, output_media_id=media_id, status="active",
+                                            error_code=None, error_message=None)
+    _ensure_polling(job_id)
+    return {**_public_job(updated), "submit_called": False}
 
 
 @router.get("/manual-flow-results/{project_id}")
@@ -536,6 +577,7 @@ async def _poll_job(job_id: str) -> None:
                 return
 
             try:
+                _restore_page_job_route(get_flow_client(), job)
                 result = await omni.check_status(job["project_id"], job["output_media_id"])
                 if result.get("error"):
                     await asyncio.sleep(POLL_INTERVAL_SECONDS)
@@ -576,8 +618,17 @@ async def _poll_job(job_id: str) -> None:
     return
 
 
+def _restore_page_job_route(client, job: dict) -> None:
+    # The persisted upload receipt identifies page-mode jobs after a cold start.
+    # Routing must not depend on sets that existed only in the previous process.
+    if str(job.get("input_media_id") or "").startswith("page-upload:") and job.get("output_media_id"):
+        client._page_video_jobs.add(job["output_media_id"])
+        client._page_video_outputs.add(job["output_media_id"])
+
+
 async def _download_completed(job: dict) -> None:
     client = get_flow_client()
+    _restore_page_job_route(client, job)
     output_media_id = job.get("output_media_id")
     if not output_media_id:
         return
@@ -606,7 +657,7 @@ async def _download_completed(job: dict) -> None:
         source = Path(local_file_path)
         if not _valid_existing_mp4(source):
             raise ValueError("Video download failed: browser download is not a valid MP4")
-        shutil.copyfile(source, dest)
+        _write_valid_mp4_bytes_atomic(source.read_bytes(), dest)
         await crud.update_omni_test_job(
             job["job_id"], video_path=str(dest), status="completed", error_code=None,
             error_message=None, completed_at=crud._now(),
@@ -645,15 +696,26 @@ async def _download_completed(job: dict) -> None:
 
 
 async def _retry_download_existing_job(job: dict, wait_schedule=None) -> None:
-    wait_schedule = wait_schedule if wait_schedule is not None else [0, 5, 10, 20, 30] + [30] * 17
+    # Both the automatic poller and the gateway recovery endpoint enter here.
+    # A job must own the same lock for the entire browser download operation.
+    lock = _download_locks.setdefault(job["job_id"], asyncio.Lock())
+    async with lock:
+        await _retry_download_existing_job_locked(job, wait_schedule)
+
+
+async def _retry_download_existing_job_locked(job: dict, wait_schedule=None) -> None:
+    wait_schedule = wait_schedule if wait_schedule is not None else [0, 2]
     client = get_flow_client()
     omni = OmniClient(client)
     started = asyncio.get_running_loop().time()
-    for delay in wait_schedule:
+    deadline = started + DOWNLOAD_WINDOW_TIMEOUT_SECONDS
+    for attempt, delay in enumerate(wait_schedule):
         if _shutdown_event.is_set():
             return
         if delay:
             await asyncio.sleep(delay)
+        if asyncio.get_running_loop().time() >= deadline:
+            break
         current = await crud.get_omni_test_job(job["job_id"])
         if current.get("video_path") and _valid_existing_mp4(Path(current["video_path"])):
             return
@@ -669,21 +731,29 @@ async def _retry_download_existing_job(job: dict, wait_schedule=None) -> None:
             )
             return
         await crud.update_omni_test_job(current["job_id"], status="waiting_download")
-        if current.get("output_media_id"):
-            status_result = await omni.check_status(current["project_id"], current["output_media_id"])
-            status_data = unwrap_response(status_result)
-            fields = extract_status_fields(status_data)
-            updates = {"raw_response_shape": json.dumps(sanitized_response_shape(status_data))}
-            if fields.get("output_media_id") and fields["output_media_id"] != current.get("output_media_id"):
-                updates["output_media_id"] = fields["output_media_id"]
-            if fields.get("operation_name"):
-                updates["operation_name"] = fields["operation_name"]
-            await crud.update_omni_test_job(current["job_id"], **updates)
-        await _download_completed(await crud.get_omni_test_job(job["job_id"]))
+        async def bounded(operation, limit):
+            return await asyncio.wait_for(operation, timeout=max(0.01, min(limit, deadline - asyncio.get_running_loop().time())))
+        try:
+            if current.get("output_media_id"):
+                _restore_page_job_route(client, current)
+                if attempt and str(current.get("input_media_id") or "").startswith("page-upload:"):
+                    await bounded(client.recover_page_video_download(current["output_media_id"]), 40)
+                status_result = await bounded(omni.check_status(current["project_id"], current["output_media_id"]), 30)
+                status_data = unwrap_response(status_result)
+                fields = extract_status_fields(status_data)
+                updates = {"raw_response_shape": json.dumps(sanitized_response_shape(status_data))}
+                if fields.get("output_media_id") and fields["output_media_id"] != current.get("output_media_id"):
+                    updates["output_media_id"] = fields["output_media_id"]
+                if fields.get("operation_name"):
+                    updates["operation_name"] = fields["operation_name"]
+                await crud.update_omni_test_job(current["job_id"], **updates)
+            await bounded(_download_completed(await crud.get_omni_test_job(job["job_id"])), DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            await crud.update_omni_test_job(job["job_id"], error_code="get_media_error", error_message="PAGE_VIDEO_DOWNLOAD_ATTEMPT_TIMEOUT")
         latest = await crud.get_omni_test_job(job["job_id"])
         if latest.get("video_path") and _valid_existing_mp4(Path(latest["video_path"])):
             return
-        if asyncio.get_running_loop().time() - started >= 600:
+        if asyncio.get_running_loop().time() >= deadline:
             break
     latest = await crud.get_omni_test_job(job["job_id"])
     if latest.get("error_code") == "get_media_error":
@@ -808,7 +878,15 @@ def _public_job(job: dict) -> dict:
         "source_worker_job_id", "resume_attempt_id", "request_batch_id",
         "extension_request_id", "remote_http_status", "remote_submission_state",
     ]
-    return {key: job.get(key) for key in keys}
+    response = {key: job.get(key) for key in keys}
+    lock = _download_locks.get(job.get("job_id"))
+    pending = _download_tasks.get(job.get("job_id"))
+    if ((lock is not None and lock.locked()) or (pending is not None and not pending.done())) and not (
+        job.get("status") == "completed" and job.get("video_path") and _valid_existing_mp4(Path(job["video_path"]))
+    ):
+        response["status"] = "downloading"
+        response["download_in_progress"] = True
+    return response
 
 
 def _request_image_paths(body: OmniVideoRequest) -> list[Path]:

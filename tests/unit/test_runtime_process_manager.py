@@ -386,6 +386,17 @@ def test_process_probe_not_found_when_get_process_is_empty(monkeypatch):
     assert probe.status == "not_found"
 
 
+def test_command_line_probe_allows_slow_windows_cim_startup(monkeypatch):
+    def slow_cim(command, **kwargs):
+        if kwargs.get("timeout", 0) < 5:
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+        return subprocess.CompletedProcess(command, 0, stdout="chrome.exe --user-data-dir=profile", stderr="")
+
+    monkeypatch.setattr("runtime.process_manager.subprocess.run", slow_cim)
+    probe = ProcessInspector().command_line_probe(33036)
+    assert probe.status == "available"
+
+
 def test_command_line_probe_reports_cim_empty_without_faking_mismatch(monkeypatch):
     monkeypatch.setattr(
         "runtime.process_manager.subprocess.run",
@@ -546,6 +557,9 @@ def test_open_login_uses_registered_profile_cdp_and_extension_flags(tmp_path, mo
     assert f"--user-data-dir={Path(account.profile_path)}" in command
     assert "--remote-debugging-port=9300" in command
     assert "--disable-skia-graphite" in command
+    assert "--disable-http2" in command
+    assert "--disable-backgrounding-occluded-windows" in command
+    assert "--disable-background-timer-throttling" in command
     assert "--disable-gpu" in command
     assert "--no-sandbox" in command
     assert len([part for part in command if str(part).startswith("--load-extension=")]) == 1

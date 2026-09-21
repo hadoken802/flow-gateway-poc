@@ -242,6 +242,8 @@ async def health():
         "ws_port": WS_PORT,
         "ws_max_size_bytes": EXTENSION_WS_MAX_SIZE_BYTES,
         "extension_connected": client.connected,
+        "extension_version": client.extension_version,
+        "workflow_revision": client.workflow_revision,
         "runtime_instance_id": FLOW_RUNTIME_INSTANCE_ID or None,
         "runtime_ownership_version": FLOW_RUNTIME_OWNERSHIP_VERSION or None,
         "runtime_ownership_capable": bool(FLOW_RUNTIME_INSTANCE_ID and FLOW_RUNTIME_OWNERSHIP_SECRET and FLOW_RUNTIME_OWNERSHIP_VERSION == OWNERSHIP_VERSION),

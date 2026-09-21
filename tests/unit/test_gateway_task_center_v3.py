@@ -178,6 +178,15 @@ def test_account_actions_show_progress_and_auto_refresh_does_not_overlap():
     assert TASK_CENTER_HTML.index("worker_online&&!node?.extension_connected") < TASK_CENTER_HTML.index("if(status==='offline')")
 
 
+def test_new_disabled_account_is_shown_as_waiting_for_login_enablement():
+    from gateway.main import TASK_CENTER_HTML
+
+    assert "node?.enabled===false" in TASK_CENTER_HTML
+    assert "登录后启用" in TASK_CENTER_HTML
+    assert "state.key==='disabled'" in TASK_CENTER_HTML
+    assert "checkLoginEnable('${esc(id)}')" in TASK_CENTER_HTML
+
+
 def test_advanced_account_controls_distinguish_unpause_from_health_reset():
     from gateway.main import TASK_CENTER_HTML
 

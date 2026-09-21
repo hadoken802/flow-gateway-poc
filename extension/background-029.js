@@ -34,7 +34,6 @@ let callbackSecret = null;  // Auth secret for HTTP callback, received from serv
 let state = 'off'; // off | idle | running
 let manualDisconnect = false;
 const pageVideoJobs = new Map();
-const pageWorkflow = new PageWorkflow(chrome.storage.local);
 
 async function persistPageVideoJobs() {
   await chrome.storage.local.set({ pageVideoJobs: [...pageVideoJobs.entries()] });
@@ -58,11 +57,8 @@ async function getPageVideoJob(mediaId) {
   if (!tab || !(tab.url || '').includes(`/project/${job.projectId}`)) {
     const tabs = await chrome.tabs.query({ url: FLOW_TAB_PATTERNS });
     const projectTab = tabs.find((item) => (item.url || '').includes(`/project/${job.projectId}`));
-    const boundTab = projectTab || await chrome.tabs.create({ url: `https://flow.google.com/project/${job.projectId}`, active: false });
-    if (boundTab) {
-      job.tabId = boundTab.id;
-      await waitForTabComplete(job.tabId, 30000, job.projectId);
-      await waitForPageVideoBridge(job.tabId, 30000);
+    if (projectTab) {
+      job.tabId = projectTab.id;
       await persistPageVideoJobs();
     }
   }
@@ -444,8 +440,6 @@ function connectToAgent() {
     // Send current state + resend token if we have one
     ws.send(JSON.stringify({
       type: 'extension_ready',
-      extensionVersion: chrome.runtime.getManifest().version,
-      workflowRevision: 1,
       flowKeyPresent: !!flowKey,
       tokenAge: flowKey && metrics.tokenCapturedAt ? Date.now() - metrics.tokenCapturedAt : null,
     }));
@@ -489,34 +483,14 @@ function connectToAgent() {
         await handlePageVideoStatus(msg);
       } else if (msg.method === 'page_video_media') {
         await handlePageVideoMedia(msg);
-      } else if (msg.method === 'page_video_recover_download') {
-        try {
-          const job = await getPageVideoJob(String(msg.params?.mediaId || ''));
-          await chrome.tabs.reload(job.tabId);
-          await waitForTabComplete(job.tabId, 20000, job.projectId);
-          await waitForPageVideoBridge(job.tabId, 15000);
-          await sendToAgent({ id: msg.id, status: 200, data: { recovered: true, submitCalled: false } });
-        } catch (error) {
-          await sendToAgent({ id: msg.id, status: 502, error: error.message });
-        }
       } else if (msg.method === 'trpc_request') {
         await handleTrpcRequest(msg);
       } else if (msg.method === 'solve_captcha') {
         await handleSolveCaptcha(msg);
       } else if (msg.method === 'get_status') {
-        const workflowState = await chrome.storage.local.get(['lastWorkflow', 'lastDownload', 'lastSubmitClick']);
-        const workflowTabs = await chrome.tabs.query({url: FLOW_TAB_PATTERNS});
-        const workflowTab = workflowTabs.find(tab => workflowState.lastWorkflow?.projectId && (tab.url || '').includes(`/project/${workflowState.lastWorkflow.projectId}`));
-        const pageState = workflowTab ? await chrome.tabs.sendMessage(workflowTab.id, {type: 'GET_PAGE_VIDEO_DOWNLOAD_STATE'}).catch(() => null) : null;
         sendToAgent({
           id: msg.id,
           result: {
-            extensionVersion: chrome.runtime.getManifest().version,
-            workflowRevision: 1,
-            workflow: workflowState.lastWorkflow || null,
-            page: pageState,
-            submitClick: workflowState.lastSubmitClick || null,
-            download: workflowState.lastDownload || null,
             state,
             flowKeyPresent: !!flowKey,
             manualDisconnect,
@@ -600,13 +574,7 @@ async function handlePageCreateProject(msg) {
     await chrome.storage.local.set({ projectCreateTrace: { stage: 'received', at: Date.now(), requestId: msg.id } });
     const tabs = await chrome.tabs.query({ url: FLOW_TAB_PATTERNS });
     if (!tabs.length) throw new Error('NO_FLOW_TAB');
-    const existingProjectIds = new Set(tabs.map((item) => (item.url || '').match(/\/project\/([0-9a-f-]{36})/i)?.[1]).filter(Boolean));
     const tab = tabs[0];
-    await chrome.tabs.update(tab.id, { active: true });
-    if (tab.windowId != null) {
-      const window = await chrome.windows.get(tab.windowId);
-      if (window.state === "minimized") await chrome.windows.update(tab.windowId, { state: "normal" });
-    }
     await chrome.storage.local.set({ projectCreateTrace: { stage: 'tab_selected', at: Date.now(), tabId: tab.id, url: tab.url } });
     if (!/^https:\/\/flow\.google\.com\/?(?:[?#].*)?$/.test(tab.url || '')) {
       await chrome.tabs.update(tab.id, { url: 'https://flow.google.com/' });
@@ -635,15 +603,12 @@ async function handlePageCreateProject(msg) {
       await new Promise((resolve) => setTimeout(resolve, 250));
       let projectTab = await chrome.tabs.get(tab.id).catch(() => null);
       let match = (projectTab?.url || '').match(/\/project\/([0-9a-f-]{36})/i);
-      if (!match || existingProjectIds.has(match[1])) {
+      if (!match) {
         const currentTabs = await chrome.tabs.query({ url: FLOW_TAB_PATTERNS });
-        projectTab = currentTabs.find((item) => {
-          const id = (item.url || '').match(/\/project\/([0-9a-f-]{36})/i)?.[1];
-          return id && !existingProjectIds.has(id) && (item.id === tab.id || item.openerTabId === tab.id);
-        });
+        projectTab = currentTabs.find((item) => /\/project\/([0-9a-f-]{36})/i.test(item.url || ''));
         match = (projectTab?.url || '').match(/\/project\/([0-9a-f-]{36})/i);
       }
-      if (projectTab && match && !existingProjectIds.has(match[1])) {
+      if (projectTab && match) {
         await chrome.tabs.update(projectTab.id, { active: true });
         const response = { id: msg.id, status: 200, data: { projectId: match[1] } };
         await chrome.storage.local.set({ projectCreateTrace: { stage: 'project_found', at: Date.now(), tabId: projectTab.id, projectId: match[1] } });
@@ -736,48 +701,35 @@ async function handlePageSubmitVideo(msg) {
       ['requestBody'],
     );
 
-    const prior = await pageWorkflow.read(projectId);
-    const resumeOnly = ['submit_intent', 'submitted', 'completed', 'needs_review'].includes(prior.phase);
-    let evidence;
-    if (resumeOnly) {
-      const recovered = await reconcilePageProject(projectId);
-      evidence = { jobId: recovered.mediaId, outputId: recovered.mediaId };
-    } else {
-      const before = await waitForStablePageVideoIds(tab.id, 15000);
-      existingIds = new Set(before?.mediaIds || []);
-      const stages = ['settings', ...(msg.params.images || []).flatMap((_, index) => [`upload:${index}`, `attach:${index}`]), 'prompt'];
-      const prepared = await pageWorkflow.prepare(projectId, stages, async (stage, deadline) => {
-        const [name, imageIndex] = stage.split(':');
-        const result = await chrome.tabs.sendMessage(tab.id, { type: 'SUBMIT_VIDEO_UI', payload: {
-          ...msg.params, stage: name, imageIndex: imageIndex === undefined ? undefined : Number(imageIndex), deadline,
-        } });
-        if (result?.error) throw new Error(result.error);
-        if (!result?.prepared) throw new Error(`PAGE_STAGE_NOT_CONFIRMED:${stage}`);
-        return result;
-      }, async () => {
-        await chrome.tabs.reload(tab.id);
-        await waitForTabComplete(tab.id, 30000, projectId);
-        await waitForPageVideoBridge(tab.id, 30000);
-      });
-      if (!prepared?.resumeOnly) {
-        if (!Number.isFinite(prepared?.generateX) || !Number.isFinite(prepared?.generateY)) throw new Error('PAGE_VIDEO_GENERATE_COORDS_MISSING');
-        if (await pageWorkflow.claimSubmission(projectId)) {
-          // The durable claim is written before the first input event. A lost
-          // acknowledgement can only lead to reconciliation, never a new click.
-          try { await trustedClick(tab.id, prepared.generateX, prepared.generateY, 'generate'); }
-          catch (error) {
-            await pageWorkflow.transition(projectId, 'needs_review', { error: error.message });
-            throw error;
-          }
+    const before = await waitForStablePageVideoIds(tab.id, 15000);
+    existingIds = new Set(before?.mediaIds || []);
+    await chrome.storage.local.set({ pageVideoSubmitTrace: { stage: 'ui_started', at: Date.now(), requestId: msg.id, tabId: tab.id } });
+    let uiResult = null;
+    let uiError = null;
+    try {
+      uiResult = await chrome.tabs.sendMessage(tab.id, { type: 'SUBMIT_VIDEO_UI', payload: msg.params });
+      if (uiResult?.error) uiError = new Error(uiResult.error);
+      if (!uiError) {
+        if (!Number.isFinite(uiResult?.generateX) || !Number.isFinite(uiResult?.generateY)) {
+          uiError = new Error('PAGE_VIDEO_GENERATE_COORDS_MISSING');
+        } else {
+          // A lost debugger response does not prove the click was rejected.
+          uiResult.clicked = true;
+          await trustedClick(tab.id, uiResult.generateX, uiResult.generateY);
         }
       }
-      try { evidence = await waitForPageVideoSubmission(tab.id, existingIds, jobPromise, 120000); }
-      catch (error) {
-        await pageWorkflow.transition(projectId, 'needs_review', { error: error.message });
-        throw error;
-      }
+    } catch (error) {
+      // Flow may replace the page/content-script context immediately after a
+      // successful Generate click.  Chrome then reports a closed message
+      // channel even though the remote submission was accepted.  Keep
+      // watching for the real request/new tile before deciding it failed.
+      uiError = error;
     }
-    await pageWorkflow.transition(projectId, 'submitted', { jobId: evidence.jobId || null, outputId: evidence.outputId || null, error: null });
+    await chrome.storage.local.set({ pageVideoSubmitTrace: { stage: 'generate_clicked', at: Date.now(), requestId: msg.id, tabId: tab.id } });
+    // Preparation does not submit anything. Never generate after a failed
+    // preparation, and never retry a click whose remote outcome is unknown.
+    if (uiError && !uiResult?.clicked) throw uiError;
+    const evidence = await waitForPageVideoSubmission(tab.id, existingIds, jobPromise, 120000);
     const capturedJobId = evidence.jobId;
     const jobId = capturedJobId || crypto.randomUUID();
     if (!pageVideoJobs.has(jobId)) {
@@ -812,7 +764,9 @@ async function handlePageSubmitVideo(msg) {
   }
 }
 
-async function reconcilePageProject(projectId) {
+async function handlePageReconcileVideo(msg) {
+  try {
+    const projectId = String(msg.params?.projectId || '');
     if (!/^[0-9a-f-]{36}$/i.test(projectId)) throw new Error('INVALID_PROJECT_ID');
     const tabs = await chrome.tabs.query({ url: FLOW_TAB_PATTERNS });
     // Use a separate project tab if necessary; never navigate another task away.
@@ -828,18 +782,13 @@ async function reconcilePageProject(projectId) {
     await hydratePageVideoJobs();
     pageVideoJobs.set(mediaId, { tabId: tab.id, projectId, baselineIds: [], outputId: mediaId, tileIndex: 0, url: null, body: null });
     await persistPageVideoJobs();
-    return { projectId, mediaId };
-}
-
-async function handlePageReconcileVideo(msg) {
-  try {
-    const data = await reconcilePageProject(String(msg.params?.projectId || ''));
-    await pageWorkflow.transition(data.projectId, 'submitted', { outputId: data.mediaId, error: null });
-    const response = { id: msg.id, status: 200, data };
-    fallbackToWebSocket(response); await sendToAgent(response);
+    const response = { id: msg.id, status: 200, data: { projectId, mediaId } };
+    fallbackToWebSocket(response);
+    await sendToAgent(response);
   } catch (error) {
     const response = { id: msg.id, status: 409, error: error.message || 'PAGE_RECOVERY_FAILED' };
-    fallbackToWebSocket(response); await sendToAgent(response);
+    fallbackToWebSocket(response);
+    await sendToAgent(response);
   }
 }
 
@@ -898,92 +847,23 @@ async function handlePageVideoStatus(msg) {
 
 async function handlePageVideoMedia(msg) {
   let createdListener = null;
-  let downloadTabId = null;
-  const downloadEvents = [];
-  const downloadTrace = [];
   try {
     const mediaId = String(msg.params?.mediaId || '');
     await hydratePageVideoJobs();
     const entry = [...pageVideoJobs.entries()].find(([jobId, job]) => jobId === mediaId || job.outputId === mediaId);
     if (!entry) throw new Error('PAGE_VIDEO_JOB_NOT_FOUND');
-    const [jobId] = entry;
-    const job = await getPageVideoJob(jobId);
-    downloadTabId = job.tabId;
-    const finishDownload = async (item, reused = false) => {
-      const deadline = Date.now() + 180000;
-      let current = item;
-      while (Date.now() < deadline) {
-        const matches = await chrome.downloads.search({ id: item.id });
-        current = matches[0] || current;
-        if (current.state === 'complete' && current.exists !== false) break;
-        if (current.state === 'interrupted') throw new Error(`PAGE_VIDEO_DOWNLOAD_INTERRUPTED:${current.error || 'unknown'}`);
-        await new Promise(resolve => setTimeout(resolve, 500));
-      }
-      if (current.state !== 'complete' || !current.filename || current.exists === false) throw new Error('PAGE_VIDEO_DOWNLOAD_TIMEOUT');
-      await chrome.storage.local.set({ lastDownload: { mediaId, downloadId: item.id, phase: 'completed',
-        method: job.downloadMethod || 'browser', reused, updatedAt: Date.now(), error: null } });
-      const response = { id: msg.id, status: 200, data: { localFilePath: current.filename, mediaId } };
-      fallbackToWebSocket(response);
-      await sendToAgent(response);
-    };
-    if (Number.isInteger(job.downloadId)) {
-      const [existing] = await chrome.downloads.search({ id: job.downloadId });
-      if (existing && existing.exists !== false && ['complete', 'in_progress'].includes(existing.state)) {
-        await finishDownload(existing, true);
-        return;
-      }
-    }
+    const [jobId, job] = entry;
     let resolveCreated;
-    let observedDownload = null;
-    let downloadArmed = false;
     const created = new Promise((resolve) => { resolveCreated = resolve; });
-    createdListener = (item) => {
-      if (!downloadArmed || observedDownload) return;
-      const identity = `${item.url || ''} ${item.finalUrl || ''} ${item.referrer || ''} ${item.filename || ''}`;
-      const isVideo = /^video\//i.test(item.mime || '') || /\.mp4(?:\b|\?)/i.test(identity);
-      const belongs = identity.includes(job.outputId || jobId) || identity.includes(job.projectId)
-        || /^blob:https:\/\/(?:flow\.google\.com|labs\.google)\//i.test(item.url || '');
-      downloadEvents.push({ id: item.id, mime: item.mime || null, state: item.state,
-        isVideo, belongs, urlKind: (item.url || '').split(':')[0],
-        referrerPresent: !!item.referrer, filenamePresent: !!item.filename });
-      if (!isVideo || !belongs) return;
-      observedDownload = item;
-      job.downloadId = item.id;
-      job.downloadMethod = 'menu';
-      persistPageVideoJobs().then(() => resolveCreated(item)).catch(() => resolveCreated(item));
-    };
+    createdListener = (item) => resolveCreated(item);
     chrome.downloads.onCreated.addListener(createdListener);
-    const activeTab = await chrome.tabs.update(job.tabId, { active: true });
-    if (chrome.windows?.get && activeTab?.windowId != null) {
-      const windowState = await chrome.windows.get(activeTab.windowId);
-      if (windowState.state === 'minimized') await chrome.windows.update(activeTab.windowId, { state: 'normal' });
-    }
     const targetMediaId = job.outputId || jobId;
     const hover = await chrome.tabs.sendMessage(job.tabId, { type: 'GET_PAGE_VIDEO_DOWNLOAD_COORDS', mediaId: targetMediaId, tileIndex: job.tileIndex, target: 'hover' });
     if (hover?.error) throw new Error(hover.error);
     await trustedMove(job.tabId, hover.x, hover.y);
     await new Promise((resolve) => setTimeout(resolve, 400));
-    const source = await chrome.tabs.sendMessage(job.tabId, { type: 'GET_PAGE_VIDEO_SOURCE', mediaId: targetMediaId });
-    downloadTrace.push({ stage: 'source', sourcePresent: source?.sourcePresent, videoPresent: source?.videoPresent,
-      width: source?.width, height: source?.height, readyState: source?.readyState, networkState: source?.networkState, mediaError: source?.mediaError });
-    if (source?.source) {
-      try {
-        const id = await chrome.downloads.download({ url: source.source, filename: `flow-${mediaId}.mp4`, saveAs: false });
-        job.downloadId = id;
-        job.downloadMethod = 'video_source';
-        await persistPageVideoJobs();
-        await finishDownload({ id });
-        return;
-      } catch (error) {
-        // A source that Chrome cannot download falls back to the official menu.
-        downloadTrace.push({ stage: 'source_download', error: error.message });
-        if (Number.isInteger(job.downloadId)) throw error;
-      }
-    }
     let download = null;
     for (let attempt = 0; attempt < 2 && !download; attempt += 1) {
-      const openMenu = await chrome.tabs.sendMessage(job.tabId, { type: 'GET_PAGE_VIDEO_DOWNLOAD_COORDS', mediaId: targetMediaId, tileIndex: job.tileIndex, target: 'download' });
-      if (!openMenu?.error) { download = openMenu; break; }
       const more = await chrome.tabs.sendMessage(job.tabId, { type: 'GET_PAGE_VIDEO_DOWNLOAD_COORDS', mediaId: targetMediaId, tileIndex: job.tileIndex, target: 'more' });
       if (more?.error) throw new Error(more.error);
       await trustedClick(job.tabId, more.x, more.y);
@@ -991,35 +871,34 @@ async function handlePageVideoMedia(msg) {
       if (!candidate?.error) download = candidate;
     }
     if (!download) throw new Error('PAGE_VIDEO_DOWNLOAD_MENU_NOT_FOUND');
-    downloadTrace.push({ stage: 'download', control: download });
-    downloadArmed = true;
     await trustedMove(job.tabId, download.x, download.y);
     await new Promise((resolve) => setTimeout(resolve, 700));
     let resolution = await chrome.tabs.sendMessage(job.tabId, { type: 'GET_PAGE_VIDEO_DOWNLOAD_COORDS', mediaId: targetMediaId, tileIndex: job.tileIndex, target: 'resolution' });
-    if (resolution?.error && !observedDownload) {
-      const focused = await chrome.tabs.sendMessage(job.tabId, { type: 'GET_PAGE_VIDEO_DOWNLOAD_COORDS', mediaId: targetMediaId, tileIndex: job.tileIndex, target: 'download', focus: true });
-      if (focused?.error) throw new Error(focused.error);
-      await trustedPressEnter(job.tabId);
+    if (resolution?.error) {
+      await trustedClick(job.tabId, download.x, download.y);
       await new Promise((resolve) => setTimeout(resolve, 700));
       resolution = await chrome.tabs.sendMessage(job.tabId, { type: 'GET_PAGE_VIDEO_DOWNLOAD_COORDS', mediaId: targetMediaId, tileIndex: job.tileIndex, target: 'resolution' });
     }
-    downloadTrace.push({ stage: 'resolution', control: resolution });
-    if (!observedDownload && !resolution?.error) {
-      const focused = await chrome.tabs.sendMessage(job.tabId, { type: 'GET_PAGE_VIDEO_DOWNLOAD_COORDS', mediaId: targetMediaId, tileIndex: job.tileIndex, target: 'resolution', focus: true });
-      if (focused?.error) throw new Error(focused.error);
-      await trustedPressEnter(job.tabId);
-    }
-    if (!observedDownload && resolution?.error) throw new Error(resolution.error);
+    if (resolution?.error) throw new Error(resolution.error);
+    await trustedClick(job.tabId, resolution.x, resolution.y);
     const item = await Promise.race([
       created,
       new Promise((_, reject) => setTimeout(() => reject(new Error('PAGE_VIDEO_DOWNLOAD_START_TIMEOUT')), 30000)),
     ]);
-    await finishDownload(item);
+    const deadline = Date.now() + 180000;
+    let current = item;
+    while (Date.now() < deadline) {
+      const matches = await chrome.downloads.search({ id: item.id });
+      current = matches[0] || current;
+      if (current.state === 'complete') break;
+      if (current.state === 'interrupted') throw new Error(`PAGE_VIDEO_DOWNLOAD_INTERRUPTED:${current.error || 'unknown'}`);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    if (current.state !== 'complete' || !current.filename) throw new Error('PAGE_VIDEO_DOWNLOAD_TIMEOUT');
+    const response = { id: msg.id, status: 200, data: { localFilePath: current.filename, mediaId } };
+    fallbackToWebSocket(response);
+    await sendToAgent(response);
   } catch (e) {
-    const page = downloadTabId == null ? null : await chrome.tabs.sendMessage(downloadTabId,
-      { type: 'GET_PAGE_VIDEO_DOWNLOAD_STATE' }).catch(() => null);
-    await chrome.storage.local.set({ lastDownload: { mediaId: String(msg.params?.mediaId || ''),
-      error: e.message, page, downloadEvents, downloadTrace, updatedAt: Date.now() } });
     const response = { id: msg.id, status: 502, error: e.message || 'PAGE_VIDEO_MEDIA_FAILED' };
     fallbackToWebSocket(response);
     await sendToAgent(response);
@@ -1180,16 +1059,8 @@ async function withTabDebugger(tabId, action) {
   finally { if (debuggerQueues.get(tabId) === operation) debuggerQueues.delete(tabId); }
 }
 
-async function trustedClick(tabId, x, y, semanticTarget = null) {
+async function trustedClick(tabId, x, y) {
   return withTabDebugger(tabId, async (target) => {
-    if (semanticTarget === 'generate') {
-      const point = await chrome.tabs.sendMessage(tabId, {type: 'GET_PAGE_VIDEO_GENERATE_TARGET'});
-      if (point?.error || !Number.isFinite(point?.x) || !Number.isFinite(point?.y)) {
-        throw new Error(point?.error || 'GENERATE_TARGET_NOT_CONFIRMED');
-      }
-      x = point.x; y = point.y;
-      await chrome.storage.local.set({lastSubmitClick: {at: Date.now(), x, y, target: 'generate'}});
-    }
     await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
     await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 });
     await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
@@ -1198,13 +1069,6 @@ async function trustedClick(tabId, x, y, semanticTarget = null) {
 
 async function trustedMove(tabId, x, y) {
   return withTabDebugger(tabId, (target) => chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y }));
-}
-
-async function trustedPressEnter(tabId) {
-  return withTabDebugger(tabId, async target => {
-    await chrome.debugger.sendCommand(target, 'Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
-    await chrome.debugger.sendCommand(target, 'Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
-  });
 }
 
 function waitForTabComplete(tabId, timeoutMs, projectId = null) {

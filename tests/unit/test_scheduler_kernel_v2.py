@@ -3,6 +3,28 @@ import sqlite3
 
 import pytest
 
+
+@pytest.mark.parametrize("message", ["REMOTE_SUBMISSION_NOT_CONFIRMED", "Timeout (360s) waiting for page_submit_video"])
+def test_uncertain_page_submit_never_retries_generation(message):
+    category = scheduler_kernel.classify_error("502", message)
+    assert category == "submission_result_unknown"
+    assert not scheduler_kernel.RETRY_POLICIES[category].retryable
+
+
+@pytest.mark.asyncio
+async def test_three_consecutive_failures_pause_account(monkeypatch):
+    from unittest.mock import AsyncMock
+    from gateway.scheduler import GatewayScheduler
+    from gateway import crud
+    scheduler = object.__new__(GatewayScheduler)
+    scheduler.db = object()
+    monkeypatch.setattr(crud, "get_account", AsyncMock(return_value={"consecutive_failures": 3, "health_score": 80}))
+    update = AsyncMock()
+    monkeypatch.setattr(crud, "update_account_controls", update)
+    await scheduler._apply_failure_policy_to_account("FLOW-001", "page_preparation_failed", scheduler_kernel.RETRY_POLICIES["page_preparation_failed"])
+    assert update.call_args.kwargs["manual_paused"] == 1
+    assert update.call_args.kwargs["manual_pause_reason"] == "repeated_failure:page_preparation_failed"
+
 from gateway import crud, scheduler_kernel
 from gateway.config import GatewaySettings
 from gateway.db import connect
@@ -132,6 +154,36 @@ async def test_quota_reservation_prevents_oversell_and_releases_once(tmp_path):
         assert account["reserved_credits"] == 0
         releases = await (await db.execute("SELECT COUNT(*) FROM quota_ledger WHERE entry_type='release'")).fetchone()
         assert releases[0] == 1
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_task_releases_quota_without_penalizing_account_health(tmp_path):
+    db = await connect(tmp_path / "gateway.db")
+    try:
+        await add_account(db, "FLOW-001", 100, health_score=80)
+        task = await crud.create_task(db, payload("cancel-neutral"))
+        leased = await crud.assign_task(db, task["task_id"], "FLOW-001", "rt-1", 15)
+        account = await crud.get_account(db, "FLOW-001")
+
+        released = await crud.guarded_release_account(
+            db,
+            task["task_id"],
+            "FLOW-001",
+            leased["lease_owner"],
+            leased["lease_version"],
+            account["lock_version"],
+            "cancelled",
+            error_code="operator_cancelled",
+        )
+
+        account = await crud.get_account(db, "FLOW-001")
+        assert released["status"] == "cancelled"
+        assert account["reserved_credits"] == 0
+        assert account["health_score"] == 80
+        assert account["failure_count"] == 0
+        assert account["consecutive_failures"] == 0
     finally:
         await db.close()
 
@@ -421,6 +473,69 @@ async def test_sweeper_recovers_expired_leased_task_once_across_connections(tmp_
     finally:
         await db1.close()
         await db2.close()
+
+
+@pytest.mark.asyncio
+async def test_sweeper_releases_orphan_account_lock_and_quota_reservation(tmp_path):
+    db = await connect(tmp_path / "gateway.db")
+    try:
+        await add_account(db, "FLOW-005", 100)
+        task = await crud.create_task(db, payload("orphan-lock"))
+        leased = await crud.assign_task(db, task["task_id"], "FLOW-005", "rt-1", 15, lease_seconds=1)
+        await db.execute("UPDATE account_leases SET status='expired' WHERE lease_id=?", (leased["lease_owner"],))
+        await db.execute(
+            "UPDATE flow_accounts SET current_task_id=NULL WHERE account_id='FLOW-005'"
+        )
+        await db.commit()
+
+        results = await scheduler_kernel.sweep_expired_leases(
+            db,
+            recovery_owner="recovery",
+            now="2026-01-01T00:00:00Z",
+        )
+
+        account = await crud.get_account(db, "FLOW-005")
+        reserve = await (
+            await db.execute(
+                "SELECT status FROM quota_ledger WHERE lease_id=? AND entry_type='reserve'",
+                (leased["lease_owner"],),
+            )
+        ).fetchone()
+        assert any(item.get("result") == "orphan_account_lock_released" for item in results)
+        assert account["lock_owner"] is None
+        assert account["lock_expires_at"] is None
+        assert account["reserved_credits"] == 0
+        assert reserve[0] == "released"
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_sweeper_releases_orphan_lock_even_when_lease_still_active(tmp_path):
+    db = await connect(tmp_path / "gateway.db")
+    try:
+        await add_account(db, "FLOW-004", 100)
+        task = await crud.create_task(db, payload("orphan-active-lease"))
+        leased = await crud.assign_task(db, task["task_id"], "FLOW-004", "rt-1", 15, lease_seconds=900)
+        await db.execute("UPDATE flow_accounts SET current_task_id=NULL WHERE account_id='FLOW-004'")
+        await db.commit()
+
+        results = await scheduler_kernel.sweep_expired_leases(
+            db,
+            recovery_owner="recovery",
+            now="2026-01-01T00:00:00Z",
+        )
+
+        account = await crud.get_account(db, "FLOW-004")
+        lease = await (
+            await db.execute("SELECT status FROM account_leases WHERE lease_id=?", (leased["lease_owner"],))
+        ).fetchone()
+        assert any(item.get("result") == "orphan_account_lock_released" for item in results)
+        assert lease[0] == "expired"
+        assert account["lock_owner"] is None
+        assert account["reserved_credits"] == 0
+    finally:
+        await db.close()
 
 
 @pytest.mark.asyncio

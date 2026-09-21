@@ -66,6 +66,7 @@ ERROR_CATEGORIES = {
     "quota_insufficient",
     "project_creation_failed",
     "media_upload_failed",
+    "page_preparation_failed",
     "submission_failed_confirmed",
     "submission_result_unknown",
     "generation_failed",
@@ -119,6 +120,7 @@ RETRY_POLICIES = {
     "quota_insufficient": RetryPolicy(False, "none", 0, 0, True, 0, 0, False),
     "project_creation_failed": RetryPolicy(True, "generation", 2, 120, True, 5, 0, False),
     "media_upload_failed": RetryPolicy(True, "generation", 2, 0, True, 10, 300, False),
+    "page_preparation_failed": RetryPolicy(False, "none", 0, 0, False, 5, 300, True),
     "submission_failed_confirmed": RetryPolicy(True, "generation", 1, 300, True, 10, 0, False),
     "submission_result_unknown": RetryPolicy(False, "reconcile", 0, 0, False, 0, 0, True),
     "generation_failed": RetryPolicy(True, "generation", 1, 300, True, 10, 0, False),
@@ -146,6 +148,10 @@ def state_for_status(status: str | None) -> str:
 
 def classify_error(error_code: str | None, error_message: str | None = None) -> str:
     text = f"{error_code or ''} {error_message or ''}".lower()
+    if "workflow_stage_failed" in text:
+        return "page_preparation_failed"
+    if "remote_submission_not_confirmed" in text or ("page_submit_video" in text and "timeout" in text):
+        return "submission_result_unknown"
     if "unusual_activity" in text or "public_error_unusual_activity" in text:
         return "account_unusual_activity"
     if "recaptcha" in text:
@@ -666,7 +672,98 @@ async def sweep_expired_leases(db, *, recovery_owner: str, now: str | None = Non
     results = []
     for lease_id in lease_ids:
         results.append(await recover_expired_lease(db, lease_id=lease_id, recovery_owner=recovery_owner, now=now))
+    results.extend(await reconcile_orphan_account_locks(db))
     return results
+
+
+async def reconcile_orphan_account_locks(db):
+    """Release stale runtime locks that no longer have an active lease or task."""
+    await db.commit()
+    await db.execute("BEGIN IMMEDIATE")
+    try:
+        cursor = await db.execute(
+            """
+            SELECT account_id, lock_owner
+            FROM flow_accounts a
+            WHERE a.current_task_id IS NULL
+              AND (a.lock_owner IS NOT NULL OR COALESCE(a.reserved_credits, 0) > 0)
+            """
+        )
+        accounts = [dict(row) for row in await cursor.fetchall()]
+        results = []
+        for account in accounts:
+            account_id = account["account_id"]
+            # An account cannot legitimately have an active lease when it has no
+            # current task.  Treat that split-brain state as orphaned immediately
+            # instead of keeping the account unavailable until the lease expires.
+            await db.execute(
+                "UPDATE account_leases SET status='expired' WHERE account_id=? AND status='active'",
+                (account_id,),
+            )
+            reserve_cursor = await db.execute(
+                """
+                SELECT q.ledger_id, q.task_id, q.lease_id, q.amount
+                FROM quota_ledger q
+                LEFT JOIN account_leases l ON l.lease_id=q.lease_id
+                WHERE q.account_id=? AND q.entry_type='reserve' AND q.status='active'
+                  AND (l.lease_id IS NULL OR l.status!='active')
+                """,
+                (account_id,),
+            )
+            orphan_reserves = [dict(row) for row in await reserve_cursor.fetchall()]
+            for reserve in orphan_reserves:
+                await db.execute(
+                    """
+                    INSERT OR IGNORE INTO quota_ledger(
+                        ledger_id, account_id, task_id, lease_id, entry_type, amount, status
+                    ) VALUES(?, ?, ?, ?, 'release', ?, 'posted')
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        account_id,
+                        reserve["task_id"],
+                        reserve["lease_id"],
+                        int(reserve["amount"] or 0),
+                    ),
+                )
+                await db.execute(
+                    "UPDATE quota_ledger SET status='released' WHERE ledger_id=? AND status='active'",
+                    (reserve["ledger_id"],),
+                )
+            remaining_cursor = await db.execute(
+                """
+                SELECT COALESCE(SUM(q.amount), 0)
+                FROM quota_ledger q
+                JOIN account_leases l ON l.lease_id=q.lease_id
+                WHERE q.account_id=? AND q.entry_type='reserve' AND q.status='active'
+                  AND l.status='active'
+                """,
+                (account_id,),
+            )
+            remaining_reserved = int((await remaining_cursor.fetchone())[0] or 0)
+            await db.execute(
+                """
+                UPDATE flow_accounts
+                SET lock_owner=NULL, lock_expires_at=NULL, reserved_credits=?,
+                    updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                WHERE account_id=? AND current_task_id IS NULL
+                """,
+                (remaining_reserved, account_id),
+            )
+            results.append(
+                {
+                    "ok": True,
+                    "result": "orphan_account_lock_released",
+                    "account_id": account_id,
+                    "lock_owner": account.get("lock_owner"),
+                    "released_reservations": len(orphan_reserves),
+                }
+            )
+        await db.commit()
+        return results
+    except Exception:
+        await db.execute("ROLLBACK")
+        raise
 
 
 async def quota_consistency_report(db):

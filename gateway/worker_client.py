@@ -21,7 +21,7 @@ class WorkerRemoteMediaFetchError(RuntimeError):
 
 
 class WorkerClient:
-    def __init__(self, submit_timeout_seconds: float = 300.0):
+    def __init__(self, submit_timeout_seconds: float = 420.0):
         if submit_timeout_seconds <= 0:
             raise ValueError("submit_timeout_seconds must be positive")
         self.submit_timeout_seconds = submit_timeout_seconds
@@ -73,7 +73,29 @@ class WorkerClient:
 
     async def create_project(self, worker, payload):
         async with httpx.AsyncClient(timeout=120.0) as client:
-            return (await client.post(f"{worker.api_url}/api/projects", json=payload)).raise_for_status().json()
+            response = await client.post(f"{worker.api_url}/api/projects", json=payload)
+        try:
+            data = response.json()
+        except ValueError:
+            data = None
+        if response.status_code >= 400:
+            detail = data.get("detail") if isinstance(data, dict) else None
+            if isinstance(detail, dict):
+                detail = detail.get("error") or detail.get("message") or str(detail)
+            message = str(detail or (data.get("error") if isinstance(data, dict) else "") or f"HTTP {response.status_code}")
+            raise WorkerSubmitError(
+                response.status_code,
+                f"Worker project creation failed: {message}",
+                data if isinstance(data, dict) else None,
+            )
+        return data
+
+    async def list_projects(self, worker):
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(f"{worker.api_url}/api/projects")
+        response.raise_for_status()
+        data = response.json()
+        return data if isinstance(data, list) else []
 
     async def get_omni_video(self, worker, worker_job_id):
         async with httpx.AsyncClient(timeout=10.0) as client:

@@ -228,7 +228,8 @@ class ProcessInspector:
                 capture_output=True,
                 text=True,
                 check=False,
-                timeout=3,
+                # CIM plus Windows PowerShell cold start can exceed three seconds.
+                timeout=10,
                 creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
             )
             if result.returncode != 0:
@@ -701,6 +702,9 @@ class RuntimeManager:
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-skia-graphite",
+            "--disable-http2",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-background-timer-throttling",
             DISABLE_GPU_ARG,
             NO_SANDBOX_ARG,
         ]

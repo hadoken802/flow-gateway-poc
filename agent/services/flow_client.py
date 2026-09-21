@@ -78,6 +78,8 @@ class FlowClient:
         self._page_uploads: dict[str, dict] = {}
         self._page_video_jobs: set[str] = set()
         self._page_video_outputs: set[str] = set()
+        self.extension_version: str | None = None
+        self.workflow_revision: int | None = None
 
     def _track_task(self, coro):
         if self._shutting_down:
@@ -248,6 +250,8 @@ class FlowClient:
 
         if data.get("type") == "extension_ready":
             self.mark_extension_ready()
+            self.extension_version = data.get("extensionVersion")
+            self.workflow_revision = data.get("workflowRevision")
             token_age = data.get("tokenAge")
             if data.get("flowKeyPresent") and isinstance(token_age, (int, float)) and token_age >= 0:
                 self._flow_key_captured_at_ms = int(time.time() * 1000 - token_age)
@@ -450,6 +454,8 @@ class FlowClient:
         return {"status": 200, "_mediaId": media_id, "data": {"media": {"name": media_id}}}
 
     async def submit_reference_video_ui(self, project_id: str, reference_media_ids: list[str], prompt: str) -> dict:
+        if self.workflow_revision != 1:
+            return {"error": "WORKFLOW_VERSION_MISMATCH: reload the Flow extension before submitting"}
         uploads = [self._page_uploads.get(media_id) for media_id in reference_media_ids]
         if not uploads or any(upload is None for upload in uploads):
             return {"error": "PAGE_UPLOAD_NOT_PREPARED"}
@@ -460,7 +466,20 @@ class FlowClient:
             "duration": 10,
             "aspectRatio": "9:16",
             "resolution": "720p",
-        }, timeout=180)
+        }, timeout=360)
+        if _is_ws_error(result) and any(marker in str(result.get("error", "")).lower()
+                                        for marker in ("timeout", "remote_submission_not_confirmed", "message channel closed")):
+            recovered = await self._send("page_reconcile_video", {"projectId": project_id}, timeout=30)
+            data = recovered.get("data", {})
+            try:
+                recovered_id = str(uuid.UUID(data.get("mediaId", "")))
+            except (ValueError, TypeError, AttributeError):
+                recovered_id = None
+            if not _is_ws_error(recovered) and data.get("projectId") == project_id and recovered_id:
+                result = {"status": 200, "data": {
+                    "media": [{"name": recovered_id, "mediaStatus": {"mediaGenerationStatus": "MEDIA_GENERATION_STATUS_ACTIVE"}}],
+                    "workflows": [{"name": recovered_id, "metadata": {"batchId": recovered_id}}],
+                }}
         if not _is_ws_error(result):
             data = result.get("data", {})
             media = data.get("media") if isinstance(data, dict) else None
@@ -762,6 +781,9 @@ class FlowClient:
         result = await self.get_media(media_id)
         status = result.get("status", 500)
         return isinstance(status, int) and status == 200
+
+    async def recover_page_video_download(self, media_id: str) -> dict:
+        return await self._send("page_video_recover_download", {"mediaId": media_id}, timeout=40)
 
     async def get_media(self, media_id: str) -> dict:
         """Fetch media metadata from Google Flow.

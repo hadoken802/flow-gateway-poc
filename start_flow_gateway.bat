@@ -6,9 +6,10 @@ set PYTHON=D:\Codex\projects\flow_gateway_poc\.venv\Scripts\python.exe
 set GATEWAY_API_HOST=127.0.0.1
 set GATEWAY_API_PORT=8200
 set POOL_DRY_RUN=false
-set POOL_MAX_CONCURRENCY=10
+set POOL_MAX_CONCURRENCY=2
 set FLOWKIT_GATEWAY_WORKER_SOURCE=runtime_registry
 set GATEWAY_DB_PATH=D:\Codex\projects\flow_gateway_poc\flowkit\data\gateway.db
+set FLOW_GATEWAY_OUTPUT_DIR=D:\Codex\projects\flow_gateway_poc\outputs
 set GATEWAY_LEASE_SWEEPER_INTERVAL_SECONDS=30
 set PID_FILE=runtime\gateway.pid
 set STDOUT_LOG=logs\gateway.log
@@ -43,9 +44,9 @@ if errorlevel 1 (
   exit /b 1
 )
 
-"%PYTHON%" scripts\wait_gateway_health.py http://127.0.0.1:8200/health 30 >nul 2>nul
+"%PYTHON%" scripts\wait_gateway_health.py http://127.0.0.1:8200/health 75 >nul 2>nul
 if errorlevel 1 (
-  echo Gateway did not become healthy within 30 seconds.
+  echo Gateway did not become healthy within 75 seconds.
   echo stdout: %STDOUT_LOG%
   echo stderr: %STDERR_LOG%
   exit /b 1

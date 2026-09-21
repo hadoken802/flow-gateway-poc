@@ -34,6 +34,36 @@ let callbackSecret = null;  // Auth secret for HTTP callback, received from serv
 let state = 'off'; // off | idle | running
 let manualDisconnect = false;
 const pageVideoJobs = new Map();
+
+async function persistPageVideoJobs() {
+  await chrome.storage.local.set({ pageVideoJobs: [...pageVideoJobs.entries()] });
+}
+
+async function hydratePageVideoJobs() {
+  const stored = await chrome.storage.local.get('pageVideoJobs');
+  for (const entry of stored.pageVideoJobs || []) {
+    if (Array.isArray(entry) && entry.length === 2 && !pageVideoJobs.has(entry[0])) pageVideoJobs.set(entry[0], entry[1]);
+  }
+}
+
+async function getPageVideoJob(mediaId) {
+  let job = pageVideoJobs.get(mediaId);
+  if (!job) {
+    await hydratePageVideoJobs();
+    job = pageVideoJobs.get(mediaId);
+  }
+  if (!job) return null;
+  const tab = await chrome.tabs.get(job.tabId).catch(() => null);
+  if (!tab || !(tab.url || '').includes(`/project/${job.projectId}`)) {
+    const tabs = await chrome.tabs.query({ url: FLOW_TAB_PATTERNS });
+    const projectTab = tabs.find((item) => (item.url || '').includes(`/project/${job.projectId}`));
+    if (projectTab) {
+      job.tabId = projectTab.id;
+      await persistPageVideoJobs();
+    }
+  }
+  return job;
+}
 let metrics = {
   tokenCapturedAt: null,
   requestCount: 0,   // captcha-consuming requests only (gen image/video/upscale)
@@ -254,6 +284,11 @@ async function init() {
   chrome.alarms.create('keepAlive', { periodInMinutes: 0.4 });
 }
 
+// MV3 may start this service worker after the browser's onStartup event has
+// already fired (for example after an unpacked-extension update).  Initialize
+// eagerly as well; the guard keeps the event listeners idempotent.
+void init();
+
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== 'local') return;
   if (changes.account_id) accountId = changes.account_id.newValue || '';
@@ -423,8 +458,15 @@ function connectToAgent() {
 
   ws.onmessage = async ({ data }) => {
     if (ws?._flowSocketId !== activeSocketId) return;
+    // Keep long uploads/submissions alive under Manifest V3. Without periodic
+    // extension API activity Chrome suspends the worker after about 30 seconds
+    // and closes both the content-script channel and the agent WebSocket.
+    let stopOperationKeepAlive = null;
     try {
       const msg = JSON.parse(data);
+      if (['page_create_project', 'page_submit_video', 'page_video_status', 'page_video_media'].includes(msg?.method)) {
+        stopOperationKeepAlive = startOperationKeepAlive();
+      }
       if (msg?.method) chrome.storage.local.set({ lastAgentMessage: { method: msg.method, at: Date.now(), id: msg.id } });
 
       if (msg.method === 'api_request') {
@@ -465,6 +507,8 @@ function connectToAgent() {
       }
     } catch (e) {
       console.error('[FlowAgent] Message error:', e);
+    } finally {
+      stopOperationKeepAlive?.();
     }
   };
 
@@ -488,6 +532,13 @@ function connectToAgent() {
     metrics.lastError = 'WS_ERROR';
     chrome.storage.local.set({ metrics });
   };
+}
+
+function startOperationKeepAlive() {
+  const ping = () => chrome.runtime.getPlatformInfo().catch(() => {});
+  ping();
+  const timer = setInterval(ping, 20000);
+  return () => clearInterval(timer);
 }
 
 async function handlePageCreditsRequest(msg) {
@@ -528,10 +579,19 @@ async function handlePageCreateProject(msg) {
       await waitForTabComplete(tab.id, 30000);
     }
     await chrome.storage.local.set({ projectCreateTrace: { stage: 'home_ready', at: Date.now(), tabId: tab.id } });
-    const point = await waitForNewProjectButton(tab.id, 15000);
+    let point;
+    try {
+      point = await waitForNewProjectButton(tab.id, 15000);
+    } catch (_) {
+      // A redirect from an expired/stale project can leave Flow's home shell
+      // blank while the URL already looks correct. Reload once and wait for
+      // the actual New project control before declaring the session unusable.
+      await chrome.tabs.reload(tab.id);
+      await waitForTabComplete(tab.id, 30000);
+      point = await waitForNewProjectButton(tab.id, 30000);
+    }
     await chrome.storage.local.set({ projectCreateTrace: { stage: 'button_ready', at: Date.now(), tabId: tab.id, point } });
-    const clickResult = await chrome.tabs.sendMessage(tab.id, { type: 'CLICK_NEW_PROJECT' });
-    if (!clickResult?.clicked) throw new Error(clickResult?.error || 'NEW_PROJECT_CLICK_FAILED');
+    await trustedClick(tab.id, point.x, point.y);
     await chrome.storage.local.set({ projectCreateTrace: { stage: 'clicked', at: Date.now(), tabId: tab.id } });
     const deadline = Date.now() + 90000;
     const maxClickAttempts = 3;
@@ -562,8 +622,11 @@ async function handlePageCreateProject(msg) {
       ) {
         try {
           const retryPoint = await waitForNewProjectButton(tab.id, 2000);
-          const retryResult = await chrome.tabs.sendMessage(tab.id, { type: 'CLICK_NEW_PROJECT' });
-          if (!retryResult?.clicked) throw new Error(retryResult?.error || 'NEW_PROJECT_CLICK_FAILED');
+          if (clickAttempts === 1) {
+            await clickNewProjectButtonInPage(tab.id);
+          } else {
+            await trustedClick(tab.id, retryPoint.x, retryPoint.y);
+          }
           clickAttempts += 1;
           await chrome.storage.local.set({ projectCreateTrace: { stage: 'click_retried', at: Date.now(), tabId: tab.id, clickAttempts } });
         } catch (_) {}
@@ -572,6 +635,17 @@ async function handlePageCreateProject(msg) {
     }
     throw new Error('PROJECT_NAVIGATION_TIMEOUT');
   } catch (e) {
+    if (['PROJECT_NAVIGATION_TIMEOUT', 'NEW_PROJECT_BUTTON_NOT_FOUND', 'FLOW_HOME_TIMEOUT'].includes(e.message)) {
+      const recoveryTabs = await chrome.tabs.query({ url: FLOW_TAB_PATTERNS }).catch(() => []);
+      const recoveryTab = recoveryTabs[0];
+      if (recoveryTab) {
+        if (/^https:\/\/flow\.google\.com\/?(?:[?#].*)?$/.test(recoveryTab.url || '')) {
+          await chrome.tabs.reload(recoveryTab.id).catch(() => {});
+        } else {
+          await chrome.tabs.update(recoveryTab.id, { url: 'https://flow.google.com/' }).catch(() => {});
+        }
+      }
+    }
     const response = { id: msg.id, status: 502, error: e.message || 'PAGE_CREATE_PROJECT_FAILED' };
     await chrome.storage.local.set({ projectCreateTrace: { stage: 'failed', at: Date.now(), error: response.error } });
     fallbackToWebSocket(response);
@@ -591,8 +665,10 @@ async function handlePageSubmitVideo(msg) {
       await chrome.tabs.update(tab.id, { url: `https://flow.google.com/project/${projectId}` });
       await waitForTabComplete(tab.id, 30000, projectId);
     }
+    await waitForPageVideoBridge(tab.id, 60000);
 
     let submitSeen = false;
+    let existingIds = new Set();
     let resolveJob;
     const jobPromise = new Promise((resolve) => { resolveJob = resolve; });
     listener = (details) => {
@@ -606,7 +682,15 @@ async function handlePageSubmitVideo(msg) {
       const decoded = decodeURIComponent(body);
       const match = decoded.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
       if (!match || pageVideoJobs.has(match[0])) return;
-      pageVideoJobs.set(match[0], { tabId: tab.id, projectId, url: details.url, body });
+      pageVideoJobs.set(match[0], {
+        tabId: tab.id,
+        projectId,
+        url: details.url,
+        body,
+        baselineIds: [...existingIds],
+        outputId: null,
+      });
+      persistPageVideoJobs().catch(() => {});
       resolveJob(match[0]);
     };
     chrome.webRequest.onBeforeRequest.addListener(
@@ -615,19 +699,62 @@ async function handlePageSubmitVideo(msg) {
       ['requestBody'],
     );
 
-    const before = await chrome.tabs.sendMessage(tab.id, { type: 'GET_PAGE_VIDEO_JOB_IDS' }).catch(() => ({ mediaIds: [] }));
-    const existingIds = new Set(before?.mediaIds || []);
+    const before = await waitForStablePageVideoIds(tab.id, 15000);
+    existingIds = new Set(before?.mediaIds || []);
     await chrome.storage.local.set({ pageVideoSubmitTrace: { stage: 'ui_started', at: Date.now(), requestId: msg.id, tabId: tab.id } });
-    const uiResult = await chrome.tabs.sendMessage(tab.id, { type: 'SUBMIT_VIDEO_UI', payload: msg.params });
-    if (uiResult?.error) throw new Error(uiResult.error);
+    let uiResult = null;
+    let uiError = null;
+    try {
+      uiResult = await chrome.tabs.sendMessage(tab.id, { type: 'SUBMIT_VIDEO_UI', payload: msg.params });
+      if (uiResult?.error) uiError = new Error(uiResult.error);
+      if (!uiError) {
+        if (!Number.isFinite(uiResult?.generateX) || !Number.isFinite(uiResult?.generateY)) {
+          uiError = new Error('PAGE_VIDEO_GENERATE_COORDS_MISSING');
+        } else {
+          await trustedClick(tab.id, uiResult.generateX, uiResult.generateY);
+          uiResult.clicked = true;
+        }
+      }
+    } catch (error) {
+      // Flow may replace the page/content-script context immediately after a
+      // successful Generate click.  Chrome then reports a closed message
+      // channel even though the remote submission was accepted.  Keep
+      // watching for the real request/new tile before deciding it failed.
+      uiError = error;
+    }
     await chrome.storage.local.set({ pageVideoSubmitTrace: { stage: 'generate_clicked', at: Date.now(), requestId: msg.id, tabId: tab.id } });
-    // The current Flow page may not expose a remote job id until the video tile
-    // finishes rendering. Return a local receipt immediately after the Generate
-    // click and resolve it to the new tile during normal status polling.
-    const capturedJobId = await Promise.race([
-      jobPromise,
-      new Promise((resolve) => setTimeout(() => resolve(null), 1500)),
-    ]);
+    // Do not report success merely because the Generate button was clicked.
+    // Flow can silently reject the click (for example, after auth expires).  A
+    // real submission must produce either a captured remote request or a new
+    // video tile in the current project.
+    let evidence;
+    try {
+      evidence = await waitForPageVideoSubmission(tab.id, existingIds, jobPromise, 15000);
+    } catch (firstEvidenceError) {
+      const retry = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: () => {
+          const button = [...document.querySelectorAll('button')].find((item) => (
+            item.getAttribute('aria-label') === '开始生成'
+            && !item.disabled
+            && item.getClientRects().length > 0
+          ));
+          if (!button) return null;
+          button.click();
+          const rect = button.getBoundingClientRect();
+          return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+        },
+      }).then((items) => items?.[0]?.result || null).catch(() => null);
+      if (Number.isFinite(retry?.x) && Number.isFinite(retry?.y)) {
+        await trustedClick(tab.id, retry.x, retry.y).catch(() => {});
+      }
+      try {
+        evidence = await waitForPageVideoSubmission(tab.id, existingIds, jobPromise, 105000);
+      } catch (evidenceError) {
+        throw uiError || evidenceError || firstEvidenceError;
+      }
+    }
+    const capturedJobId = evidence.jobId;
     const jobId = capturedJobId || crypto.randomUUID();
     if (!pageVideoJobs.has(jobId)) {
       pageVideoJobs.set(jobId, {
@@ -636,8 +763,9 @@ async function handlePageSubmitVideo(msg) {
         url: null,
         body: null,
         baselineIds: [...existingIds],
-        outputId: null,
+        outputId: evidence.outputId || null,
       });
+      await persistPageVideoJobs();
     }
     const response = {
       id: msg.id,
@@ -663,15 +791,16 @@ async function handlePageSubmitVideo(msg) {
 async function handlePageVideoStatus(msg) {
   try {
     const mediaId = String(msg.params?.mediaId || '');
-    const job = pageVideoJobs.get(mediaId);
+    const job = await getPageVideoJob(mediaId);
     if (!job) throw new Error('PAGE_VIDEO_JOB_NOT_FOUND');
-    if (!job.url && !job.outputId) {
-      const current = await chrome.tabs.sendMessage(job.tabId, { type: 'GET_PAGE_VIDEO_JOB_IDS' }).catch(() => ({ mediaIds: [] }));
+    if (!job.outputId) {
+      const current = await readPageVideoIds(job.tabId);
       const baselineIds = new Set(job.baselineIds || []);
       job.outputId = (current?.mediaIds || []).find((id) => !baselineIds.has(id)) || null;
+      if (job.outputId) await persistPageVideoJobs();
     }
     const domMediaId = job.outputId || mediaId;
-    const dom = await chrome.tabs.sendMessage(job.tabId, { type: 'GET_PAGE_VIDEO_STATUS', mediaId: domMediaId });
+    const dom = await readPageVideoStatus(job.tabId, domMediaId, job.tileIndex);
     if (Number.isInteger(dom?.tileIndex) && dom.tileIndex >= 0) job.tileIndex = dom.tileIndex;
     let outputId = null;
     if (job.url && job.body) {
@@ -688,6 +817,7 @@ async function handlePageVideoStatus(msg) {
     }
     const completed = !!dom?.completed;
     if (completed && outputId) job.outputId = outputId;
+    if (completed || Number.isInteger(job.tileIndex)) await persistPageVideoJobs();
     const response = {
       id: msg.id,
       status: 200,
@@ -715,6 +845,7 @@ async function handlePageVideoMedia(msg) {
   let createdListener = null;
   try {
     const mediaId = String(msg.params?.mediaId || '');
+    await hydratePageVideoJobs();
     const entry = [...pageVideoJobs.entries()].find(([jobId, job]) => jobId === mediaId || job.outputId === mediaId);
     if (!entry) throw new Error('PAGE_VIDEO_JOB_NOT_FOUND');
     const [jobId, job] = entry;
@@ -736,8 +867,14 @@ async function handlePageVideoMedia(msg) {
       if (!candidate?.error) download = candidate;
     }
     if (!download) throw new Error('PAGE_VIDEO_DOWNLOAD_MENU_NOT_FOUND');
-    await trustedClick(job.tabId, download.x, download.y);
-    const resolution = await chrome.tabs.sendMessage(job.tabId, { type: 'GET_PAGE_VIDEO_DOWNLOAD_COORDS', mediaId: targetMediaId, tileIndex: job.tileIndex, target: 'resolution' });
+    await trustedMove(job.tabId, download.x, download.y);
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    let resolution = await chrome.tabs.sendMessage(job.tabId, { type: 'GET_PAGE_VIDEO_DOWNLOAD_COORDS', mediaId: targetMediaId, tileIndex: job.tileIndex, target: 'resolution' });
+    if (resolution?.error) {
+      await trustedClick(job.tabId, download.x, download.y);
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      resolution = await chrome.tabs.sendMessage(job.tabId, { type: 'GET_PAGE_VIDEO_DOWNLOAD_COORDS', mediaId: targetMediaId, tileIndex: job.tileIndex, target: 'resolution' });
+    }
     if (resolution?.error) throw new Error(resolution.error);
     await trustedClick(job.tabId, resolution.x, resolution.y);
     const item = await Promise.race([
@@ -772,7 +909,7 @@ async function waitForNewProjectButton(tabId, timeoutMs) {
     const [{ result }] = await chrome.scripting.executeScript({
       target: { tabId },
       func: async () => {
-        const target = [...document.querySelectorAll('button, a, [role="button"]')].find((element) => {
+        const target = document.querySelector('button.new-project-button') || [...document.querySelectorAll('button, a, [role="button"]')].find((element) => {
           const text = `${element.textContent || ''} ${element.getAttribute('aria-label') || ''}`.trim();
           return element.getClientRects().length > 0 && !element.disabled && /新建项目|创建项目|New project|Create project/i.test(text);
         });
@@ -787,6 +924,113 @@ async function waitForNewProjectButton(tabId, timeoutMs) {
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
   throw new Error('NEW_PROJECT_BUTTON_NOT_FOUND');
+}
+
+async function waitForPageVideoBridge(tabId, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tab || !/\/project\/[0-9a-f-]{36}/i.test(tab.url || '')) {
+      throw new Error('PROJECT_NOT_ACCESSIBLE');
+    }
+    const response = await readPageVideoIds(tabId);
+    if (response && Array.isArray(response.mediaIds)) {
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw new Error('PAGE_VIDEO_BRIDGE_TIMEOUT');
+}
+
+async function waitForStablePageVideoIds(tabId, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let previous = null;
+  let stableCount = 0;
+  // Give Flow's project shell time to hydrate before taking the baseline.  An
+  // early empty snapshot can otherwise make an old tile look newly generated.
+  await new Promise((resolve) => setTimeout(resolve, 4000));
+  while (Date.now() < deadline) {
+    const response = await readPageVideoIds(tabId);
+    if (response && Array.isArray(response.mediaIds)) {
+      const ids = [...new Set(response.mediaIds)].sort();
+      const signature = JSON.stringify(ids);
+      stableCount = signature === previous ? stableCount + 1 : 1;
+      previous = signature;
+      if (stableCount >= 3) return { mediaIds: ids };
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+  throw new Error('PAGE_VIDEO_BASELINE_TIMEOUT');
+}
+
+async function waitForPageVideoSubmission(tabId, existingIds, jobPromise, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let capturedJobId = null;
+  jobPromise.then((value) => { capturedJobId = value || null; }).catch(() => {});
+  while (Date.now() < deadline) {
+    if (capturedJobId) return { jobId: capturedJobId, outputId: null };
+    const current = await readPageVideoIds(tabId);
+    const outputId = (current?.mediaIds || []).find((id) => !existingIds.has(id));
+    if (outputId) return { jobId: null, outputId };
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw new Error('REMOTE_SUBMISSION_NOT_CONFIRMED');
+}
+
+async function readPageVideoIds(tabId) {
+  const response = await chrome.tabs.sendMessage(tabId, { type: 'GET_PAGE_VIDEO_JOB_IDS' }).catch(() => null);
+  if (response && Array.isArray(response.mediaIds)) return response;
+  const injected = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => ({
+      mediaIds: [...new Set([...document.querySelectorAll('flow-video-tile img')]
+        .map((image) => image.src.match(/\/image\/([0-9a-f-]{36})/i)?.[1] || image.src)
+        .filter(Boolean))],
+    }),
+  }).catch(() => []);
+  return injected?.[0]?.result || null;
+}
+
+async function readPageVideoStatus(tabId, mediaId, tileIndex = -1) {
+  const injected = await chrome.scripting.executeScript({
+    target: { tabId },
+    args: [mediaId, tileIndex],
+    func: (targetId, requestedIndex) => {
+      const tiles = [...document.querySelectorAll('flow-video-tile')];
+      const image = [...document.querySelectorAll('flow-video-tile img')]
+        .find((item) => item.src.includes(`/image/${targetId}`) || item.src === targetId);
+      const tile = image?.closest('flow-video-tile') || tiles[requestedIndex] || (tiles.length === 1 ? tiles[0] : null);
+      const progress = tile?.querySelector('.progress-bar');
+      const progressValue = progress ? Number.parseFloat(progress.style.getPropertyValue('--progress-percent') || '0') : 100;
+      // Flow retains the progress bar after generation, resets it to 0%, and
+      // hides it with opacity: 0.  Only a visible progress bar means that the
+      // tile is still generating.
+      const progressVisible = !!progress && Number.parseFloat(getComputedStyle(progress).opacity || '1') > 0.01;
+      return {
+        completed: !!tile && (!progressVisible || progressValue >= 100),
+        mediaId: targetId,
+        tileIndex: tile ? tiles.indexOf(tile) : -1,
+      };
+    },
+  }).catch(() => []);
+  return injected?.[0]?.result || { completed: false, mediaId, tileIndex: -1 };
+}
+
+async function clickNewProjectButtonInPage(tabId) {
+  const [{ result }] = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => {
+      const target = document.querySelector('button.new-project-button') || [...document.querySelectorAll('button, a, [role="button"]')].find((element) => {
+        const text = `${element.textContent || ''} ${element.getAttribute('aria-label') || ''}`.trim();
+        return element.getClientRects().length > 0 && !element.disabled && /新建项目|创建项目|New project|Create project/i.test(text);
+      });
+      if (!target) return false;
+      target.click();
+      return true;
+    },
+  });
+  if (!result) throw new Error('NEW_PROJECT_BUTTON_NOT_FOUND');
 }
 
 async function trustedClick(tabId, x, y) {
@@ -819,7 +1063,13 @@ function waitForTabComplete(tabId, timeoutMs, projectId = null) {
       const expectedUrl = projectId
         ? (tab.url || '').includes(`/project/${projectId}`)
         : /^https:\/\/flow\.google\.com\/?(?:[?#].*)?$/.test(tab.url || '');
-      if (tab.status === 'complete' && expectedUrl) return;
+      // Flow is a long-lived SPA and can keep Chrome's tab status at "loading"
+      // while the target project is already usable. Element-specific waits in
+      // the next step provide the real readiness check.
+      if (expectedUrl) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        return;
+      }
       await new Promise((resolve) => setTimeout(resolve, 200));
     }
     throw new Error('FLOW_HOME_TIMEOUT');

@@ -15,7 +15,7 @@ import httpx
 from runtime.extension_bootstrap import ExtensionBootstrapper
 from runtime.process_manager import RuntimeManager
 from runtime.gateway_projection import ReadOnlyRuntimeStatusProvider
-from runtime.port_allocator import port_can_bind, port_is_available, port_is_listening, worker_fallback_range, worker_port_base
+from runtime.port_allocator import port_can_bind, port_is_available, port_is_listening, worker_fallback_range
 from runtime.registry import AccountRegistry
 
 from . import crud
@@ -131,11 +131,11 @@ def _quick_add_worker_port(payload: dict, number: int, registry: AccountRegistry
     explicit = payload.get("worker_port") or payload.get("worker_api_port")
     if explicit:
         return int(explicit)
-    preferred = worker_port_base() + int(number)
     reserved = {account.worker_api_port for account in registry.list_accounts()}
-    if port_is_available(preferred, reserved):
-        return preferred
-    return port_is_available_from_range(worker_fallback_range(), reserved | {preferred})
+    # New accounts use the same high worker-port pool as the stable
+    # FLOW-001..005 runtimes.  The legacy 810x range is frequently reserved
+    # by Windows and made otherwise identical accounts behave differently.
+    return port_is_available_from_range(worker_fallback_range(), reserved)
 
 
 def port_is_available_from_range(candidates, reserved: set[int]) -> int:
@@ -376,7 +376,7 @@ async def refresh_session(scheduler, account_id: str, registry: AccountRegistry 
     account = registry.get(account_id)
     if not account:
         return None
-    cdp_result = await _open_or_refresh_flow_page(account.chrome_cdp_port)
+    cdp_result = await _open_or_refresh_flow_page(account.chrome_cdp_port, force_reload=True)
     await asyncio.sleep(2)
     worker = WorkerConfig(account.account_id, f"http://127.0.0.1:{account.worker_api_port}", bool(account.enabled), account.runtime_instance_id)
     try:
@@ -439,7 +439,29 @@ async def _node_snapshot(account_id: str, scheduler, registry: AccountRegistry, 
     }
 
 
-async def _open_or_refresh_flow_page(cdp_port: int) -> dict:
+async def refresh_flow_auth_page(account_id: str, registry: AccountRegistry | None = None) -> dict:
+    registry = registry or AccountRegistry()
+    account = registry.get(account_id)
+    if not account:
+        return {"ok": False, "stage": "account_lookup", "error": "account_not_found"}
+    return await _open_or_refresh_flow_page(account.chrome_cdp_port, force_reload=True)
+
+
+async def _reload_cdp_target(websocket_url: str) -> bool:
+    if not websocket_url:
+        return False
+    import websockets
+
+    try:
+        async with websockets.connect(websocket_url, open_timeout=3) as websocket:
+            await websocket.send(json.dumps({"id": 1, "method": "Page.reload", "params": {"ignoreCache": True}}))
+            await asyncio.wait_for(websocket.recv(), timeout=3)
+        return True
+    except Exception:
+        return False
+
+
+async def _open_or_refresh_flow_page(cdp_port: int, force_reload: bool = False) -> dict:
     base = f"http://127.0.0.1:{int(cdp_port)}"
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
@@ -451,7 +473,8 @@ async def _open_or_refresh_flow_page(cdp_port: int) -> dict:
             url = page.get("url") or ""
             if page_id and ("flow.google.com" in url or ("labs.google" in url and "/flow" in url)):
                 await client.put(f"{base}/json/activate/{quote(page_id, safe='')}")
-                return {"ok": True, "stage": "activated_existing_page", "page_id": page_id}
+                reloaded = await _reload_cdp_target(page.get("webSocketDebuggerUrl") or "") if force_reload else False
+                return {"ok": True, "stage": "reloaded_existing_page" if reloaded else "activated_existing_page", "page_id": page_id, "reloaded": reloaded}
         response = await client.put(f"{base}/json/new?{quote(FLOW_URL, safe=':/?=&')}")
         return {"ok": response.status_code < 400, "stage": "opened_flow_page", "status_code": response.status_code}
 

@@ -8,7 +8,7 @@
     // Some account pages otherwise remain permanently stuck with an empty body.
     if (!document.head) return;
     const s = document.createElement('script');
-    s.src = chrome.runtime.getURL('injected.js');
+    s.src = chrome.runtime.getURL('injected-026.js');
     s.onload = () => s.remove();
     document.head.appendChild(s);
   };
@@ -79,66 +79,9 @@ chrome.runtime.onMessage.addListener((msg, _, reply) => {
     return true;
   }
   if (msg.type === 'GET_PAGE_VIDEO_DOWNLOAD_COORDS') {
-    getPageVideoDownloadCoords(String(msg.mediaId || ''), String(msg.target || 'more'), Number(msg.tileIndex), !!msg.focus)
+    getPageVideoDownloadCoords(String(msg.mediaId || ''), String(msg.target || 'more'), Number(msg.tileIndex))
       .then(reply)
       .catch((e) => reply({ error: e.message || 'PAGE_VIDEO_DOWNLOAD_COORDS_FAILED' }));
-    return true;
-  }
-  if (msg.type === 'GET_PAGE_VIDEO_GENERATE_TARGET') {
-    (async () => {
-      const button = [...document.querySelectorAll('button')].find(element =>
-        element.getClientRects().length > 0 && /^(开始生成|Generate|Start generation)$/i.test(element.getAttribute('aria-label') || ''));
-      if (!button || button.disabled) return {error: 'GENERATE_TARGET_NOT_READY'};
-      button.scrollIntoView({block: 'center', inline: 'center'});
-      await new Promise(resolve => setTimeout(resolve, 250));
-      const rect = button.getBoundingClientRect();
-      const x = rect.left + rect.width / 2, y = rect.top + rect.height / 2;
-      const hit = document.elementFromPoint(x, y);
-      if (hit !== button && !button.contains(hit)) return {error: 'GENERATE_TARGET_OBSCURED'};
-      return {x, y};
-    })().then(reply).catch(error => reply({error: error.message}));
-    return true;
-  }
-  if (msg.type === 'GET_PAGE_VIDEO_DOWNLOAD_STATE') {
-    reply({
-      hidden: document.hidden,
-      ingredientCount: document.querySelectorAll('flow-ingredient-chip').length,
-      promptLength: (document.querySelector('[contenteditable=true]')?.textContent || '').length,
-      visibleButtons: [...document.querySelectorAll('button')].filter(element => element.getClientRects().length > 0)
-        .map(element => ({label: (element.getAttribute('aria-label') || element.innerText || '').trim().slice(0, 100), disabled: element.disabled})).slice(-30),
-      tileCount: document.querySelectorAll('flow-video-tile').length,
-      notices: [...document.querySelectorAll('[role=alert],[role=dialog],.mat-mdc-snack-bar-container')]
-        .filter(element => element.getClientRects().length > 0)
-        .map(element => (element.innerText || '').trim().slice(0, 300)).slice(0, 3),
-      menuItems: [...document.querySelectorAll('[role=menuitem],[role=option],[role=menu] button')]
-        .filter(element => element.getClientRects().length > 0)
-        .map(element => (element.innerText || element.textContent || '').trim().slice(0, 120)).slice(0, 30),
-    });
-    return;
-  }
-  if (msg.type === 'GET_PAGE_VIDEO_SOURCE') {
-    const mediaId = String(msg.mediaId || '');
-    const tiles = [...document.querySelectorAll('flow-video-tile')];
-    const media = [...document.querySelectorAll('flow-video-tile img,flow-video-tile video')]
-      .find(element => (element.src || '').includes(mediaId));
-    const tile = media?.closest('flow-video-tile') || (tiles.length === 1 ? tiles[0] : null);
-    const video = tile?.querySelector('video');
-    (async () => {
-      if (video && video.readyState === 0 && (video.currentSrc || video.src)) {
-        await new Promise(resolve => {
-          const done = () => { clearTimeout(timer); video.removeEventListener('loadedmetadata', done); video.removeEventListener('error', done); resolve(); };
-          const timer = setTimeout(done, 5000);
-          video.addEventListener('loadedmetadata', done, { once: true });
-          video.addEventListener('error', done, { once: true });
-          video.load();
-        });
-      }
-      const src = video?.currentSrc || video?.src || '';
-      const fullSize = Math.min(video?.videoWidth || 0, video?.videoHeight || 0) >= 720;
-      reply({ source: fullSize && /^(https:|blob:https:)/.test(src) ? src : null,
-        sourcePresent: !!src, videoPresent: !!video, width: video?.videoWidth || 0, height: video?.videoHeight || 0,
-        readyState: video?.readyState, networkState: video?.networkState, mediaError: video?.error?.code || null });
-    })().catch(() => reply({ source: null, error: 'PAGE_VIDEO_SOURCE_UNAVAILABLE' }));
     return true;
   }
   if (msg.type !== 'GET_CAPTCHA') return;
@@ -227,22 +170,19 @@ async function clickPageVideoDownload(mediaId) {
   return { clicked: true, mediaId };
 }
 
-async function getPageVideoDownloadCoords(mediaId, target, tileIndex = -1, focus = false) {
+async function getPageVideoDownloadCoords(mediaId, target, tileIndex = -1) {
   const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const requestedIndex = Number.isInteger(tileIndex) ? tileIndex : -1;
   const findTile = () => {
     const tiles = [...document.querySelectorAll('flow-video-tile')];
     const media = [...document.querySelectorAll('img, video')]
       .find((item) => item.src.includes(`/image/${mediaId}`) || item.src.includes(`/video/${mediaId}`) || item.src === mediaId);
-    return media?.closest('flow-video-tile') || (tiles.length === 1 ? tiles[0] : null);
+    return media?.closest('flow-video-tile') || tiles[requestedIndex] || (tiles.length === 1 ? tiles[0] : null);
   };
   if (target === 'hover') {
-    const deadline = Date.now() + 15000;
-    let tile = findTile();
-    while (!tile && Date.now() < deadline) { await delay(250); tile = findTile(); }
+    const tile = findTile();
     const container = tile?.closest('flow-grid-tile-container') || tile;
     if (!container) throw new Error('PAGE_VIDEO_TILE_NOT_FOUND');
-    container.scrollIntoView({ block: 'center', inline: 'center' });
     const rect = container.getBoundingClientRect();
     return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
   }
@@ -255,11 +195,8 @@ async function getPageVideoDownloadCoords(mediaId, target, tileIndex = -1, focus
           return element.getClientRects().length > 0 && /(^|\n)(下载|Download)(\n|$)/i.test(text);
         });
       if (item) {
-        if (item.disabled || item.getAttribute('aria-disabled') === 'true') throw new Error('PAGE_VIDEO_DOWNLOAD_DISABLED');
-        if (focus) item.focus();
         const rect = item.getBoundingClientRect();
-        return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2,
-          label: (item.innerText || item.textContent || '').trim().slice(0, 120), role: item.getAttribute('role') };
+        return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
       }
       await delay(100);
     }
@@ -268,19 +205,14 @@ async function getPageVideoDownloadCoords(mediaId, target, tileIndex = -1, focus
   if (target === 'resolution') {
     const deadline = Date.now() + 5000;
     while (Date.now() < deadline) {
-      const item = [...document.querySelectorAll('[role=menuitem],[role=menuitemradio],[role=option],button')]
+      const item = [...document.querySelectorAll('[role=menuitem],button')]
         .find((element) => {
           const text = (element.innerText || element.textContent || '').trim();
-          const role = element.getAttribute('role');
-          const inMenu = ['menuitem', 'menuitemradio', 'option'].includes(role) || !!element.closest('[role=menu],[role=listbox]');
-          return inMenu && element.getClientRects().length > 0 && !element.disabled
-            && /原始尺寸|Original|\b720\s*p\b/i.test(text) && !/1080|4\s*k|升级|Upscale/i.test(text);
+          return element.getClientRects().length > 0 && /原始尺寸|Original/i.test(text);
         });
       if (item) {
-        if (focus) item.focus();
         const rect = item.getBoundingClientRect();
-        return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2,
-          label: (item.innerText || item.textContent || '').trim().slice(0, 120), role: item.getAttribute('role') };
+        return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
       }
       await delay(100);
     }

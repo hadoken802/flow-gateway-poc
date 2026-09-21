@@ -26,6 +26,7 @@ class FakeWorkerClient:
             "credits_error": state.get("credits_error"),
             "extension_connected": state.get("extension_connected", True),
             "flow_key_present": state.get("flow_key_present", True),
+            "page_ui_ready": state.get("page_ui_ready", False),
             "token_expired": state.get("token_expired", False),
         }
 
@@ -111,6 +112,33 @@ class SwitchAccountWorkerClient(FakeRealWorkerClient):
         return self.jobs[worker_job_id]
 
 
+class TransientNotReadyAfterProjectClient(FakeRealWorkerClient):
+    """Simulate one brief extension readiness drop after project creation."""
+
+    def __init__(self, states, output_dir=None):
+        super().__init__(states, output_dir)
+        self._drop_next_inspect = False
+        self.transient_not_ready_count = 0
+
+    async def create_project(self, worker, payload):
+        result = await super().create_project(worker, payload)
+        self._drop_next_inspect = True
+        return result
+
+    async def inspect(self, worker):
+        if self._drop_next_inspect:
+            self._drop_next_inspect = False
+            self.transient_not_ready_count += 1
+            return {
+                "status": "ok",
+                "credits": self.states[worker.account_id]["credits"],
+                "extension_connected": False,
+                "flow_key_present": False,
+                "page_ui_ready": False,
+            }
+        return await super().inspect(worker)
+
+
 def local_db(name):
     path = RUN_ROOT / name / "gateway.db"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -129,6 +157,14 @@ def make_scheduler(settings, worker_client):
         write_workers(workers_path, list(worker_client.states))
         settings = replace(settings, workers_path=workers_path)
     return GatewayScheduler(settings, worker_client=worker_client, worker_provider=StaticJsonWorkerProvider(settings.workers_path))
+
+
+def test_download_attempt_limit_uses_current_and_legacy_counters():
+    from gateway.scheduler import _download_attempt_limit_reached
+
+    assert _download_attempt_limit_reached({"download_attempt_count": 2, "download_attempts": 0, "download_max_attempts": 2}) is True
+    assert _download_attempt_limit_reached({"download_attempt_count": 0, "download_attempts": 2, "download_max_attempts": 2}) is True
+    assert _download_attempt_limit_reached({"download_attempt_count": 1, "download_attempts": 1, "download_max_attempts": 2}) is False
 
 
 def write_workers(path, account_ids):
@@ -164,6 +200,7 @@ async def test_gateway_config_defaults_to_8200(monkeypatch):
     from gateway.config import GatewaySettings
 
     monkeypatch.delenv("GATEWAY_API_PORT", raising=False)
+    monkeypatch.setenv("POOL_DRY_RUN", "true")
     settings = GatewaySettings.from_env()
     assert settings.api_host == "127.0.0.1"
     assert settings.api_port == 8200
@@ -240,21 +277,99 @@ async def test_live_credits_keep_logged_in_account_ready_without_flow_key():
 
 
 @pytest.mark.asyncio
-async def test_expired_worker_token_is_not_schedulable_even_with_live_credits():
+async def test_expired_worker_token_with_live_page_is_auto_recovered_without_blocking():
     from gateway.config import GatewaySettings
 
     scheduler = make_scheduler(
         GatewaySettings(db_path=local_db("expired_worker_token")),
-        FakeWorkerClient({"FLOW-004": {"credits": 1043, "token_expired": True}}),
+        FakeWorkerClient({"FLOW-004": {"credits": 1043, "token_expired": True, "page_ui_ready": True}}),
     )
+    recoveries = []
+
+    async def recover_auth(account_id):
+        recoveries.append(account_id)
+
+    scheduler.auth_recovery_callback = recover_auth
     await scheduler.start()
     try:
+        await asyncio.sleep(0)
         account = (await scheduler.list_accounts())[0]
-        assert account["status"] == "needs_login"
+        assert account["status"] == "ready"
+        assert recoveries == []
         assert scheduler.select_worker(
             {"task_id": "expired-token-task", "estimated_quota_cost": 15},
             account_states=[account],
-        )["ok"] is False
+        )["ok"] is True
+    finally:
+        await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_expired_token_on_temporarily_ineligible_runtime_uses_live_page_session():
+    from gateway.config import GatewaySettings
+    from gateway.scheduler import GatewayScheduler
+    from gateway.worker_provider import WorkerConfig, WorkerSnapshot
+
+    worker = WorkerConfig("FLOW-004", "http://127.0.0.1:18103", True, "runtime-4")
+    eligible_snapshot = WorkerSnapshot(
+        workers=[worker],
+        candidates=[{
+            "account_id": "FLOW-004",
+            "eligible": True,
+            "worker_api_endpoint": worker.api_url,
+            "runtime_instance_id": worker.runtime_instance_id,
+        }],
+        worker_source="runtime_registry",
+        provider_kind="test",
+        registry_snapshot_time="2026-01-01T00:00:00Z",
+    )
+    excluded_snapshot = WorkerSnapshot(
+        workers=[],
+        candidates=[{
+            "account_id": "FLOW-004",
+            "eligible": False,
+            "worker_api_endpoint": worker.api_url,
+            "runtime_instance_id": worker.runtime_instance_id,
+            "exclusion_reasons": ["ownership_not_verified"],
+        }],
+        worker_source="runtime_registry",
+        provider_kind="test",
+        registry_snapshot_time="2026-01-01T00:00:01Z",
+    )
+
+    class Provider:
+        def __init__(self):
+            self.calls = 0
+
+        def load_workers(self):
+            self.calls += 1
+            return eligible_snapshot if self.calls == 1 else excluded_snapshot
+
+    scheduler = GatewayScheduler(
+        GatewaySettings(db_path=local_db("expired_token_ineligible_live_page")),
+        worker_client=FakeWorkerClient({
+            "FLOW-004": {
+                "credits": 1043,
+                "token_expired": True,
+                "page_ui_ready": True,
+                "extension_connected": True,
+            }
+        }),
+        worker_provider=Provider(),
+    )
+    recoveries = []
+
+    async def recover_auth(account_id):
+        recoveries.append(account_id)
+
+    scheduler.auth_recovery_callback = recover_auth
+    await scheduler.start()
+    try:
+        account = (await scheduler.list_accounts())[0]
+        assert account["status"] == "ready"
+        assert account["quota_confidence"] == "live"
+        assert recoveries == []
+        assert scheduler.workers == []
     finally:
         await scheduler.stop()
 
@@ -763,6 +878,39 @@ async def test_real_mode_posts_to_worker_and_passes_idempotency_key():
 
 
 @pytest.mark.asyncio
+async def test_real_mode_retries_one_transient_worker_not_ready_after_project_creation():
+    from gateway.config import GatewaySettings
+
+    states = {"FLOW-001": {"credits": 5}, "FLOW-002": {"credits": 50}, "FLOW-003": {"credits": 50}}
+    output_dir = RUN_ROOT / "transient_worker_not_ready_outputs"
+    client = TransientNotReadyAfterProjectClient(states, output_dir=output_dir)
+    settings = GatewaySettings(db_path=local_db("transient_worker_not_ready"), dry_run=False)
+    scheduler = make_scheduler(settings, client)
+    await scheduler.start()
+    await scheduler.create_task({
+        "idempotency_key": "transient-worker-not-ready",
+        "image_path": "D:/img.png",
+        "prompt": "p",
+        "duration": 10,
+        "aspect_ratio": "9:16",
+        "preferred_account_id": "FLOW-002",
+    })
+
+    for _ in range(150):
+        task = (await scheduler.list_tasks())[0]
+        if task["status"] in {"completed", "manual_review", "failed"}:
+            break
+        await asyncio.sleep(0.02)
+
+    task = (await scheduler.list_tasks())[0]
+    assert client.transient_not_ready_count == 1
+    assert task["status"] == "completed"
+    assert task["error_code"] is None
+    assert len(client.submits) == 1
+    await scheduler.stop()
+
+
+@pytest.mark.asyncio
 async def test_real_mode_poll_and_download_responses_fill_missing_remote_ids():
     from gateway.config import GatewaySettings
 
@@ -907,6 +1055,46 @@ async def test_real_mode_project_create_failure_releases_account_without_submit(
     assert len(client.projects) == 1
     assert client.submits == []
     assert accounts["FLOW-002"]["current_task_id"] is None
+    await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_project_navigation_timeout_never_reuses_unrelated_project():
+    from gateway.config import GatewaySettings
+
+    class ReuseProjectClient(FakeRealWorkerClient):
+        async def create_project(self, worker, payload):
+            self.projects.append((worker.account_id, dict(payload)))
+            raise RuntimeError("Worker project creation failed: PROJECT_NAVIGATION_TIMEOUT")
+
+        async def list_projects(self, worker):
+            return [
+                {"id": "old-project", "status": "ACTIVE"},
+                {"id": "latest-project", "status": "ACTIVE"},
+            ]
+
+    states = {"FLOW-001": {"credits": 5}, "FLOW-002": {"credits": 50}, "FLOW-003": {"credits": 5}}
+    client = ReuseProjectClient(states, output_dir=RUN_ROOT / "reuse_project_outputs")
+    settings = GatewaySettings(db_path=local_db("reuse_project"), dry_run=False)
+    scheduler = make_scheduler(settings, client)
+    await scheduler.start()
+    await scheduler.create_task({
+        "idempotency_key": "reuse-project",
+        "image_path": "D:/img.png",
+        "prompt": "p",
+        "duration": 10,
+        "aspect_ratio": "9:16",
+        "preferred_account_id": "FLOW-002",
+    })
+    for _ in range(100):
+        task = (await scheduler.list_tasks())[0]
+        if task["status"] == "failed_before_remote_submit":
+            break
+        await asyncio.sleep(0.02)
+    task = (await scheduler.list_tasks())[0]
+    assert task["status"] == "failed_before_remote_submit"
+    assert task["project_id"] is None
+    assert client.submits == []
     await scheduler.stop()
 
 
@@ -1561,8 +1749,8 @@ def test_gateway_submit_timeout_defaults_and_env_override(monkeypatch):
 
     monkeypatch.delenv("GATEWAY_WORKER_SUBMIT_TIMEOUT_SECONDS", raising=False)
     settings = GatewaySettings.from_env()
-    assert settings.worker_submit_timeout_seconds == 300.0
-    assert WorkerClient().submit_timeout_seconds == 300.0
+    assert settings.worker_submit_timeout_seconds == 420.0
+    assert WorkerClient().submit_timeout_seconds == 420.0
 
     monkeypatch.setenv("GATEWAY_WORKER_SUBMIT_TIMEOUT_SECONDS", "45")
     assert GatewaySettings.from_env().worker_submit_timeout_seconds == 45.0
@@ -1820,7 +2008,9 @@ async def test_worker_401_before_remote_submit_marks_login_required_and_switches
 
         await scheduler.refresh_workers()
         refreshed_account_a = await crud.get_account(scheduler.db, "FLOW-001")
-        assert refreshed_account_a["status"] == "needs_login"
+        assert refreshed_account_a["status"] == "ready"
+        assert refreshed_account_a["manual_paused"] == 0
+        assert refreshed_account_a["manual_pause_reason"] is None
     finally:
         await scheduler.stop()
 

@@ -137,6 +137,9 @@ async def update_account_controls(db, account_id, **fields):
 
 async def create_task(db, payload):
     task_id = str(uuid.uuid4())
+    prompt = payload.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError("prompt is required")
     idempotency_key = payload.get("idempotency_key") or f"storyboard:{task_id}:attempt:1"
     estimated_quota_cost = int(payload.get("estimated_quota_cost") or 15)
     priority = int(payload.get("priority") or 0)
@@ -187,7 +190,7 @@ async def create_task(db, payload):
             """,
             (
                 task_id, idempotency_key, payload.get("project_id"), image_path,
-                payload["prompt"], duration, aspect_ratio, payload.get("preferred_account_id"),
+                prompt, duration, aspect_ratio, payload.get("preferred_account_id"),
                 priority, not_before, estimated_quota_cost,
                 payload.get("external_task_id"), payload.get("batch_id"),
                 payload.get("output_directory"), payload.get("output_filename"),
@@ -742,6 +745,7 @@ async def guarded_release_account(db, task_id, account_id, expected_lease_owner,
             return None
         quota_release = status in {"failed", "failed_before_remote_submit", "cancelled", "manual_review", "manual_submit_required", "download_failed", "retry_wait"}
         quota_consume = status == "completed"
+        failure_outcome = status in {"failed", "failed_before_remote_submit", "manual_review", "manual_submit_required", "download_failed", "retry_wait"}
         reserved = 0
         if expected_lease_owner:
             await db.execute(
@@ -785,10 +789,10 @@ async def guarded_release_account(db, task_id, account_id, expected_lease_owner,
                 consumed_credits=consumed_credits+?,
                 success_count=success_count+?,
                 failure_count=failure_count+?,
-                consecutive_failures=CASE WHEN ? THEN 0 ELSE consecutive_failures+1 END,
+                consecutive_failures=CASE WHEN ? THEN 0 WHEN ? THEN consecutive_failures+1 ELSE consecutive_failures END,
                 health_score=MIN(100, MAX(0, health_score+?)),
                 last_success_at=CASE WHEN ? THEN strftime('%Y-%m-%dT%H:%M:%SZ', 'now') ELSE last_success_at END,
-                last_failure_at=CASE WHEN ? THEN last_failure_at ELSE strftime('%Y-%m-%dT%H:%M:%SZ', 'now') END,
+                last_failure_at=CASE WHEN ? THEN strftime('%Y-%m-%dT%H:%M:%SZ', 'now') ELSE last_failure_at END,
                 updated_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
             WHERE account_id=? AND current_task_id=? AND lock_owner=? AND lock_version=?
             """,
@@ -796,11 +800,12 @@ async def guarded_release_account(db, task_id, account_id, expected_lease_owner,
                 reserved if (expected_lease_owner and (quota_release or quota_consume)) else 0,
                 reserved if quota_consume else 0,
                 1 if quota_consume else 0,
-                0 if quota_consume else 1,
+                1 if failure_outcome else 0,
                 1 if quota_consume else 0,
-                2 if quota_consume else -10,
+                1 if failure_outcome else 0,
+                2 if quota_consume else (-10 if failure_outcome else 0),
                 1 if quota_consume else 0,
-                1 if quota_consume else 0,
+                1 if failure_outcome else 0,
                 account_id,
                 task_id,
                 expected_lease_owner,

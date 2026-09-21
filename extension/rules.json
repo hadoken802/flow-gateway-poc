@@ -21,5 +21,16 @@
       "urlFilter": "aisandbox-pa.googleapis.com",
       "resourceTypes": ["xmlhttprequest"]
     }
+  },
+  {
+    "id": 2,
+    "priority": 2,
+    "action": {
+      "type": "block"
+    },
+    "condition": {
+      "urlFilter": "||www.gstatic.com/glue/cookienotificationbar/",
+      "resourceTypes": ["stylesheet", "script"]
+    }
   }
 ]

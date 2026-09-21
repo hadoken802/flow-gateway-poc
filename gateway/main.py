@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 settings = GatewaySettings.from_env()
 scheduler = GatewayScheduler(settings)
+scheduler.auth_recovery_callback = nodes.refresh_flow_auth_page
 instance_lock = GatewayInstanceLock(settings.db_path, settings.api_port)
 
 
@@ -310,9 +311,11 @@ async def v1_retry_download(task_id: str):
     task = await scheduler.get_task(task_id)
     if not task:
         raise HTTPException(404, "Task not found")
-    if task.get("status") not in {"download_failed", "download_pending", "generated"}:
-        raise HTTPException(409, "Task is not eligible for retry-download")
-    return {"ok": True, "task_id": task_id, "planned_action": "scheduler_download_recovery", "submit_called": False}
+    try:
+        recovered = await scheduler.retry_download(task_id)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"ok": recovered.get("status") in {"completed", "downloading"}, "task": recovered, "submit_called": False}
 
 
 @app.post("/api/v1/tasks/{task_id}/reconcile")
@@ -491,6 +494,18 @@ async def v1_system_status():
     }
 
 
+@app.post("/api/v1/system/daily-probe/reset")
+async def reset_daily_probe():
+    if not scheduler.daily_probe:
+        raise HTTPException(409, "DAILY_PROBE_DISABLED")
+    async with scheduler.assignment_lock:
+        try:
+            await scheduler.daily_probe.reset()
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc)) from exc
+    return await scheduler.daily_probe.status()
+
+
 @app.get("/api/v1/client/system/ready")
 async def v1_client_ready():
     status = await scheduler.pool_status()
@@ -508,7 +523,8 @@ async def v1_client_ready():
         if task_status in active_statuses:
             active_task_counts[task_status] = active_task_counts.get(task_status, 0) + 1
     return {
-        "ready": True,
+        "ready": status.get("daily_probe", {}).get("state") != "blocked",
+        "daily_probe": status.get("daily_probe"),
         "status": "ok",
         "api_version": "v1",
         "dry_run": settings.dry_run,
@@ -777,15 +793,21 @@ async function refresh(){
   refreshPromise=(async()=>{try{
     const [s,accountsData,tasksData]=await Promise.all([api('/api/v1/system/status'),api('/api/v1/accounts'),api('/api/v1/tasks')]);
     gatewayDryRun=Boolean(s.dry_run);accountRows=accountsData;taskRows=tasksData;
-    renderAccounts();renderTasks();renderAdvanced();renderMetrics(s);
+    renderAccounts();renderTasks();renderAdvanced();renderMetrics(s);renderDailyProbe(s);
     nodeRows=await api('/api/v1/nodes');
-    renderAccounts();renderAdvanced();renderMetrics(s);
+    renderAccounts();renderAdvanced();renderMetrics(s);renderDailyProbe(s);
   }catch(e){metrics.innerHTML=`<div class="metric"><span class="dot danger"></span>Gateway<b>异常</b></div>`;console.error(e)}finally{refreshPromise=null}})();
   return refreshPromise;
 }
 function mergedAccounts(){
   const merged=new Map();accountRows.forEach(a=>merged.set(a.account_id,{account:a,node:null}));nodeRows.forEach(n=>merged.set(n.account_id,{account:merged.get(n.account_id)?.account||null,node:n}));return [...merged.entries()].sort((a,b)=>a[0].localeCompare(b[0]));
 }
+function renderDailyProbe(s){
+  const p=s.daily_probe;if(!p||p.state==='disabled')return;
+  const labels={awaiting:'等待当天首条任务',running:'首条任务验证中，后续排队',passed:'今日已通过',blocked:'已暂停后续派发'};
+  metrics.innerHTML+=`<div class="metric">每日探针<b>${esc(labels[p.state]||p.state)}</b>${p.state==='blocked'?`<small>${esc(p.reason)}<br>任务：${esc(p.task_id)}</small><button onclick="resetDailyProbe()">问题解决后重新验证</button>`:''}</div>`;
+}
+async function resetDailyProbe(){try{await api('/api/v1/system/daily-probe/reset',{method:'POST'});await refresh()}catch(e){alert('当前探针任务尚未结束，请先检查该任务。')}}
 function cooldownRemaining(value){const end=Date.parse(value);if(!value||Number.isNaN(end)||end<=Date.now())return '';const sec=Math.ceil((end-Date.now())/1000);return sec<60?`${sec} 秒`:`${Math.ceil(sec/60)} 分钟`}
 function accountState(account,node){
   const cooldown=cooldownRemaining(account?.cooldown_until||node?.cooldown_until);if(cooldown)return {key:'cooldown',label:`冷却中 · 剩余 ${cooldown}`,tone:'warn'};
@@ -794,6 +816,7 @@ function accountState(account,node){
   if(node?.worker_online&&!node?.extension_connected)return {key:'extension',label:'浏览器扩展未连接',tone:'warn'};
   if(node?.extension_connected&&node?.runtime?.account_match===false)return {key:'mismatch',label:'登录账号不匹配',tone:'danger'};
   if(node?.extension_connected&&node?.runtime?.account_match&&(account?.quota_confidence==='stale'||oauth.includes('credits_http_')))return {key:'quota',label:'登录正常，额度验证失败',tone:'warn'};
+  if(node?.enabled===false)return {key:'disabled',label:'登录后启用',tone:'warn'};
   const nodeVerified=node?.worker_online&&node?.extension_connected&&node?.runtime?.account_match&&node?.quota_confidence==='live'&&node?.credits!=null&&oauth==='live';
   if(nodeVerified)return {key:'ready',label:status==='busy'||account?.current_task_id?'生成中':'正常',tone:''};
   if(status==='offline')return {key:'offline',label:'离线',tone:'danger'};
@@ -803,7 +826,7 @@ function accountState(account,node){
   if(status==='ready'||status==='busy')return {key:'ready',label:status==='busy'?'生成中':'正常',tone:''};
   return {key:'other',label:status||worker||'未知',tone:'warn'};
 }
-function accountAction(id,state){if(state.key==='login'||state.key==='oauth'||state.key==='mismatch')return `<button onclick="openNodeLogin('${esc(id)}',this)">${state.key==='login'?'登录':'重新登录'}</button>`;if(state.key==='extension')return `<button onclick="openNodeLogin('${esc(id)}',this)">重新连接</button>`;if(state.key==='quota')return `<button onclick="refreshNodeSession('${esc(id)}',this)">重新验证</button>`;if(state.key==='offline')return `<button onclick="openNodeLogin('${esc(id)}',this)">启动</button>`;return ''}
+function accountAction(id,state){if(state.key==='login'||state.key==='oauth'||state.key==='mismatch')return `<button onclick="openNodeLogin('${esc(id)}',this)">${state.key==='login'?'登录':'重新登录'}</button>`;if(state.key==='extension')return `<button onclick="openNodeLogin('${esc(id)}',this)">重新连接</button>`;if(state.key==='quota')return `<button onclick="refreshNodeSession('${esc(id)}',this)">重新验证</button>`;if(state.key==='disabled')return `<button onclick="checkLoginEnable('${esc(id)}')">检查登录并启用</button>`;if(state.key==='offline')return `<button onclick="openNodeLogin('${esc(id)}',this)">启动</button>`;return ''}
 function renderAccounts(){
   const rows=mergedAccounts();accountSummary.textContent=`${rows.length} 个账号`;
   accountList.innerHTML='<div class="list-row list-head"><span>账号</span><span>状态</span><span>积分</span><span></span></div>'+(rows.length?rows.map(([id,v])=>{const state=accountState(v.account,v.node),credits=v.account?.credits??v.node?.credits??'—';return `<div class="list-row"><strong>${esc(id)}</strong><span class="state"><i class="dot ${state.tone}"></i>${esc(state.label)}</span><span class="credits">${esc(credits)}</span><span>${accountAction(id,state)}</span></div>`}).join(''):'<div class="empty">暂无账号</div>');
@@ -813,7 +836,7 @@ function isDryRunTask(t){return t.submitted_at==='dry-run'||String(t.video_path|
 function taskState(t){if(t.status==='completed'&&isDryRunTask(t))return '演练完成（未生成视频）';const map={completed:'已完成',failed:'失败',failed_before_remote_submit:'提交到 Flow 前失败',manual_review:'需要人工检查',manual_submit_required:'需要人工提交',submission_unknown:'提交结果待确认',project_creation_unknown:'项目创建结果待确认',download_failed:'视频下载失败',queued:'排队中',processing:'生成中',downloading:'下载中',cancelled:'已取消'};return map[t.status]||'状态待确认'}
 function zhStatus(value){const map={ready:'正常',busy:'生成中',offline:'离线',needs_login:'需要登录',low_credits:'积分不足',paused:'已暂停',cooldown:'冷却中',completed:'已完成',failed:'失败',failed_before_remote_submit:'提交到 Flow 前失败',manual_review:'需要人工检查',manual_submit_required:'需要人工提交',submission_unknown:'提交结果待确认',project_creation_unknown:'项目创建结果待确认',download_failed:'视频下载失败',queued:'排队中',processing:'生成中',downloading:'下载中',cancelled:'已取消',live:'正常',unknown:'未知',extension_ready:'扩展已就绪',extension_missing:'缺少扩展'};return map[String(value??'').toLowerCase()]??'状态待确认'}
 function zhBool(value){return value===true||value===1?'是':value===false||value===0?'否':value??''}
-function taskAction(t){if(t.status==='completed'&&t.video_path&&!isDryRunTask(t))return `<a class="link-button" target="_blank" href="/api/v1/client/tasks/${encodeURIComponent(t.task_id)}/download">打开视频</a>`;if(t.status==='failed'||t.error_code||t.last_error_category)return `<button onclick="showTaskReason('${esc(t.task_id)}')">查看原因</button>`;return ''}
+function taskAction(t){if(t.status==='completed'&&t.video_path&&!isDryRunTask(t))return `<a class="link-button" target="_blank" href="/api/v1/client/tasks/${encodeURIComponent(t.task_id)}/download">打开视频</a>`;if(t.status==='download_failed'||(t.status==='failed'&&t.last_error_category==='download_failed'))return `<button onclick="retryDownload('${esc(t.task_id)}')">只恢复下载</button> <button onclick="showTaskReason('${esc(t.task_id)}')">查看原因</button>`;if(t.status==='failed'||t.error_code||t.last_error_category)return `<button onclick="showTaskReason('${esc(t.task_id)}')">查看原因</button>`;return ''}
 function renderTasks(){const newest=[...taskRows].reverse(),rows=showAllTasks?newest:newest.slice(0,8);taskList.innerHTML='<div class="list-row task-row list-head"><span>任务</span><span>状态</span><span>账号</span><span></span></div>'+(rows.length?rows.map(t=>`<div class="list-row task-row"><strong>${esc(t.name||t.external_task_id||'未命名任务')}</strong><span>${esc(taskState(t))}</span><span>${esc(t.assigned_account_id||t.account_id||'—')}</span><span>${taskAction(t)}</span></div>`).join(''):'<div class="empty">暂无任务</div>');allTasksButton.textContent=showAllTasks?'只看最近任务':'查看全部任务'}
 function toggleAllTasks(){showAllTasks=!showAllTasks;renderTasks()}
 async function createSimpleTask(){
@@ -841,6 +864,9 @@ function zhTaskReason(t){
   if(raw.includes('UNAUTHENTICATED')||raw.includes('HTTP 401')||code==='401')return '登录凭证已失效，Google 未接受当前账号的身份验证。请重新登录该账号后再试。';
   if(raw.includes('WORKER_NOT_READY')||raw.includes('WORKER IS NO LONGER READY'))return '账号的本地服务或浏览器扩展未就绪，任务已停止自动处理。请确认账号窗口和扩展连接正常后重试。';
   if(raw.includes('PAGE_ELEMENT_TIMEOUT:PROMPT_MEDIA'))return '图片上传后，Flow 页面未在规定时间内识别到素材，请刷新对应账号的 Flow 页面后重试。';
+  if(raw.includes('PAGE_VIDEO_DOWNLOAD_RESOLUTION_NOT_FOUND'))return '视频已经生成，但系统未能自动展开下载分辨率菜单或找到 720p 原始尺寸。系统会自动重试，超过上限后会停止并释放账号。';
+  if(raw.includes('DOWNLOAD_ATTEMPTS_EXHAUSTED'))return '视频下载已达到自动重试上限，任务已停止并释放账号，请点击“重试下载”再次尝试。';
+  if(raw.includes('READTIMEOUT'))return '本地下载接口等待超时，系统会按上限重试，不会再无限卡在“下载中”。';
   if(raw.includes('PAGE_ELEMENT_TIMEOUT'))return 'Flow 页面操作超时，系统没有找到需要操作的页面元素，请刷新对应账号的 Flow 页面后重试。';
   if(raw.includes('UPSTREAM_UNUSUAL_ACTIVITY')||raw.includes('UNUSUAL_ACTIVITY'))return 'Google 检测到异常活动，自动提交被拒绝，需要在对应账号窗口中人工确认。';
   if(raw.includes('REMOTE_OUTPUT_NO_LONGER_RECOVERABLE'))return 'Flow 端的视频结果已无法恢复，请重新创建任务。';
@@ -876,7 +902,7 @@ async function resumeTask(id){await api(`/api/v1/tasks/${id}/resume`,{method:'PO
 async function cancelTask(id){await api(`/api/v1/tasks/${id}/cancel`,{method:'POST'}); await loadTasks()}
 async function priorityTask(id){const priority=prompt('任务优先级'); if(priority===null) return; await api(`/api/v1/tasks/${id}/priority`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({priority:Number(priority)})}); await loadTasks()}
 async function requeueTask(id){await api(`/api/v1/tasks/${id}/requeue`,{method:'POST'}); await loadTasks()}
-async function retryDownload(id){alert(JSON.stringify(await api(`/api/v1/tasks/${id}/retry-download`,{method:'POST'}),null,2))}
+async function retryDownload(id){try{const r=await api(`/api/v1/tasks/${id}/retry-download`,{method:'POST'});await refresh();if(!r.ok)alert(zhTaskReason(r.task))}catch(e){alert('无法恢复下载：'+e.message)}}
 async function reconcileTask(id){alert(JSON.stringify(await api(`/api/v1/tasks/${id}/reconcile`,{method:'POST'}),null,2))}
 async function manualTask(id){await api(`/api/v1/tasks/${id}/need-manual`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({error_code:'NEED_MANUAL',error_message:'Marked from task center'})}); await loadTasks()}
 async function detail(id){alert(JSON.stringify(await api(`/api/v1/tasks/${id}`),null,2))}

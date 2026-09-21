@@ -1,9 +1,20 @@
 {
   "manifest_version": 3,
   "name": "Flow Kit",
-  "version": "0.2.21",
+  "version": "0.4.2",
   "description": "Local agent bridge for Google Flow API — captures tokens, solves reCAPTCHA, proxies API calls",
-  "permissions": ["storage", "alarms", "tabs", "webRequest", "scripting", "debugger", "declarativeNetRequest", "sidePanel", "offscreen", "downloads"],
+  "permissions": [
+    "storage",
+    "alarms",
+    "tabs",
+    "webRequest",
+    "scripting",
+    "debugger",
+    "declarativeNetRequest",
+    "sidePanel",
+    "offscreen",
+    "downloads"
+  ],
   "host_permissions": [
     "https://flow.google.com/*",
     "https://labs.google/*",
@@ -12,7 +23,7 @@
     "http://localhost/*"
   ],
   "background": {
-    "service_worker": "background-027.js"
+    "service_worker": "background-045.js"
   },
   "content_scripts": [
     {
@@ -21,14 +32,24 @@
         "https://labs.google/fx/tools/flow*",
         "https://labs.google/fx/*/tools/flow*"
       ],
-      "js": ["content.js"],
+      "js": [
+        "content.js"
+      ],
       "run_at": "document_start"
     }
   ],
   "web_accessible_resources": [
     {
-      "resources": ["injected.js", "offscreen.html", "offscreen.js"],
-      "matches": ["https://flow.google.com/*", "https://labs.google/*"]
+      "resources": [
+        "injected.js",
+        "injected-026.js",
+        "offscreen.html",
+        "offscreen.js"
+      ],
+      "matches": [
+        "https://flow.google.com/*",
+        "https://labs.google/*"
+      ]
     }
   ],
   "declarative_net_request": {

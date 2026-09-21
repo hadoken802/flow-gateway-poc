@@ -298,7 +298,8 @@ def test_dynamic_concurrency_respects_configured_upper_bound():
 def test_quick_add_formats_account_number_and_ports(monkeypatch, registry):
     from gateway import nodes
 
-    monkeypatch.setattr("gateway.nodes.port_is_available", lambda port, reserved=(), host="127.0.0.1": int(port) == 8107)
+    monkeypatch.setattr("gateway.nodes.worker_fallback_range", lambda: range(18100, 18110))
+    monkeypatch.setattr("gateway.nodes.port_is_available", lambda port, reserved=(), host="127.0.0.1": int(port) == 18100)
 
     assert nodes.normalize_flow_account_id("7") == "FLOW-007"
     assert nodes.normalize_flow_account_id("007") == "FLOW-007"
@@ -307,7 +308,7 @@ def test_quick_add_formats_account_number_and_ports(monkeypatch, registry):
     preview = nodes.quick_add_preview({"flow_account_number": "7"}, registry, FakeManager(registry))
 
     assert preview["account_id"] == "FLOW-007"
-    assert preview["worker_port"] == 8107
+    assert preview["worker_port"] == 18100
     assert preview["extension_ws_port"] == 9206
     assert preview["cdp_port"] == 9306
     assert preview["enabled"] is False
@@ -323,6 +324,21 @@ def test_quick_add_uses_fallback_when_preferred_worker_port_unavailable(monkeypa
     preview = nodes.quick_add_preview({"flow_account_number": "7"}, registry, FakeManager(registry))
 
     assert preview["worker_port"] == 18100
+
+
+def test_quick_add_flow_009_uses_standard_high_worker_port_pool(monkeypatch, registry):
+    from gateway import nodes
+
+    monkeypatch.setattr("gateway.nodes.worker_fallback_range", lambda: range(18100, 18110))
+    monkeypatch.setattr("gateway.nodes.port_is_available", lambda port, reserved=(), host="127.0.0.1": int(port) in {8109, 18100})
+
+    preview = nodes.quick_add_preview({"flow_account_number": "009"}, registry, FakeManager(registry))
+
+    assert preview["account_id"] == "FLOW-009"
+    assert preview["worker_port"] == 18100
+    assert preview["extension_ws_port"] == 9208
+    assert preview["cdp_port"] == 9308
+    assert preview["enabled"] is False
 
 
 def test_quick_add_uses_fallback_when_preferred_worker_port_is_excluded(monkeypatch, registry):

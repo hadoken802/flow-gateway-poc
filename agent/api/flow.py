@@ -67,9 +67,23 @@ async def extension_status():
         "connected": client.connected,
         "flow_key_present": client._flow_key is not None,
         "page_ui_ready": client.connected,
+        "extension_version": client.extension_version,
+        "workflow_revision": client.workflow_revision,
         "token_age_ms": client.flow_token_age_ms,
         "token_expired": client.flow_token_expired,
     }
+
+
+@router.get("/workflow-status")
+async def workflow_status():
+    client = get_flow_client()
+    response = await client._send("get_status", {}, timeout=10)
+    if response.get("error"):
+        raise HTTPException(503, response["error"])
+    result = response.get("result", response.get("data", {}))
+    return {"extension_version": result.get("extensionVersion"),
+            "workflow_revision": result.get("workflowRevision"),
+            "workflow": result.get("workflow"), "download": result.get("download"), "page": result.get("page"), "submit_click": result.get("submitClick")}
 
 
 @router.get("/credits")

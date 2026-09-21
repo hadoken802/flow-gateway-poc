@@ -9,6 +9,28 @@ from agent.services.flow_client import FlowClient
 
 
 @pytest.mark.asyncio
+async def test_lost_submit_response_reconciles_without_resubmitting(monkeypatch):
+    client = FlowClient()
+    client.workflow_revision = 1
+    client._page_uploads["upload"] = {"fileName": "original.png"}
+    calls = []
+    media_id = "22222222-2222-4222-8222-222222222222"
+
+    async def send(method, params, **kwargs):
+        calls.append(method)
+        if method == "page_submit_video":
+            return {"error": "Timeout (360s) waiting for page_submit_video"}
+        assert method == "page_reconcile_video"
+        return {"data": {"projectId": "project", "mediaId": media_id}}
+
+    monkeypatch.setattr(client, "_send", send)
+    result = await client.submit_reference_video_ui("project", ["upload"], "original prompt")
+    assert calls == ["page_submit_video", "page_reconcile_video"]
+    assert result["data"]["media"][0]["name"] == media_id
+    assert media_id in client._page_video_jobs
+
+
+@pytest.mark.asyncio
 async def test_dom_page_video_completion_routes_download_through_extension(monkeypatch):
     client = FlowClient()
 
@@ -77,11 +99,28 @@ def test_extension_reads_current_flow_page_credits_and_returns_over_websocket():
 def test_extension_version_invalidates_stale_service_worker_cache():
     manifest = json.loads(Path("extension/manifest.json").read_text(encoding="utf-8"))
 
-    assert tuple(map(int, manifest["version"].split("."))) >= (0, 2, 7)
+    assert tuple(map(int, manifest["version"].split("."))) >= (0, 2, 30)
     assert "debugger" in manifest["permissions"]
-    assert manifest["background"]["service_worker"] == "background-027.js"
-    versioned_background = Path("extension/background-027.js").read_text(encoding="utf-8")
+    entry = manifest["background"]["service_worker"]
+    assert entry not in {"background.js", "background-033.js"}
+    assert "importScripts('page-workflow.js', 'background.js')" in Path('extension', entry).read_text(encoding='utf-8')
+    versioned_background = Path("extension/background.js").read_text(encoding="utf-8")
     assert "msg.method === 'page_create_project'" in versioned_background
+    assert "button.new-project-button" in versioned_background
+    assert "await trustedClick(tab.id, point.x, point.y)" in versioned_background
+    assert "keepaliveTimer = setInterval" in versioned_background
+    assert "flow-video-tile img, flow-video-tile video" in versioned_background
+    assert "getComputedStyle(progress).opacity" in versioned_background
+    assert "Number.isFinite(retry?.x)" not in versioned_background
+    assert "handlePageReconcileVideo" in versioned_background
+
+
+def test_versioned_content_script_handles_hidden_progress_and_direct_video_tiles():
+    content = Path("extension/content.js").read_text(encoding="utf-8")
+
+    assert "flow-video-tile img, flow-video-tile video" in content
+    assert "getComputedStyle(progress).opacity" in content
+    assert "item.src.includes(`/video/${mediaId}`)" in content
 
 
 @pytest.mark.asyncio
@@ -110,15 +149,20 @@ def test_extension_creates_project_by_clicking_current_flow_page():
     assert "新建项目|创建项目|New project|Create project" in content
     assert content.index("reply({ clicked: true })") < content.index("target.click()")
     assert "msg.method === 'page_create_project'" in background
+    assert "button.new-project-button" in background
+    assert "await trustedClick(tab.id, point.x, point.y)" in background
+    assert "media.src.match(/\\/(?:image|video)\\/([0-9a-f-]{36})/i)?.[1] || media.src" in content
     assert "const currentTabs = await chrome.tabs.query" in background
     assert "const deadline = Date.now() + 90000" in background
     assert "const maxClickAttempts = 3" in background
     assert "clickAttempts < maxClickAttempts" in background
     assert "target.scrollIntoView({ block: 'center', inline: 'center' })" in background
-    assert "chrome.tabs.sendMessage(tab.id, { type: 'CLICK_NEW_PROJECT' })" in background
+    assert "await trustedClick(tab.id, retryPoint.x, retryPoint.y)" in background
     assert "await chrome.tabs.get(tab.id)" in background
     assert "data: { projectId: match[1] }" in background
     assert "Input.dispatchMouseEvent" in background
+    assert "if (expectedUrl)" in background
+    assert "tab.status === 'complete' && expectedUrl" not in background
     assert "const response = { id: msg.id, status: 200" in background
     assert "await sendToAgent(response)" in background
     assert "stage: 'project_found'" in background

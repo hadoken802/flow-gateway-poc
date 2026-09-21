@@ -10,6 +10,7 @@ from . import client_files
 from . import scheduler_kernel
 from .config import GatewaySettings
 from .db import connect
+from .daily_probe import DailyProbe
 from .models import ACTIVE_TASK_STATUSES
 from .worker_client import WorkerClient, WorkerSubmitError
 from .worker_provider import WorkerConfig, WorkerSnapshot, build_worker_provider
@@ -33,6 +34,7 @@ class GatewayScheduler:
         self.settings = settings
         self.worker_client = worker_client or WorkerClient(settings.worker_submit_timeout_seconds)
         self.db = None
+        self.daily_probe = None
         self.worker_provider = worker_provider or build_worker_provider(settings)
         self.worker_snapshot = self._load_worker_snapshot()
         self.workers = self.worker_snapshot.workers
@@ -48,6 +50,8 @@ class GatewayScheduler:
         self.assignment_history: list[tuple[str, str]] = []
         self._last_worker_refresh = 0.0
         self._worker_refresh_lock = asyncio.Lock()
+        self.auth_recovery_callback = None
+        self._auth_recovery_last_attempt: dict[str, float] = {}
         self.startup_stage: str | None = None
         self.boot_id = str(uuid.uuid4())
         self.scheduler_instance_id = str(uuid.uuid4())
@@ -88,6 +92,9 @@ class GatewayScheduler:
         self.startup_stage = "database_connect"
         self._audit("database_connect_started", database_path=str(self.settings.db_path))
         self.db = await connect(self.settings.db_path)
+        if self.settings.daily_probe_enabled and not self.settings.dry_run:
+            self.daily_probe = DailyProbe(self.db)
+            await self.daily_probe.initialize()
         self._audit("database_connect_completed", database_path=str(self.settings.db_path))
         self.startup_stage = "upsert_accounts"
         self._audit("accounts_upsert_started", account_count=len(self.workers))
@@ -101,7 +108,7 @@ class GatewayScheduler:
         self.startup_stage = "recover_tasks"
         self._audit("recover_tasks_started")
         await self.sweep_expired_leases_once(reason="startup")
-        await self.recover_tasks()
+        await self.recover_tasks(refresh_workers=False)
         self._audit("recover_tasks_completed")
         self.startup_stage = "scheduler_loop_start"
         self._runner_task = asyncio.create_task(self._run_loop())
@@ -172,17 +179,28 @@ class GatewayScheduler:
                     write_credits = credits if credits is not None else stored_credits
                     if write_credits is None:
                         write_credits = last_known_credits
+                    stale_token_recoverable = bool(
+                        info.get("token_expired")
+                        and info.get("page_ui_ready")
+                        and credits is not None
+                    )
                     if info.get("status") == "offline":
                         status = "offline"
-                    elif info.get("token_expired"):
+                    elif info.get("token_expired") and not stale_token_recoverable:
                         status = "needs_login"
+                        if not (account or {}).get("current_task_id"):
+                            self._schedule_auth_recovery(worker.account_id)
                     elif not info.get("extension_connected") or (
                         credits is None
                         and not (info.get("flow_key_present") or info.get("page_ui_ready"))
                     ):
                         status = "needs_login"
-                    elif account and int(account.get("manual_paused") or 0) and account.get("manual_pause_reason") == "authentication_expired":
+                        if account and account.get("manual_pause_reason") == "authentication_expired" and not account.get("current_task_id"):
+                            self._schedule_auth_recovery(worker.account_id)
+                    elif account and int(account.get("manual_paused") or 0) and account.get("manual_pause_reason") == "authentication_expired" and credits is None:
                         status = "needs_login"
+                        if not account.get("current_task_id"):
+                            self._schedule_auth_recovery(worker.account_id)
                     elif credits is not None and credits < self.settings.omni_10s_credit_cost:
                         status = "low_credits"
                     elif credits is None and account and account.get("status") == "low_credits":
@@ -191,6 +209,18 @@ class GatewayScheduler:
                         status = "low_credits"
                     else:
                         status = "busy" if account and account.get("current_task_id") else "ready"
+                    # The page-driven submission path remains healthy when the
+                    # bearer token is stale as long as the Flow UI and live
+                    # quota are available.  Reloading the page in that state
+                    # destroys the content-script channel mid-upload.  Only
+                    # recover auth while the account is idle and the stale
+                    # token is not already covered by a working page session.
+                    if (
+                        info.get("token_expired")
+                        and not stale_token_recoverable
+                        and not (account or {}).get("current_task_id")
+                    ):
+                        self._schedule_auth_recovery(worker.account_id)
                     await crud.upsert_account(
                         self.db,
                         worker,
@@ -200,6 +230,18 @@ class GatewayScheduler:
                         quota_source=info.get("credits_source") if credits is not None else info.get("credits_error"),
                         quota_confidence="live" if credits is not None else "stale",
                     )
+                    if (
+                        status in {"ready", "busy"}
+                        and account
+                        and int(account.get("manual_paused") or 0)
+                        and account.get("manual_pause_reason") == "authentication_expired"
+                    ):
+                        await crud.update_account_controls(
+                            self.db,
+                            worker.account_id,
+                            manual_paused=0,
+                            manual_pause_reason=None,
+                        )
                     if status in {"ready", "busy"} and self.settings.dry_run:
                         recovery_task = await crud.get_waiting_recovery_task_for_account(self.db, worker.account_id)
                         if recovery_task and recovery_task["task_id"] not in self._dry_tasks:
@@ -229,6 +271,11 @@ class GatewayScheduler:
                 if not account:
                     continue
                 credits = info.get("credits")
+                page_session_recoverable = bool(
+                    info.get("extension_connected")
+                    and info.get("page_ui_ready")
+                    and credits is not None
+                )
                 persisted_worker = WorkerConfig(
                     account_id=worker.account_id,
                     api_url=worker.api_url,
@@ -238,14 +285,28 @@ class GatewayScheduler:
                 await crud.upsert_account(
                     self.db,
                     persisted_worker,
-                    status="needs_login",
+                    status=("busy" if account.get("current_task_id") else "ready") if page_session_recoverable else "needs_login",
                     credits=credits if credits is not None else account.get("credits"),
-                    last_error="authentication_expired",
+                    last_error=None if page_session_recoverable else "authentication_expired",
                     quota_source=info.get("credits_source") if credits is not None else info.get("credits_error"),
                     quota_confidence="live" if credits is not None else "stale",
                 )
+                if not page_session_recoverable and not account.get("current_task_id"):
+                    self._schedule_auth_recovery(worker.account_id)
 
-    async def recover_tasks(self):
+    def _schedule_auth_recovery(self, account_id: str) -> None:
+        callback = self.auth_recovery_callback
+        if not callback:
+            return
+        now = asyncio.get_running_loop().time()
+        if now - self._auth_recovery_last_attempt.get(account_id, 0.0) < 60:
+            return
+        self._auth_recovery_last_attempt[account_id] = now
+        result = callback(account_id)
+        if asyncio.iscoroutine(result):
+            asyncio.create_task(result)
+
+    async def recover_tasks(self, refresh_workers: bool = True):
         tasks = await crud.list_tasks(self.db)
         if not tasks:
             return
@@ -271,7 +332,8 @@ class GatewayScheduler:
                 """
             )
             await self.db.commit()
-            await self.refresh_workers()
+            if refresh_workers:
+                await self.refresh_workers()
             await self.schedule_once()
             return
 
@@ -374,7 +436,8 @@ class GatewayScheduler:
                     )
                 else:
                     await crud.update_task_status(self.db, task["task_id"], "queued")
-        await self.refresh_workers()
+        if refresh_workers:
+            await self.refresh_workers()
         await self.schedule_once()
 
     async def _run_loop(self):
@@ -446,6 +509,7 @@ class GatewayScheduler:
             "accounts_offline": sum(1 for account in accounts if account["status"] == "offline"),
             "accounts_paused": sum(1 for account in accounts if int(account.get("manual_paused") or 0)),
             "accounts_cooldown": sum(1 for account in accounts if account.get("cooldown_until")),
+            "daily_probe": await self.daily_probe.status() if self.daily_probe else {"state": "disabled"},
         }
 
     def effective_max_concurrency_from_accounts(self, accounts: list[dict]) -> int:
@@ -478,6 +542,11 @@ class GatewayScheduler:
 
     async def _schedule_once_locked(self):
         status = await self.pool_status()
+        probe_state = status["daily_probe"]["state"]
+        if probe_state in {"running", "blocked"}:
+            return
+        if probe_state == "awaiting" and status["active_count"]:
+            return
         if status["active_count"] >= status["effective_max_concurrency"]:
             return
         accounts = await crud.list_accounts(self.db)
@@ -488,11 +557,18 @@ class GatewayScheduler:
             account["_total_task_count"] = total_count
         status["effective_max_concurrency"] = self.effective_max_concurrency_from_accounts(accounts)
         while status["active_count"] < status["effective_max_concurrency"]:
-            next_task = self._next_schedulable_task(await crud.list_tasks(self.db))
-            if not next_task:
-                return
-            selected = self.select_worker(next_task, self.worker_snapshot, account_states=accounts)
-            if not selected.get("ok"):
+            next_task = None
+            selected = None
+            # A queued task pinned to a temporarily unavailable account must
+            # not block unrelated accounts behind it.  Keep queue ordering,
+            # but choose the first task that currently has an eligible worker.
+            for candidate in self._schedulable_tasks(await crud.list_tasks(self.db)):
+                candidate_selection = self.select_worker(candidate, self.worker_snapshot, account_states=accounts)
+                if candidate_selection.get("ok"):
+                    next_task = candidate
+                    selected = candidate_selection
+                    break
+            if not next_task or not selected:
                 return
             account_id = selected["selected_account_id"]
             account = next((item for item in accounts if item["account_id"] == account_id), None)
@@ -513,6 +589,8 @@ class GatewayScheduler:
                 )
                 if not task:
                     return
+                if self.daily_probe and probe_state == "awaiting":
+                    await self.daily_probe.claim(task["task_id"])
                 self.assignment_history.append((task["task_id"], account_id))
                 self._audit("account_reserved", task_id=task["task_id"], account_id=account_id, runtime_instance_id=selected.get("selected_runtime_instance_id"))
                 account["status"] = "busy"
@@ -522,6 +600,8 @@ class GatewayScheduler:
                     self._dry_tasks[task["task_id"]] = asyncio.create_task(self._run_dry_task(task["task_id"], account_id))
                 else:
                     self._real_tasks[task["task_id"]] = asyncio.create_task(self._run_real_task(task["task_id"], account_id))
+                if probe_state == "awaiting":
+                    return
 
     def select_worker(self, task: dict, worker_snapshot: WorkerSnapshot | None = None, account_states: list[dict] | None = None) -> dict:
         snapshot = worker_snapshot or self.worker_snapshot
@@ -611,6 +691,10 @@ class GatewayScheduler:
         }
 
     def _next_schedulable_task(self, tasks: list[dict]) -> dict | None:
+        queued = self._schedulable_tasks(tasks)
+        return queued[0] if queued else None
+
+    def _schedulable_tasks(self, tasks: list[dict]) -> list[dict]:
         now = crud.utc_now()
         queued = [
             task for task in tasks
@@ -620,9 +704,7 @@ class GatewayScheduler:
             and (not task.get("not_before") or task.get("not_before") <= now)
         ]
         queued.sort(key=lambda task: (-int(task.get("priority") or 0), task.get("created_at") or "", task.get("task_id") or ""))
-        if queued:
-            return queued[0]
-        return None
+        return queued
 
     def _task_quota_cost(self, task: dict) -> int:
         return int(task.get("estimated_quota_cost") or self.settings.omni_10s_credit_cost)
@@ -722,6 +804,53 @@ class GatewayScheduler:
         finally:
             self._dry_tasks.pop(task_id, None)
 
+    async def retry_download(self, task_id):
+        """Reserve the original account for download only, even when dispatch is paused."""
+        async with self.assignment_lock:
+            task = await crud.get_task(self.db, task_id)
+            if not task or task.get('status') not in {'download_failed', 'failed'}:
+                raise ValueError('DOWNLOAD_RECOVERY_NOT_ELIGIBLE')
+            if not all(task.get(k) for k in ('worker_job_id', 'project_id', 'output_media_id', 'assigned_account_id')):
+                raise ValueError('DOWNLOAD_RECOVERY_REMOTE_ID_MISSING')
+            account_id = task['assigned_account_id']
+            worker = self._worker_by_account(account_id)
+            account = await crud.get_account(self.db, account_id)
+            if not worker or not account or not scheduler_kernel.account_is_schedulable(account)[0]:
+                raise ValueError('DOWNLOAD_RECOVERY_ACCOUNT_UNAVAILABLE')
+            original_status = task['status']
+            await crud.update_task_status(self.db, task_id, 'queued')
+            leased = await crud.assign_task(self.db, task_id, account_id, worker.runtime_instance_id, 0,
+                                            self.settings.lease_duration_seconds)
+            if not leased:
+                await crud.update_task_status(self.db, task_id, original_status)
+                raise ValueError('DOWNLOAD_RECOVERY_ACCOUNT_BUSY')
+            token = _lease_token(leased)
+            await crud.guarded_update_task(self.db, task_id, token['lease_owner'], token['lease_version'],
+                                           'downloading', download_attempts=int(task.get('download_attempts') or 0) + 1)
+        try:
+            result = await asyncio.wait_for(self.worker_client.retry_omni_video_download(worker, task['worker_job_id']), 115)
+            if any(result.get(k) and result[k] != task[k] for k in ('project_id', 'output_media_id')):
+                result = {'error_code': 'remote_id_conflict', 'error_message': 'Download result belongs to a different remote task'}
+        except Exception as exc:
+            result = {'error_code': type(exc).__name__, 'error_message': str(exc)[:300] or 'DOWNLOAD_RECOVERY_TIMEOUT'}
+        if result.get('status') == 'downloading':
+            # Keep the existing lease and let the normal monitor observe the
+            # already-running download; never turn progress into a failure.
+            self._real_tasks[task_id] = asyncio.create_task(self._run_real_task(task_id, account_id))
+            return await crud.get_task(self.db, task_id)
+        async with self.assignment_lock:
+            account = await crud.get_account(self.db, account_id)
+            check = _valid_local_mp4(result.get('video_path'))
+            if result.get('status') == 'completed' and check['ok']:
+                await crud.guarded_complete_real_task(self.db, task_id, account_id, token['lease_owner'],
+                    token['lease_version'], int(account.get('lock_version') or 0), result['video_path'], result.get('remaining_credits'))
+            else:
+                await crud.guarded_release_account(self.db, task_id, account_id, token['lease_owner'],
+                    token['lease_version'], int(account.get('lock_version') or 0), 'download_failed',
+                    error_code=result.get('error_code') or check['error_code'],
+                    error_message=result.get('error_message') or check['error_message'])
+        return await crud.get_task(self.db, task_id)
+
     async def _increment_attempt_count(self, task_id):
         async with self.assignment_lock:
             await self.db.execute(
@@ -768,6 +897,7 @@ class GatewayScheduler:
                     return
                 project_id = task.get("project_id")
                 if not isinstance(project_id, str) or not project_id.strip():
+                    reused_existing_project = False
                     try:
                         async with self.assignment_lock:
                             task = await crud.guarded_update_task(self.db, task_id, token["lease_owner"], token["lease_version"], "project_create_pending", scheduler_instance_id=self.scheduler_instance_id, worker_instance_id=worker.runtime_instance_id, boot_id=self.boot_id)
@@ -805,7 +935,7 @@ class GatewayScheduler:
                             )
                         return
                     async with self.assignment_lock:
-                        task = await crud.guarded_update_task(self.db, task_id, token["lease_owner"], token["lease_version"], "project_created", project_id=project_id, project_created_by_gateway=1, project_created_at=crud.utc_now())
+                        task = await crud.guarded_update_task(self.db, task_id, token["lease_owner"], token["lease_version"], "project_created", project_id=project_id, project_created_by_gateway=0 if reused_existing_project else 1, project_created_at=crud.utc_now())
                     if not task:
                         self._audit("fencing_lost", task_id=task_id, action="project_created")
                         return
@@ -999,6 +1129,27 @@ class GatewayScheduler:
                     if result.get("status") == "completed" and _valid_local_mp4(result.get("video_path"))["ok"]:
                         pass
                     elif result.get("status") in {"waiting_download", "completed_remote"}:
+                        if _download_attempt_limit_reached(task):
+                            async with self.assignment_lock:
+                                self._audit("account_released", task_id=task_id, account_id=account_id, release_reason="download_attempts_exhausted")
+                                account = await crud.get_account(self.db, account_id)
+                                await crud.guarded_release_account(
+                                    self.db,
+                                    task_id,
+                                    account_id,
+                                    token["lease_owner"],
+                                    token["lease_version"],
+                                    int((account or {}).get("lock_version") or 0),
+                                    "download_failed",
+                                    error_code=result.get("error_code") or "download_attempts_exhausted",
+                                    error_message=result.get("error_message") or "Video download retry limit reached",
+                                    remaining_credits=result.get("remaining_credits"),
+                                    last_error_code=result.get("error_code") or "download_attempts_exhausted",
+                                    last_error_message=result.get("error_message") or "Video download retry limit reached",
+                                    last_error_category="download_failed",
+                                )
+                            await self.schedule_once()
+                            return
                         async with self.assignment_lock:
                             downloading = await crud.guarded_transition(
                                 self.db,
@@ -1008,6 +1159,7 @@ class GatewayScheduler:
                                 task.get("status"),
                                 "downloading",
                                 download_attempts=("increment", 1),
+                                download_attempt_count=("increment", 1),
                             )
                         if not downloading:
                             self._audit("fencing_lost", task_id=task_id, action="downloading")
@@ -1229,15 +1381,46 @@ class GatewayScheduler:
             self._audit("account_released", task_id=task_id, account_id=account_id, release_reason="account_not_bound")
             await crud.release_task_for_manual_review(self.db, task_id, account_id, error_code="account_not_bound", error_message="Account is no longer bound to this task")
             return None
-        try:
-            info = await self.worker_client.inspect(worker)
-        except Exception as exc:
-            await crud.release_task_for_manual_review(self.db, task_id, account_id, error_code="worker_offline", error_message=str(exc)[:500])
-            return None
-        if info.get("status") == "offline" or not info.get("extension_connected") or not (
-            info.get("flow_key_present") or info.get("page_ui_ready")
-        ):
-            await crud.release_task_for_manual_review(self.db, task_id, account_id, error_code="worker_not_ready", error_message="Worker is no longer ready")
+        info = None
+        inspect_error = None
+        for attempt, delay_seconds in enumerate((0.0, 0.25, 0.75), start=1):
+            if delay_seconds:
+                await asyncio.sleep(delay_seconds)
+            try:
+                info = await self.worker_client.inspect(worker)
+                inspect_error = None
+            except Exception as exc:
+                inspect_error = exc
+                info = None
+            ready = bool(
+                info
+                and info.get("status") != "offline"
+                and info.get("extension_connected")
+                and (info.get("flow_key_present") or info.get("page_ui_ready"))
+            )
+            if ready:
+                if attempt > 1:
+                    self._audit("worker_ready_after_retry", task_id=task_id, account_id=account_id, attempt=attempt)
+                break
+            if attempt < 3:
+                self._audit("worker_ready_retry", task_id=task_id, account_id=account_id, attempt=attempt)
+        else:
+            if inspect_error is not None:
+                await crud.release_task_for_manual_review(
+                    self.db,
+                    task_id,
+                    account_id,
+                    error_code="worker_offline",
+                    error_message=str(inspect_error)[:500],
+                )
+            else:
+                await crud.release_task_for_manual_review(
+                    self.db,
+                    task_id,
+                    account_id,
+                    error_code="worker_not_ready",
+                    error_message="Worker remained unavailable after automatic retry",
+                )
             return None
         return worker
 
@@ -1310,6 +1493,9 @@ class GatewayScheduler:
             updates["manual_paused"] = 1
             updates["manual_pause_reason"] = category
             updates["status"] = "needs_login"
+        elif int(account.get("consecutive_failures") or 0) >= 3:
+            updates["manual_paused"] = 1
+            updates["manual_pause_reason"] = f"repeated_failure:{category}"
         if updates:
             await crud.update_account_controls(self.db, account_id, **updates)
 
@@ -1336,6 +1522,8 @@ def _project_payload(task_id):
 
 
 def _map_worker_status(status):
+    if status == "downloading":
+        return "downloading"
     if status in {"waiting_download", "completed_remote"}:
         return "processing"
     if status in {"queued", "scheduled"}:
@@ -1347,6 +1535,14 @@ def _map_worker_status(status):
     if status == "failed":
         return "manual_review"
     return "submitted"
+
+
+def _download_attempt_limit_reached(task: dict) -> bool:
+    attempts = max(
+        int(task.get("download_attempt_count") or 0),
+        int(task.get("download_attempts") or 0),
+    )
+    return attempts >= max(1, int(task.get("download_max_attempts") or 2))
 
 
 def _requires_manual_submit(result: dict) -> bool:

@@ -68,6 +68,17 @@ async def test_create_task_with_input_file_ids_records_order(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_create_task_rejects_missing_prompt_before_database_insert(tmp_path):
+    from gateway import crud
+    from gateway.db import connect
+
+    db = await connect(tmp_path / "gateway.db")
+    with pytest.raises(ValueError, match="prompt is required"):
+        await crud.create_task(db, {"image_path": "D:/input.png"})
+    await db.close()
+
+
+@pytest.mark.asyncio
 async def test_duplicate_idempotency_key_reuses_multi_image_task(tmp_path):
     from gateway import client_files, crud
     from gateway.db import connect
@@ -177,21 +188,41 @@ async def test_flow_client_upload_retries_legacy_payload_after_invalid_argument(
 def test_page_submit_selects_each_uploaded_asset_and_verifies_prompt_attachments():
     injected = Path("extension/injected.js").read_text(encoding="utf-8")
 
-    select_uploaded = "button.getAttribute('role') === 'option' && lines.includes(image.fileName)"
-    wait_active = "asset.classList.contains('asset-item-active')"
+    select_uploaded = "button.getAttribute('role') === 'option'"
+    wait_active = "isAssetSelected(findUploadedAsset()) || findAttachButton()"
     verify_increment = "promptIngredientCount() === previousIngredientCount + 1"
     verify_total = "promptIngredientCount() !== images.length"
     retry_attach = "for (let attempt = 0; attempt < 5; attempt += 1)"
 
     assert "const promptIngredientCount" in injected
     assert select_uploaded in injected
+    assert "button.getClientRects().length > 0" in injected
+    assert "}).at(-1);" in injected
     assert wait_active in injected
     assert verify_increment in injected
     assert verify_total in injected
     assert retry_attach in injected
-    assert "press(attach)" in injected
-    assert injected.index(select_uploaded) < injected.index("press(attach)")
-    assert injected.index("press(attach)") < injected.index(verify_increment)
+    assert "asset = await waitFor(findUploadedAsset" in injected
+    assert "attach.click()" in injected
+    assert "press(attach)" not in injected  # A second click can undo attachment.
+    assert injected.index(select_uploaded) < injected.index("attach.click()")
+    assert injected.index("attach.click()") < injected.index(verify_increment, injected.index("attach.click()"))
+
+
+def test_page_submit_accepts_visible_attach_button_when_flow_drops_asset_active_class():
+    injected = Path("extension/injected.js").read_text(encoding="utf-8")
+
+    assert "const findAttachButton" in injected
+    assert "isAssetSelected(findUploadedAsset()) || findAttachButton()" in injected
+    assert "let attach = findAttachButton();" in injected
+    assert "previousIngredientCount + 1,\n          10000,\n          `prompt_media:${image.fileName}`" in injected
+
+
+def test_page_submit_opens_and_closes_settings_with_native_click():
+    injected = Path("extension/injected.js").read_text(encoding="utf-8")
+
+    assert injected.count("settings.click();") >= 2
+    assert "press(settings);" not in injected
 
 
 def test_page_video_defaults_to_720p_and_downloads_original_resolution():
